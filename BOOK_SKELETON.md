@@ -60,7 +60,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Latency vs throughput machines → SIMT (grids, blocks, warps; divergence) → the streaming multiprocessor → the memory hierarchy and its bandwidth/latency pyramid → tensor cores, Volta → Rubin (FP16 → FP8 → FP4) → HBM → NVLink/NVSwitch and rack-scale systems → TPUs, MI300X/MI355X, Trainium, Groq, Cerebras → reading a spec sheet.
 **Refs.** NVIDIA whitepapers; Jouppi 2017/2023; Kirk & Hwu (PMPP); Luo 2024 (dissecting Hopper).
 
-### Chapter 6 — The Roofline Model and Performance Analysis
+### Chapter 6 — The Roofline Model and Performance Analysis ✅ *(v2)*
 **Motivating question.** How do we predict the speed of any kernel or model, and how do we know how far we are from the limit?
 **Arc.** Roofline as \(\min(\pi, I\beta)\) → hierarchical rooflines → operators of an LLM on the roofline → critical batch size, including KV traffic → MFU and MBU → Little's law and the latency–throughput frontier → profiling (Nsight, PyTorch profiler).
 **Refs.** Williams 2009; Pope 2022; Austin 2025; Yuan 2024.
@@ -177,4 +177,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 3 | Running the Model: Prefill, Decode and the KV Cache | ✅ v2 (new) |
 | 4 | Decoding: From Logits to Text | ✅ v2 |
 | 5 | GPU Architecture from First Principles | ✅ v2 |
-| 6–26 | — | ⏳ planned |
+| 6 | The Roofline Model and Performance Analysis | ✅ v2 |
+| 7–26 | — | ⏳ planned |

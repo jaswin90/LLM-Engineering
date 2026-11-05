@@ -63,6 +63,8 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(s_{kv}\) | KV-cache bytes per token \(=2\,L\,n_{kv}\,d_h\,b_{kv}\) | |
 | \(t_{\text{step}}\) | time of one forward pass (decode step) | |
 | \(f_{\text{clk}}\) | clock frequency (Ch. 5) | ≈ 1.83 GHz |
+| \(B^{*}(t)\), \(t_{\text{crit}}\) | critical batch size for compute-bound decode at context \(t\); critical context length (Ch. 6) | 388 tokens for Llama 3 8B |
+| MFU, MBU | model FLOPs utilisation; memory-bandwidth utilisation (Ch. 3, 6) | |
 | \(\delta_{\text{mem}}\) | main-memory access latency (Ch. 5) | ≈ 600–800 ns |
 
 ## Serving

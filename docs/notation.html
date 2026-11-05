@@ -76,6 +76,8 @@
 <tr><td>\(s_{kv}\)</td><td>KV-cache bytes per token \(=2\,L\,n_{kv}\,d_h\,b_{kv}\)</td><td></td></tr>
 <tr><td>\(t_{\text{step}}\)</td><td>time of one forward pass (decode step)</td><td></td></tr>
 <tr><td>\(f_{\text{clk}}\)</td><td>clock frequency (Ch. 5)</td><td>≈ 1.83 GHz</td></tr>
+<tr><td>\(B^{*}(t)\), \(t_{\text{crit}}\)</td><td>critical batch size for compute-bound decode at context \(t\); critical context length (Ch. 6)</td><td>388 tokens for Llama 3 8B</td></tr>
+<tr><td>MFU, MBU</td><td>model FLOPs utilisation; memory-bandwidth utilisation (Ch. 3, 6)</td><td></td></tr>
 <tr><td>\(\delta_{\text{mem}}\)</td><td>main-memory access latency (Ch. 5)</td><td>≈ 600–800 ns</td></tr>
 </tbody></table></div>
 <h2>Serving</h2>
