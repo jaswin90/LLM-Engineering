@@ -79,7 +79,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** MQA → GQA → MLA (derivation and weight absorption) → sliding-window and local/global hybrids → cross-layer sharing → KV quantisation → eviction (attention sinks, H2O, SnapKV) and why reasoning models break it.
 **Refs.** Shazeer 2019; Ainslie 2023; DeepSeek-V2 2024; Xiao 2023; Zhang 2023; Liu 2024 (KIVI); Brandon 2024.
 
-### Chapter 9 — IO-Aware Attention: FlashAttention 1 → 4
+### Chapter 9 — IO-Aware Attention: FlashAttention 1 → 4 ✅ *(v2)*
 **Motivating question.** Attention with a \(T\times T\) matrix moves \(\Theta(T^2)\) bytes. Can we compute exactly the same function while moving far less?
 **Arc.** IO complexity → online softmax derivation → FA1 tiling → FA2 → FA3 (Hopper asynchrony, FP8) → FA4 (Blackwell) → decode kernels (FlashDecoding, FlashInfer) → MLA and sparse kernels.
 **Refs.** Dao 2022/2023; Shah 2024; FA4 2026; Rabe & Staats 2021; Ye 2025.
@@ -180,4 +180,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 6 | The Roofline Model and Performance Analysis | ✅ v2 |
 | 7 | GPU Programming for Mathematicians | ✅ v2 |
 | 8 | The KV Cache: Shrinking It | ✅ v2 |
-| 9–26 | — | ⏳ planned |
+| 9 | IO-Aware Attention: FlashAttention 1 → 4 | ✅ v2 |
+| 10–26 | — | ⏳ planned |
