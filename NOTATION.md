@@ -141,6 +141,16 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\) | rotations pair \(r\) completes over the training length; \(c_{\text{lo}},c_{\text{hi}}\) YaRN ramp thresholds |
 | \(k_s\) | tokens (or blocks) selected per query by sparse attention |
 
+## Recurrent and state-space layers (Ch. 21)
+| Symbol | Meaning |
+|---|---|
+| \(\mathcal S_t\) | matrix-valued recurrent state of a linear-attention head after token \(t\) (\(d_v\times d_k\)) |
+| \(\psi(\cdot)\) | feature map of linear attention, \(\psi(q)^\top\psi(k)\approx\) similarity |
+| \(f_t\), \(\eta_t\) | forget (decay) gate in \((0,1]\) and write rate of a gated / delta-rule state update |
+| \(\mathbf A\), \(\mathbf b_t\), \(\mathbf c_t\) | SSM state matrix (diagonal) and input-dependent input/output vectors (Mamba's \(A,B,C\)) |
+| \(\Delta_t\) | SSM discretisation step (Ch. 21 only; unrelated to the quantisation step of Ch. 14) |
+| \(d_s\) | SSM state size per channel (Mamba's \(N\)) |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.

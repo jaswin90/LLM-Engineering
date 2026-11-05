@@ -147,6 +147,15 @@
 <tr><td>\(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\)</td><td>rotations pair \(r\) completes over the training length; \(c_{\text{lo}},c_{\text{hi}}\) YaRN ramp thresholds</td></tr>
 <tr><td>\(k_s\)</td><td>tokens (or blocks) selected per query by sparse attention</td></tr>
 </tbody></table></div>
+<h2>Recurrent and state-space layers (Ch. 21)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\mathcal S_t\)</td><td>matrix-valued recurrent state of a linear-attention head after token \(t\) (\(d_v\times d_k\))</td></tr>
+<tr><td>\(\psi(\cdot)\)</td><td>feature map of linear attention, \(\psi(q)^\top\psi(k)\approx\) similarity</td></tr>
+<tr><td>\(f_t\), \(\eta_t\)</td><td>forget (decay) gate in \((0,1]\) and write rate of a gated / delta-rule state update</td></tr>
+<tr><td>\(\mathbf A\), \(\mathbf b_t\), \(\mathbf c_t\)</td><td>SSM state matrix (diagonal) and input-dependent input/output vectors (Mamba's \(A,B,C\))</td></tr>
+<tr><td>\(\Delta_t\)</td><td>SSM discretisation step (Ch. 21 only; unrelated to the quantisation step of Ch. 14)</td></tr>
+<tr><td>\(d_s\)</td><td>SSM state size per channel (Mamba's \(N\))</td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

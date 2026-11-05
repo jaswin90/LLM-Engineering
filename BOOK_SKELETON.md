@@ -149,7 +149,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Position extrapolation (PI, NTK, YaRN) → sparse attention (NSA, DSA) → context parallelism and offload → retrieval vs long context.
 **Refs.** Chen 2023; Peng 2023; Yuan 2025.
 
-### Chapter 21 — Beyond Attention: SSMs, Linear Attention and Hybrids
+### Chapter 21 — Beyond Attention: SSMs, Linear Attention and Hybrids ✅ *(v2)*
 **Arc.** Linear attention as an RNN → S4 → Mamba → Mamba-2 → RWKV, Gated DeltaNet → hybrids and their serving implications.
 **Refs.** Katharopoulos 2020; Gu & Dao 2023; Dao & Gu 2024; Lieber 2024.
 
@@ -192,4 +192,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 18 | Mixture of Experts at Inference | ✅ v2 |
 | 19 | Speculative Decoding | ✅ v2 |
 | 20 | Long-Context Inference | ✅ v2 |
-| 21–26 | — | ⏳ planned |
+| 21 | Beyond Attention: SSMs and Hybrids | ✅ v2 |
+| 22–26 | — | ⏳ planned |
