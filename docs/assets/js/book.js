@@ -9,33 +9,34 @@
   'use strict';
 
   const CHAPTERS = [
-    { id: 'ch01', n: 1, part: 'I', title: 'From Shannon to Serving', sub: 'A history of language modelling and the birth of inference engineering', file: 'chapters/ch01.html', ready: true },
-    { id: 'ch02', n: 2, part: 'I', title: 'The Transformer, Dissected for Inference', sub: 'Shapes, parameters, FLOPs, prefill vs decode, KV cache, arithmetic intensity', file: 'chapters/ch02.html', ready: true },
-    { id: 'ch03', n: 3, part: 'I', title: 'Decoding: From Logits to Text', sub: 'Greedy, beam, temperature, top-k/top-p/min-p, constrained decoding', ready: false },
-    { id: 'ch04', n: 4, part: 'II', title: 'GPU Architecture from First Principles', sub: 'SIMT, SMs, tensor cores, HBM, NVLink; Volta → Blackwell → Rubin; TPUs', ready: false },
-    { id: 'ch05', n: 5, part: 'II', title: 'The Roofline Model and Performance Analysis', sub: 'Arithmetic intensity, MFU/MBU, critical batch size, profiling', ready: false },
-    { id: 'ch06', n: 6, part: 'II', title: 'GPU Programming for Mathematicians', sub: 'CUDA, Triton, tiling, online softmax, fusion, CUDA graphs', ready: false },
-    { id: 'ch07', n: 7, part: 'III', title: 'The KV Cache: Theory, Size and Shrinking It', sub: 'MQA, GQA, MLA, sliding windows, KV quantisation, eviction', ready: false },
-    { id: 'ch08', n: 8, part: 'III', title: 'IO-Aware Attention: FlashAttention 1 → 4', sub: 'Tiling, online softmax, FlashDecoding, FlashInfer, FlashMLA', ready: false },
-    { id: 'ch09', n: 9, part: 'III', title: 'Memory Management: PagedAttention & Prefix Caching', sub: 'Block tables, copy-on-write, RadixAttention, KV hierarchies', ready: false },
-    { id: 'ch10', n: 10, part: 'IV', title: 'Batching and Scheduling', sub: 'Continuous batching, chunked prefill, preemption, SLO-aware scheduling', ready: false },
-    { id: 'ch11', n: 11, part: 'IV', title: 'Inside an Inference Engine', sub: 'vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp', ready: false },
-    { id: 'ch12', n: 12, part: 'IV', title: 'Disaggregated Serving', sub: 'Splitwise, DistServe, Mooncake, Dynamo, KV transfer', ready: false },
-    { id: 'ch13', n: 13, part: 'V', title: 'Quantisation', sub: 'FP8, INT4, MXFP4/NVFP4, GPTQ, AWQ, SmoothQuant, rotations', ready: false },
-    { id: 'ch14', n: 14, part: 'V', title: 'Pruning, Sparsity and Distillation', sub: 'SparseGPT, Wanda, 2:4, Minitron, distillation', ready: false },
-    { id: 'ch15', n: 15, part: 'VI', title: 'Distributed Computing Fundamentals', sub: 'Collectives, α–β model, ring all-reduce, NVLink, InfiniBand, NCCL', ready: false },
-    { id: 'ch16', n: 16, part: 'VI', title: 'Parallelism Strategies for Inference', sub: 'Tensor, pipeline, sequence/context parallelism', ready: false },
-    { id: 'ch17', n: 17, part: 'VI', title: 'Mixture of Experts at Inference', sub: 'Routing, expert parallelism, all-to-all, DeepSeek-V3 deployment', ready: false },
-    { id: 'ch18', n: 18, part: 'VII', title: 'Speculative Decoding', sub: 'Exactness proof, Medusa, EAGLE 1–3, MTP, tree verification', ready: false },
-    { id: 'ch19', n: 19, part: 'VII', title: 'Long-Context Inference', sub: 'RoPE scaling, sparse attention, context parallelism', ready: false },
-    { id: 'ch20', n: 20, part: 'VII', title: 'Beyond Attention: SSMs and Hybrids', sub: 'Linear attention, Mamba, RWKV, hybrid models', ready: false },
-    { id: 'ch21', n: 21, part: 'VIII', title: 'Reasoning Models and Test-Time Compute', sub: 'o1/R1, inference scaling, long-output serving', ready: false },
-    { id: 'ch22', n: 22, part: 'VIII', title: 'Serving at Scale', sub: 'Routing, autoscaling, multi-LoRA, cost modelling', ready: false },
-    { id: 'ch23', n: 23, part: 'VIII', title: 'Benchmarking and Observability', sub: 'Methodology, MLPerf, tracing, quality regressions', ready: false },
-    { id: 'ch24', n: 24, part: 'VIII', title: 'On-Device and Edge Inference', sub: 'llama.cpp, GGUF, MLX, NPUs', ready: false },
-    { id: 'ch25', n: 25, part: 'VIII', title: 'The ML-Systems Design Interview', sub: 'Worked case studies and rubrics', ready: false }
+    { id: 'ch01', n: 1, part: 'I', title: 'From Shannon to Serving', sub: 'The history of language modelling as a chain of bottlenecks, and why inference became the hard problem', file: 'chapters/ch01.html', ready: true },
+    { id: 'ch02', n: 2, part: 'I', title: 'The Transformer, Dissected', sub: 'Tokenisation, attention, RoPE, normalisation, SwiGLU; counting parameters, FLOPs and bytes', file: 'chapters/ch02.html', ready: true },
+    { id: 'ch03', n: 3, part: 'I', title: 'Running the Model: Prefill, Decode and the KV Cache', sub: 'The KV cache, compute vs memory vs overhead, the roofline, and latency models for TTFT and TPOT', file: 'chapters/ch03.html', ready: true },
+    { id: 'ch04', n: 4, part: 'I', title: 'Decoding: From Logits to Text', sub: 'Greedy, beam, temperature, top-k/top-p/min-p, structured output, determinism', ready: false },
+    { id: 'ch05', n: 5, part: 'II', title: 'GPU Architecture from First Principles', sub: 'SIMT, SMs, tensor cores, HBM, NVLink; Volta → Blackwell → Rubin; TPUs and others', ready: false },
+    { id: 'ch06', n: 6, part: 'II', title: 'The Roofline Model and Performance Analysis', sub: 'Hierarchical rooflines, critical batch size, MFU/MBU, profiling', ready: false },
+    { id: 'ch07', n: 7, part: 'II', title: 'GPU Programming for Mathematicians', sub: 'CUDA, Triton, tiling, online softmax, fusion, CUDA graphs', ready: false },
+    { id: 'ch08', n: 8, part: 'III', title: 'The KV Cache: Shrinking It', sub: 'MQA, GQA, MLA, sliding windows, KV quantisation, eviction', ready: false },
+    { id: 'ch09', n: 9, part: 'III', title: 'IO-Aware Attention: FlashAttention 1 → 4', sub: 'Tiling, online softmax, FlashDecoding, FlashInfer, FlashMLA', ready: false },
+    { id: 'ch10', n: 10, part: 'III', title: 'Memory Management: PagedAttention and Prefix Caching', sub: 'Block tables, copy-on-write, radix trees, KV hierarchies', ready: false },
+    { id: 'ch11', n: 11, part: 'IV', title: 'Batching and Scheduling', sub: 'Continuous batching, chunked prefill, preemption, SLO-aware scheduling', ready: false },
+    { id: 'ch12', n: 12, part: 'IV', title: 'Inside an Inference Engine', sub: 'vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp', ready: false },
+    { id: 'ch13', n: 13, part: 'IV', title: 'Disaggregated Serving', sub: 'Splitwise, DistServe, Mooncake, Dynamo, KV transfer', ready: false },
+    { id: 'ch14', n: 14, part: 'V', title: 'Quantisation', sub: 'FP8, INT4, MXFP4/NVFP4, GPTQ, AWQ, SmoothQuant, rotations', ready: false },
+    { id: 'ch15', n: 15, part: 'V', title: 'Pruning, Sparsity and Distillation', sub: 'SparseGPT, Wanda, 2:4, Minitron, distillation', ready: false },
+    { id: 'ch16', n: 16, part: 'VI', title: 'Distributed Computing Fundamentals', sub: 'Collectives, the α–β model, ring all-reduce, NVLink, InfiniBand, NCCL', ready: false },
+    { id: 'ch17', n: 17, part: 'VI', title: 'Parallelism Strategies for Inference', sub: 'Tensor, pipeline, sequence and context parallelism', ready: false },
+    { id: 'ch18', n: 18, part: 'VI', title: 'Mixture of Experts at Inference', sub: 'Routing, expert parallelism, all-to-all, the DeepSeek-V3 deployment', ready: false },
+    { id: 'ch19', n: 19, part: 'VII', title: 'Speculative Decoding', sub: 'Exactness proof, Medusa, EAGLE 1–3, MTP, tree verification', ready: false },
+    { id: 'ch20', n: 20, part: 'VII', title: 'Long-Context Inference', sub: 'RoPE scaling, sparse attention, context parallelism', ready: false },
+    { id: 'ch21', n: 21, part: 'VII', title: 'Beyond Attention: SSMs and Hybrids', sub: 'Linear attention, Mamba, RWKV, hybrid models', ready: false },
+    { id: 'ch22', n: 22, part: 'VIII', title: 'Reasoning Models and Test-Time Compute', sub: 'o1/R1, inference scaling, long-output serving', ready: false },
+    { id: 'ch23', n: 23, part: 'VIII', title: 'Serving at Scale', sub: 'Routing, autoscaling, multi-LoRA, cost modelling', ready: false },
+    { id: 'ch24', n: 24, part: 'VIII', title: 'Benchmarking and Observability', sub: 'Methodology, MLPerf, tracing, quality regressions', ready: false },
+    { id: 'ch25', n: 25, part: 'VIII', title: 'On-Device and Edge Inference', sub: 'llama.cpp, GGUF, MLX, NPUs', ready: false },
+    { id: 'ch26', n: 26, part: 'VIII', title: 'The ML-Systems Design Interview', sub: 'Worked case studies and rubrics', ready: false }
   ];
-  const PARTS = { I: 'Foundations: How We Got Here', II: 'The Machine: Hardware for Mathematicians', III: 'Attention and Memory', IV: 'Serving Systems', V: 'Making Models Smaller', VI: 'Distributed Inference', VII: 'Faster Decoding and Longer Contexts', VIII: 'Production' };
+  const PARTS = { I: 'Foundations: What We Run and Why It Is Expensive', II: 'The Machine: Hardware for Mathematicians', III: 'Attention and Memory', IV: 'Serving Systems', V: 'Making Models Smaller', VI: 'Distributed Inference', VII: 'Faster Decoding and Longer Contexts', VIII: 'Production' };
 
   /* ------------------------------------------------------------------ store */
   const KEY = 'llmeng-progress-v1';
@@ -123,7 +124,7 @@
       '<button class="btn icon-btn" id="toc-toggle" aria-label="Contents">☰</button>' +
       '<a class="brand" href="' + r + 'index.html">Introduction to <span>LLM Engineering</span></a>' +
       '<span class="spacer"></span>' +
-      '<nav><a href="' + r + 'index.html#contents">Contents</a><a href="' + r + 'progress.html">My progress</a><a href="' + r + 'references.html">Bibliography</a></nav>' +
+      '<nav><a href="' + r + 'index.html#contents">Contents</a><a href="' + r + 'notation.html">Notation</a><a href="' + r + 'progress.html">My progress</a><a href="' + r + 'references.html">Bibliography</a></nav>' +
       '<button class="btn icon-btn" id="theme-btn" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>' +
       '<span id="auth-slot"><button class="btn" id="auth-btn" title="Sign in to sync your progress">Sign in</button></span>';
     document.body.insertBefore(bar, document.body.firstChild);

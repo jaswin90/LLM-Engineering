@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ch 1 · From Shannon to Serving — Introduction to LLM Engineering</title>
-<meta name="description" content="Chapter 1 of Introduction to LLM Engineering: the history of language modelling and the birth of LLM inference engineering, with MCQs and interview questions.">
+<meta name="description" content="Chapter 1 of Introduction to LLM Engineering: the history of language modelling as a chain of bottlenecks, why inference became the dominant cost, the memory wall, and the vocabulary of serving metrics.">
 <script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -22,115 +22,91 @@
 <aside class="sidebar" aria-label="Chapter contents"></aside>
 <main>
 <article>
-
 <div class="chapter-kicker">Part I · Foundations — Chapter 1</div>
 <h1 id="top">From Shannon to Serving</h1>
-<p class="lede">A history of language modelling, and how running a trained model—<em>inference</em>—became the hardest and most expensive engineering problem in AI.</p>
+<p class="lede">How predicting the next word went from a parlour game for information theorists to the most expensive computation on Earth—and why <em>running</em> a language model became a discipline of its own.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Type a question into a chat assistant and press Enter. Within a few hundred milliseconds the first words appear, and the rest of the answer streams in at roughly the speed you can read. Behind that experience, a model with tens or hundreds of billions of parameters is evaluated once for every word-fragment it writes. Each evaluation reads gigabytes of numbers from memory. Thousands of other people are being served by the same chips at the same moment, each with their own conversation history held in that memory. Every second of this costs real money, and across the industry the bill for <em>serving</em> models has grown to rival or exceed the bill for <em>training</em> them.</p>
+<p>This book is about the engineering that makes that experience possible: <strong>LLM inference engineering</strong>. It sits at the meeting point of numerical linear algebra, computer architecture, distributed systems and queueing theory. Before we can study any of its techniques, we need to understand how we got here. Why are today's models shaped the way they are? Why does producing text one token at a time stress hardware in such a particular way? Why did the industry's cost centre move from training to serving, and when?</p>
+<p>This chapter answers those questions by telling the history of language modelling as a sequence of bottlenecks. Each generation of models solved the problem that limited its predecessor, and in doing so created a new problem. You will see the central tension of the whole book emerge in §1.6, when the Transformer trades a model with a small, fixed memory for one whose memory grows with every token it reads. By the end of the chapter you will be able to estimate, with nothing more than a model size and a hardware datasheet, how fast a model can possibly write. You will also have the vocabulary that the rest of the book, and every inference interview, uses.</p>
 
 <div class="box objectives">
 <div class="box-title">Learning objectives</div>
-<p>After this chapter you should be able to:</p>
 <ol>
-<li>State language modelling as conditional density estimation and relate cross-entropy, bits-per-token and perplexity.</li>
-<li>Explain, in one sentence each, the problem that each era solved (n-grams → neural LMs → RNNs → attention → Transformers → scaling → reasoning) and the new problem each created.</li>
-<li>Contrast the <em>inference state</em> of an RNN (constant size) with that of a Transformer (the KV cache, growing linearly)—the trade-off that organises this whole book.</li>
-<li>Explain why compute-optimal training (Chinchilla) is not inference-optimal, and why modern small models are trained on 100–2000 tokens per parameter.</li>
-<li>Define TTFT, TPOT, ITL, throughput, goodput and cost per million tokens, and say which a given product cares about.</li>
-<li>Do your first bandwidth-bound back-of-the-envelope estimate of decode speed.</li>
+<li>State language modelling as conditional density estimation, and convert between cross-entropy, bits per byte and perplexity.</li>
+<li>For each era (n-grams, neural LMs, RNNs, attention, Transformers, scaling, reasoning), name the bottleneck it removed and the one it introduced.</li>
+<li>Contrast the <em>inference state</em> of an RNN (constant size) with that of a Transformer (the KV cache, growing with context).</li>
+<li>Derive the Chinchilla compute-optimal allocation, and explain why heavily served models are trained far beyond it.</li>
+<li>Explain the "memory wall" and use it to bound the speed of single-user generation.</li>
+<li>Define TTFT, TPOT, ITL, throughput, goodput and cost per million tokens, and apply Little's law.</li>
 </ol>
 </div>
-
-<h2 id="s1-1">1.1 Why a book on inference, and why now</h2>
-
-<p>For most of the history of machine learning, the interesting engineering happened during <em>training</em>. Inference—evaluating a trained function on a new input—was an afterthought: a ResNet-50 classifies an image in a few GFLOPs, one forward pass, done. Large language models broke this picture in three ways at once.</p>
-<ol>
-<li><strong>Inference is iterative.</strong> An LLM produces its output one token at a time, each token requiring a full pass through billions of parameters. A 1,000-token answer is 1,000 sequential forward passes.</li>
-<li><strong>Inference is stateful.</strong> Each pass must see everything that came before. The model carries a growing state—the <em>key–value cache</em>—that can be larger than the model weights themselves.</li>
-<li><strong>Inference is where the money is.</strong> A frontier model is trained once, but served billions of times. Over a model's lifetime the compute spent answering requests routinely exceeds the compute spent training it (§1.9), and with reasoning models that think for thousands of tokens before answering (§1.11), the ratio keeps growing.</li>
-</ol>
-<p>The result is a new discipline—<strong>LLM inference engineering</strong>—sitting at the intersection of numerical linear algebra, computer architecture, distributed systems and queueing theory. Companies hire specifically for it ("inference engineer", "ML systems engineer", "performance engineer, LLM serving"), and the interview loops probe a recognisable body of knowledge: KV caches, attention kernels, batching, quantisation, parallelism, speculative decoding, GPU architecture, and back-of-the-envelope cost estimation.</p>
 
 <div class="box bridge">
-<div class="box-title">For the mathematician</div>
-<p>You already own most of the tools. The roofline model is a minimum of two linear functions. A KV cache is memoisation of a function whose arguments only ever grow. Speculative decoding is rejection sampling. Continuous batching is a scheduling problem with a queueing-theoretic objective. Ring all-reduce is a bandwidth-optimal algorithm whose optimality is a three-line counting argument. What you may lack is the <em>vocabulary</em> of systems engineering and a mental model of the machine. This book supplies both, in "software-engineering bridge" boxes like this one.</p>
+<div class="box-title">How to read this book</div>
+<p>Each chapter interleaves theory with worked examples, short <em>drills</em> (numerical problems with hidden solutions; do them with pen and paper), multiple-choice questions and graded interview questions. Click an MCQ option to see whether you were right and why. Reveal an interview answer only after answering out loud, then rate yourself. Your answers are saved in your browser, or across devices if you sign in. Symbols are used consistently across the whole book; the <a href="../notation.html">notation page</a> lists them all. Three <strong>running examples</strong> recur throughout: <em>Llama 3 8B</em> (a typical dense model), <em>Llama 3 70B</em> (a large dense model) and <em>DeepSeek-V3</em> (a 671-billion-parameter mixture-of-experts model). The reference hardware is NVIDIA's <em>H100</em> GPU.</p>
 </div>
 
-<h3 id="how-to-read">How to use this book</h3>
-<p>Each chapter interleaves theory with four kinds of active material:</p>
-<ul>
-<li><strong>Worked examples</strong> with real model configurations and real hardware numbers.</li>
-<li><strong>Back-of-the-envelope drills</strong>—short numerical problems with hidden solutions. Do them with pen and paper; interviewers expect you to be fluent.</li>
-<li><strong>Multiple-choice questions</strong> at the end of each chapter. Click an option to see whether you were right and why. Your answers are saved; sign in with Google (top right) to keep your history across devices.</li>
-<li><strong>Interview questions</strong> graded <span class="pill">Warm-up</span> <span class="pill">Core</span> <span class="pill">Deep-dive</span> <span class="pill">Design</span>. Answer out loud before revealing the model answer, then rate yourself; your "review again" list appears on the <a href="../progress.html">My progress</a> page.</li>
-</ul>
-
-<h2 id="s1-2">1.2 Language modelling as probability</h2>
-
-<p>Fix a finite vocabulary \(V\) of <em>tokens</em> (words, sub-words or bytes; Chapter 2 explains how they are chosen). A <strong>language model</strong> is a probability distribution over finite sequences \(x_{1:T} = (x_1,\dots,x_T) \in V^*\). Every such distribution can be factorised by the chain rule of probability—no assumptions needed:</p>
+<h2 id="s1-1">1.1 Language as a probability distribution</h2>
+<p>In 1948 Claude Shannon wanted to understand how much information English text carries, and therefore how efficiently it could be transmitted. His insight was to treat text as the output of a random process. Each letter is drawn from a distribution that depends on the letters before it. A source with predictable output carries little information per symbol; a source whose next symbol is hard to guess carries a lot<span class="cite"><a href="#ref-shannon48">[1]</a></span>. Three years later he measured the predictability of English directly. Human subjects guessed the next letter of a passage one character at a time, and from the number of guesses they needed he estimated that printed English carries roughly 0.6 to 1.3 bits per character<span class="cite"><a href="#ref-shannon51">[2]</a></span>. That number is, in a precise sense, the target every language model since has been chasing.</p>
+<p>The modern formulation is Shannon's, made explicit. Fix a finite vocabulary \(\mathcal V\) of <em>tokens</em>. Tokens can be characters, words or the sub-word pieces that Chapter 2 describes. A <strong>language model</strong> is a probability distribution over finite token sequences \(x_{1:T}=(x_1,\dots,x_T)\). Any such distribution can be written, with no assumptions at all, by the chain rule of probability:</p>
 \[ p(x_{1:T}) \;=\; \prod_{t=1}^{T} p(x_t \mid x_{&lt;t}), \qquad x_{&lt;t} := (x_1,\dots,x_{t-1}). \]
-<p>An <strong>autoregressive</strong> language model parameterises the conditionals \(p_\theta(x_t \mid x_{&lt;t})\) directly. Two consequences shape everything that follows:</p>
-<ul>
-<li><strong>Training is parallel.</strong> Given a whole document, all \(T\) conditionals can be evaluated simultaneously (if the architecture allows it—the Transformer does, the RNN does not).</li>
-<li><strong>Generation is sequential.</strong> To sample, we must draw \(x_1\), then \(x_2 \sim p_\theta(\cdot\mid x_1)\), and so on. There is no way around the dependency chain without changing the model or the sampler (Chapter 18 shows one way to cheat it exactly).</li>
-</ul>
+<p>An <strong>autoregressive</strong> language model parameterises the conditionals \(p_\theta(x_t\mid x_{&lt;t})\) directly, with parameters \(\theta\). Everything in this book follows from two consequences of this choice. First, <em>training can be parallel</em>. Given a complete document, all \(T\) conditional probabilities can in principle be evaluated at the same time, because every prefix is already known. Whether that parallelism is actually available depends on the architecture, and this turns out to decide which architecture wins (§1.6). Second, <em>generation is sequential</em>. To sample a new text we must draw \(x_1\), feed it back, draw \(x_2\sim p_\theta(\cdot\mid x_1)\), and so on. Each token needs a fresh evaluation of the model, and the \(t\)-th evaluation cannot begin until the \((t-1)\)-th has finished. This sequential dependence is the root of almost every difficulty in LLM inference.</p>
 
-<h3 id="cross-entropy">Cross-entropy, bits and perplexity</h3>
-<p>Let \(p^{*}\) be the (unknown) true distribution of text. We fit \(\theta\) by minimising the per-token cross-entropy</p>
-\[ H(p^{*}, p_\theta) \;=\; -\,\mathbb{E}_{x \sim p^{*}}\Big[\tfrac{1}{T}\textstyle\sum_{t} \log p_\theta(x_t\mid x_{&lt;t})\Big], \]
-<p>estimated on held-out text. By Gibbs' inequality \(H(p^{*},p_\theta) = H(p^{*}) + D_{\mathrm{KL}}(p^{*}\,\|\,p_\theta) \ge H(p^{*})\): the loss is bounded below by the entropy rate of language, the irreducible term that reappears as the constant \(E\) in the Chinchilla scaling law (§1.8).</p>
-<div class="box def">
-<div class="box-title">Definition — perplexity</div>
-<p>With \(H\) measured in nats per token, the <strong>perplexity</strong> is \(\mathrm{PP} = e^{H}\) (equivalently \(2^{H}\) with \(H\) in bits). It is the size of a uniform distribution with the same cross-entropy: a perplexity of 8 means the model is, on average, as uncertain as a fair 8-sided die.</p>
-</div>
-<p>Perplexity is <em>tokeniser-dependent</em>: a model with a larger vocabulary predicts fewer, "bigger" tokens per document, so per-token perplexities are not comparable across tokenisers. Normalise to <strong>bits per byte</strong> (or per character) to compare models fairly—exactly the unit Claude Shannon used in 1951, when he had human subjects guess the next letter of English text and estimated the entropy of printed English at roughly 0.6–1.3 bits per character<span class="cite"><a href="#ref-shannon51">[2]</a></span>. Shannon's earlier 1948 paper had already introduced \(n\)-gram approximations to English as an illustration of a Markov source<span class="cite"><a href="#ref-shannon48">[1]</a></span>; seventy years of language modelling have been an effort to push the cross-entropy towards his bound.</p>
+<h3 id="cross-entropy">Measuring a language model</h3>
+<p>How do we know whether one model is better than another? Let \(p^{*}\) be the true, unknown distribution of text. We would like \(p_\theta\) to be close to \(p^{*}\), and the natural measure is the per-token <strong>cross-entropy</strong>, estimated on held-out text:</p>
+\[ H(p^{*}, p_\theta) \;=\; -\,\mathbb{E}_{x \sim p^{*}}\Big[\tfrac{1}{T}\textstyle\sum_{t=1}^{T} \log p_\theta(x_t\mid x_{&lt;t})\Big]. \]
+<p>This is exactly the training loss of every modern LLM. It decomposes as \(H(p^{*},p_\theta) = H(p^{*}) + D_{\mathrm{KL}}(p^{*}\,\|\,p_\theta)\). Because the Kullback–Leibler divergence is non-negative (Gibbs' inequality), the loss can never fall below \(H(p^{*})\), the entropy rate of language itself. Some uncertainty in text is irreducible: no model can know which of several equally sensible continuations an author chose. We will meet this floor again as the constant \(E\) in the scaling laws of §1.8.</p>
+<p>Cross-entropy is often reported as <strong>perplexity</strong>, \(\mathrm{PP}=e^{H}\) when \(H\) is in nats (or \(2^{H}\) in bits). Perplexity has a pleasant interpretation as an effective branching factor. A perplexity of 8 means the model is, on average, as uncertain as if it were choosing uniformly among 8 tokens. Perplexity has one trap: it depends on what a token is. A model with a larger vocabulary predicts fewer but more informative tokens per document, so its per-token perplexity can be higher even when it assigns higher probability to the text as a whole. To compare models with different tokenisers, divide the total negative log-likelihood by the number of bytes (or characters). The result, <strong>bits per byte</strong>, is in Shannon's own units.</p>
 
 <div class="box example">
 <div class="box-title">Worked example — converting units</div>
-<p>A model reports a validation loss of 1.95 nats/token on English web text, with a tokeniser averaging 4.2 bytes per token. Its perplexity is \(e^{1.95}\approx 7.0\). In bits per byte: \(1.95/\ln 2 = 2.81\) bits/token, divided by 4.2 bytes/token \(=0.67\) bits/byte—inside Shannon's human range.</p>
+<p>A model reports a validation loss of 1.95 nats per token on English web text, using a tokeniser that averages 4.2 bytes per token. Its perplexity is \(e^{1.95}\approx 7.0\). In bits per token the loss is \(1.95/\ln 2 = 2.81\); dividing by 4.2 bytes per token gives \(0.67\) bits per byte. For English text, where a byte is essentially a character, this lies inside Shannon's estimate of human predictive ability.</p>
 </div>
 
-<h2 id="s1-3">1.3 The count-based era (1948–2003)</h2>
-<p>The first practical language models made a <strong>Markov assumption</strong> of order \(n-1\):</p>
-\[ p(x_t\mid x_{&lt;t}) \approx p(x_t \mid x_{t-n+1:t-1}), \qquad \hat p_{\text{MLE}}(w\mid h) = \frac{c(h,w)}{c(h)}, \]
-<p>with \(c(\cdot)\) counts in a corpus. From the 1970s to the 2000s, \(n\)-gram models powered speech recognition and statistical machine translation, notably at IBM under Fred Jelinek—whose group is often credited with the quip that recognition accuracy improved every time a linguist left the team.</p>
-<p>The fatal flaw is <strong>sparsity</strong>. A model of order \(n\) has \(|V|^{n}\) possible contexts-plus-continuations; with \(|V|=50{,}000\) a trigram table has \(1.25\times10^{14}\) cells, almost all of which are never observed. The MLE assigns probability zero to any unseen \(n\)-gram, giving infinite perplexity. Decades of work went into <em>smoothing</em>: additive (Laplace), Good–Turing, Katz back-off, interpolation, and finally <strong>Kneser–Ney</strong> smoothing<span class="cite"><a href="#ref-kn">[3]</a></span>, which backs off to a "continuation" distribution—how many distinct contexts a word appears in, not how often it appears. Chen and Goodman's empirical study<span class="cite"><a href="#ref-chen-goodman">[4]</a></span> established modified Kneser–Ney as the strongest count-based method.</p>
+<p>We now have a target, the entropy of language, and a yardstick, cross-entropy. The history that follows is the story of how the gap between them was closed, and of what each step cost when the model is <em>run</em>.</p>
+
+<h2 id="s1-2">1.2 Counting: the n-gram era (1948–2003)</h2>
+<p>The conditionals \(p(x_t\mid x_{&lt;t})\) depend on an unboundedly long history. The first practical idea was to throw most of that history away. An \(n\)-gram model makes a <strong>Markov assumption</strong> of order \(n-1\): the next token depends only on the previous \(n-1\) tokens. The model then reduces to a table of counts. If \(c(\cdot)\) counts occurrences in a training corpus, the maximum-likelihood estimate is</p>
+\[ p(x_t\mid x_{&lt;t}) \approx p(x_t \mid x_{t-n+1:t-1}), \qquad \hat p_{\text{MLE}}(w\mid h) = \frac{c(h,w)}{c(h)} . \]
+<p>For three decades this was the state of the art. Shannon himself used \(n\)-gram approximations to generate increasingly English-like gibberish in his 1948 paper. From the 1970s, groups at IBM led by Fred Jelinek built speech recognisers on trigram models. That work established the statistical, data-driven approach to language that eventually displaced hand-written grammars; Jelinek is often credited with the quip that his system's accuracy improved every time a linguist left the team.</p>
+<p>The \(n\)-gram's weakness is <strong>sparsity</strong>, and it is exponential. There are \(|\mathcal V|^{n-1}\) possible contexts. With a modest vocabulary of 50,000 words a trigram model has \(2.5\times10^{9}\) contexts, each with 50,000 possible continuations: \(1.25\times10^{14}\) table cells, almost none of which appear in any corpus. The maximum-likelihood estimate assigns probability zero to every unseen combination. One unseen trigram in a test sentence makes its probability zero and its perplexity infinite. A great deal of ingenuity went into <em>smoothing</em>, which moves probability mass from seen to unseen events. Methods included add-one (Laplace), Good–Turing, Katz back-off, linear interpolation, and finally <strong>Kneser–Ney</strong> smoothing<span class="cite"><a href="#ref-kn">[3]</a></span>. Kneser–Ney's insight is subtle and worth remembering. When backing off to a shorter context, a word's probability should reflect how many <em>different</em> contexts it follows, not how often it occurs. "Francisco" is frequent, but almost always after "San", so it deserves little probability after an unfamiliar word. Chen and Goodman's careful comparison established modified Kneser–Ney as the strongest count-based method<span class="cite"><a href="#ref-chen-goodman">[4]</a></span>.</p>
+<p>Smoothing reduced the symptoms but could not cure the disease. A count table cannot generalise: evidence about "the cat sat on the mat" says nothing about "the dog sat on the rug", because the model has no notion that cats and dogs are similar. Increasing \(n\) to capture longer context only makes the sparsity worse.</p>
 
 <div class="box interview">
-<div class="box-title">Why an inference engineer should care about n-grams</div>
-<p>They have not disappeared. <em>Prompt-lookup</em> and <em>n-gram speculative decoding</em> (Chapter 18) use exactly this idea—match the last few tokens against earlier text and propose the continuation—as a free draft model. And an \(n\)-gram is the purest example of a model with <em>bounded</em> context: its "state" is the last \(n-1\) tokens, a theme we will revisit with sliding-window attention.</p>
+<div class="box-title">Why an inference engineer should still care about n-grams</div>
+<p>Two ideas from this era return later in the book. First, an \(n\)-gram's state is the last \(n-1\) tokens: its memory is <em>bounded</em>, an idea that reappears as sliding-window attention (Chapter 8). Second, matching recent tokens against earlier text is a free and surprisingly good predictor. Modern servers use it as a "draft model" in <em>prompt-lookup</em> and <em>n-gram speculative decoding</em> (Chapter 19), for example when a model is copying code or quoting a document.</p>
 </div>
 
-<h2 id="s1-4">1.4 The neural turn (2003–2013)</h2>
-<p>Bengio, Ducharme, Vincent and Jauvin<span class="cite"><a href="#ref-bengio03">[5]</a></span> attacked sparsity with <strong>distributed representations</strong>. Each word \(w\) is mapped to a learned vector \(C(w)\in\mathbb{R}^{m}\); the \(n-1\) context vectors are concatenated and passed through a hidden layer and a softmax over the vocabulary:</p>
-\[ p(x_t = w \mid x_{t-n+1:t-1}) = \operatorname{softmax}\!\big(b + U\tanh(d + H[C(x_{t-1});\dots;C(x_{t-n+1})])\big)_w . \]
-<p>Similar words get similar vectors, so evidence about "the cat sat" transfers to "the dog sat"—generalisation by smoothness in embedding space rather than by count heuristics. Two details foreshadow modern inference:</p>
-<ul>
-<li>The <strong>softmax over \(|V|\)</strong> was the computational bottleneck. Bengio et al. had to parallelise it across machines. Today the output projection ("LM head") of a model with a 128k–256k vocabulary is still one of the largest single matrices (Chapter 2).</li>
-<li>The embedding table is a <strong>lookup</strong>, not a matrix multiply: memory-bound, cheap in FLOPs.</li>
-</ul>
-<p>Mikolov's recurrent neural LM (2010)<span class="cite"><a href="#ref-rnnlm">[6]</a></span> and especially <strong>word2vec</strong> (2013)<span class="cite"><a href="#ref-w2v">[7]</a></span> made embeddings ubiquitous; the latter's famous linear regularities (\(\vec{\text{king}}-\vec{\text{man}}+\vec{\text{woman}}\approx\vec{\text{queen}}\)) convinced the field that geometry in representation space carries meaning.</p>
+<h2 id="s1-3">1.3 Learning representations: the neural turn (2003–2013)</h2>
+<p>The cure for sparsity was to stop treating words as atomic symbols. Bengio, Ducharme, Vincent and Jauvin proposed the <strong>neural probabilistic language model</strong> in 2003<span class="cite"><a href="#ref-bengio03">[5]</a></span>. Each word \(w\) is assigned a learned vector \(e_w\in\mathbb R^{d}\), its <em>embedding</em>. The previous \(n-1\) embeddings are concatenated, passed through a hidden layer, and mapped by a softmax to a distribution over the whole vocabulary:</p>
+\[ p(x_t = w \mid x_{t-n+1:t-1}) = \operatorname{softmax}\!\big(b + U\tanh(c + H[e_{x_{t-1}};\dots;e_{x_{t-n+1}}])\big)_w . \]
+<p>Because similar words are trained to have similar vectors, what the model learns about one context transfers smoothly to similar contexts. This is generalisation by continuity in embedding space rather than by counting heuristics. The model still used a fixed window of \(n-1\) words, but it beat smoothed \(n\)-grams on perplexity.</p>
+<p>Two details of Bengio's model are worth noticing, because they are still true of the largest models today. The <strong>embedding is a lookup, not a computation</strong>. Fetching row \(x_t\) of a table costs no arithmetic, only a memory read. And the <strong>softmax over the vocabulary was the computational bottleneck</strong>: the output layer has one row per vocabulary word, so it was by far the largest matrix, and Bengio et al. had to distribute it across machines. Twenty years later the output projection of a model with a 128,000-token vocabulary is still one of its largest matrices (Chapter 2).</p>
+<p>Embeddings became ubiquitous with Mikolov and colleagues' <strong>word2vec</strong> (2013)<span class="cite"><a href="#ref-w2v">[7]</a></span>. It trained embeddings cheaply on billions of words and revealed striking linear structure: \(e_{\text{king}}-e_{\text{man}}+e_{\text{woman}}\approx e_{\text{queen}}\). The lesson the field drew was that geometry in a learned vector space can carry meaning. But the fixed context window remained. To condition on <em>everything</em> that came before, the model needed some form of memory.</p>
 
-<h2 id="s1-5">1.5 The recurrent era (2010–2017): constant-size state</h2>
-<p>A recurrent neural network drops the fixed window. It maintains a hidden state \(h_t\in\mathbb{R}^d\) updated by</p>
-\[ h_t = \phi(W h_{t-1} + U e_{x_t} + b), \qquad p(x_{t+1}\mid x_{\le t}) = \operatorname{softmax}(O h_t). \]
-<p>In principle \(h_t\) summarises the whole prefix. In practice, training by back-propagation through time multiplies Jacobians:</p>
+<h2 id="s1-4">1.4 Remembering: the recurrent era (2010–2017)</h2>
+<p>A <strong>recurrent neural network</strong> (RNN) abandons the fixed window. It carries a hidden state \(h_t\in\mathbb R^{d}\) forward through the sequence, updating it with each new token:</p>
+\[ h_t = \phi(W h_{t-1} + U e_{x_t} + b), \qquad p(x_{t+1}\mid x_{\le t}) = \operatorname{softmax}(W_{\text{out}} h_t). \]
+<p>Mikolov's recurrent language model (2010)<span class="cite"><a href="#ref-rnnlm">[6]</a></span> showed large perplexity gains over \(n\)-grams. In principle \(h_t\) can summarise the entire prefix. In practice, training it to do so is hard. Back-propagation through time multiplies Jacobians, one per step:</p>
 \[ \frac{\partial h_t}{\partial h_{s}} = \prod_{k=s+1}^{t} \operatorname{diag}\big(\phi'(a_k)\big)\, W, \qquad \Big\|\frac{\partial h_t}{\partial h_{s}}\Big\| \le \big(\gamma\,\|W\|\big)^{t-s}, \]
-<p>where \(\gamma\) bounds \(|\phi'|\). Unless \(\gamma\|W\|\approx 1\) the gradient vanishes or explodes exponentially in the distance \(t-s\) — the <strong>vanishing-gradient problem</strong> identified by Hochreiter (1991) and Bengio, Simard and Frasconi (1994)<span class="cite"><a href="#ref-bengio94">[8]</a></span>. The <strong>LSTM</strong><span class="cite"><a href="#ref-lstm">[9]</a></span> fixed this with an additively-updated cell state \(c_t = f_t\odot c_{t-1} + i_t\odot \tilde c_t\), whose Jacobian along the cell path is the diagonal gate \(f_t\), close to the identity when the forget gate is open.</p>
-
-<p>In 2014 Sutskever, Vinyals and Le<span class="cite"><a href="#ref-seq2seq">[10]</a></span> showed that an LSTM <em>encoder</em> could compress a source sentence into a vector and an LSTM <em>decoder</em> could generate a translation from it (seq2seq). The bottleneck was obvious: a whole sentence squeezed into one fixed vector. Bahdanau, Cho and Bengio<span class="cite"><a href="#ref-bahdanau">[11]</a></span> introduced <strong>attention</strong>: at each decoder step \(i\), compute weights over <em>all</em> encoder states,</p>
-\[ \alpha_{ij} = \frac{\exp(\mathrm{score}(s_{i-1}, h_j))}{\sum_{k}\exp(\mathrm{score}(s_{i-1}, h_k))}, \qquad c_i = \sum_j \alpha_{ij}\,h_j, \]
-<p>so the decoder "looks back" at the source as needed. Remember the shape of this: to attend, you must <em>keep</em> all the \(h_j\).</p>
+<p>where \(a_k\) is the pre-activation and \(\gamma\) bounds \(|\phi'|\). Unless \(\gamma\|W\|\) stays very close to 1, the influence of an early token on a late gradient shrinks or grows <em>exponentially</em> with the distance between them. Hochreiter (1991) and Bengio, Simard and Frasconi (1994)<span class="cite"><a href="#ref-bengio94">[8]</a></span> identified this <strong>vanishing-gradient problem</strong>. Its consequence is that a vanilla RNN learns short-range dependencies well and long-range ones barely at all.</p>
+<p>The <strong>Long Short-Term Memory</strong> (LSTM) cell of Hochreiter and Schmidhuber<span class="cite"><a href="#ref-lstm">[9]</a></span> fixed this with an architectural trick. Its cell state is updated <em>additively</em>, \(c_t = f_t\odot c_{t-1} + i_t\odot \tilde c_t\), where \(f_t\) and \(i_t\) are learned gates in \((0,1)\). Along the cell path the Jacobian is just the diagonal matrix \(\operatorname{diag}(f_t)\). When the forget gate is open, gradients flow back many steps almost undiminished. LSTMs became the workhorse of sequence modelling.</p>
+<p>Recurrence also enabled <em>conditional</em> generation. In 2014 Sutskever, Vinyals and Le<span class="cite"><a href="#ref-seq2seq">[10]</a></span> used one LSTM to read a source sentence into a vector and a second LSTM to generate its translation from that vector (sequence-to-sequence). The weak point was obvious: an entire sentence, of any length, squeezed into one fixed-size vector. The same year Bahdanau, Cho and Bengio<span class="cite"><a href="#ref-bahdanau">[11]</a></span> removed the squeeze with <strong>attention</strong>. At each output step \(s\), the decoder computes a weight for every encoder state \(h_j\), based on how relevant it is to the decoder's current state, and reads a weighted average:</p>
+\[ \alpha_{sj} = \frac{\exp(\operatorname{score}(q_{s}, h_j))}{\sum_{k}\exp(\operatorname{score}(q_{s}, h_k))}, \qquad c_s = \sum_j \alpha_{sj}\,h_j, \]
+<p>where \(q_s\) is the decoder's state. Attention lets the decoder look back at whichever parts of the source it needs. Notice what this requires: to attend to the past, you must <em>keep</em> the past.</p>
 
 <div class="box thm">
-<div class="box-title">Key property — inference cost of an RNN</div>
-<p>Generating one token costs \(O(d^2)\) FLOPs (a few matrix–vector products) and needs \(O(d)\) memory of state per sequence, <em>independent of how long the sequence already is</em>. An RNN is the ideal inference machine. Its curse is training: step \(t\) cannot start before step \(t-1\) finishes, so a length-\(T\) sequence needs \(T\) sequential steps, which leaves GPUs idle.</p>
+<div class="box-title">Key property — the inference cost of an RNN</div>
+<p>Generating one token with an RNN costs \(O(d^2)\) floating-point operations (a few matrix–vector products). The only memory carried from step to step is \(h_t\): \(O(d)\) numbers per sequence, <em>independent of how long the sequence already is</em>. As an inference machine, the RNN is close to ideal. Its curse is training. Step \(t\) cannot be computed before step \(t-1\), so even when the whole training document is known, the work is a chain of \(T\) dependent steps. Parallel hardware cannot shorten that chain.</p>
 </div>
 
-<h2 id="s1-6">1.6 The Transformer (2017): parallel training, growing state</h2>
-<p>"Attention Is All You Need"<span class="cite"><a href="#ref-vaswani">[12]</a></span> removed recurrence entirely. Every position computes a query \(q_t\), key \(k_t\) and value \(v_t\) by linear maps, and attends to all permitted positions:</p>
-\[ \operatorname{Attn}(Q,K,V) = \operatorname{softmax}\!\Big(\frac{QK^\top}{\sqrt{d_k}} + M\Big)V , \]
-<p>with \(M\) a causal mask (\(-\infty\) above the diagonal) for language modelling. Because the whole \(T\times T\) score matrix is a single matrix product, training on a length-\(T\) document is one big parallel computation instead of \(T\) dependent steps—perfectly suited to GPUs. The original big model trained in 3.5 days on 8 NVIDIA P100 GPUs and set a new state of the art in English–German translation.</p>
-<p>But look at what generation now requires. To produce token \(t+1\), the new query must be dotted with the keys of all \(t\) previous tokens, in every layer. Recomputing those keys and values every step would make generation quadratic. Instead, we <em>cache</em> them. This is the <strong>KV cache</strong>, the single most important data structure in this book.</p>
+<h2 id="s1-5">1.5 The Transformer's bargain (2017)</h2>
+<p>By 2016 the most accurate translation systems were stacks of LSTMs with attention, and training them was painfully slow. The authors of "Attention Is All You Need"<span class="cite"><a href="#ref-vaswani">[12]</a></span> asked a radical question: if attention can look at any position directly, why keep the recurrence at all? The <strong>Transformer</strong> computes, for every position, a query \(q_i\), a key \(k_j\) and a value \(v_j\) by linear maps of its input, and lets every position attend to every permitted position:</p>
+\[ \operatorname{Attn}(Q,K,V) = \operatorname{softmax}\!\Big(\frac{QK^\top}{\sqrt{d_h}} + M\Big)V , \]
+<p>where the rows of \(Q,K,V\) are the queries, keys and values of all positions, \(d_h\) is their dimension, and \(M\) is a <em>causal mask</em>. The mask sets the score to \(-\infty\) whenever a query would look at a later position, so each position sees only its past. Chapter 2 takes this formula apart. What matters here is its consequence for training. For a whole document, the scores of every query against every key are one matrix product, and all \(T\) next-token predictions are computed in a single pass. A computation that was a chain of \(T\) dependent steps became one large, parallel matrix computation, which is exactly the kind of work GPUs are built for. The original model trained in 3.5 days on eight GPUs and set a new state of the art in English–German translation.</p>
+<p>The bargain has a second half, which shows up only when we <em>generate</em>. To produce token \(t+1\), the new query must be compared with the keys of all \(t\) earlier tokens, and must average their values, in every layer. Recomputing all those keys and values at every step would make the cost of generating a sequence quadratic in its length. They do not change once computed, so we store them. This store is the <strong>key–value cache</strong>, or <strong>KV cache</strong>, and it is the single most important data structure in this book.</p>
 
 <figure class="diagram" id="fig-1-1">
 <svg class="dg" viewBox="0 0 720 300" role="img" aria-label="RNN constant state versus Transformer growing KV cache">
@@ -183,31 +159,30 @@
 <text x="540" y="256" text-anchor="middle" class="t-sm">memory O(L·d·t) · attention compute O(L·d·t) per token</text>
 </g>
 </svg>
-<figcaption><b>Figure 1.1 — The central trade-off.</b> An RNN compresses the past into a fixed vector, so it is cheap to run but hard to train in parallel. A Transformer keeps an explicit, lossless record of the past (keys and values for every token, every layer). That makes training parallel and recall precise, but its inference state grows with context length. Most of this book is about managing that growing state.</figcaption>
-</figure>
+<figcaption><b>Figure 1.1 — The Transformer's bargain.</b> Left: an RNN compresses the past into a fixed vector \(h_t\); its memory per sequence never grows. Right: a Transformer keeps an explicit record of the past, a key and a value for every token in every layer. Each new query attends over all of them, and then its own key and value are appended.</figcaption></figure>
+
+<p>Figure 1.1 puts the two architectures side by side, and it is worth studying, because the contrast shapes the whole field. The RNN on the left carries forward only the vector \(h_t\). Whatever it has not squeezed into that vector is lost, but its memory never grows. The Transformer on the right keeps a lossless record: the full list of keys and values, one pair per token per layer. At step five, the new query \(q_5\) is compared with all five keys, and then \(k_5\) and \(v_5\) are appended for future steps. The record makes recall precise and training parallel. It also means the Transformer's working memory <em>grows linearly with the length of the conversation</em>, and so does the amount of data every generation step must read. Most of Parts III and IV of this book are about managing that growth. Chapter 21 shows how recent "state-space" and hybrid models try to recover the RNN's constant-size state without giving up the Transformer's training efficiency.</p>
 
 <div class="box timeline">
-<div class="box-title">Timeline — the architecture lineage</div>
+<div class="box-title">Timeline — the architectural lineage</div>
 <ul class="tl">
-<li><b>1948</b><span>Shannon: n-gram approximations of English; information theory.</span></li>
+<li><b>1948</b><span>Shannon: language as a stochastic process; n-gram approximations.</span></li>
 <li><b>1995</b><span>Kneser–Ney smoothing.</span></li>
 <li><b>1997</b><span>LSTM (Hochreiter &amp; Schmidhuber).</span></li>
 <li><b>2003</b><span>Neural probabilistic language model (Bengio et al.).</span></li>
-<li><b>2013</b><span>word2vec (Mikolov et al.).</span></li>
-<li><b>2014</b><span>seq2seq (Sutskever et al.); additive attention (Bahdanau et al.).</span></li>
-<li><b>2017</b><span>Transformer (Vaswani et al.); first Mixture-of-Experts layer at scale (Shazeer et al.).</span></li>
-<li><b>2018–20</b><span>GPT-1, BERT, GPT-2, T5, GPT-3.</span></li>
-<li><b>2023–25</b><span>State-space and hybrid models (Mamba, Jamba, Qwen3-Next) revisit constant-size state: Chapter 20.</span></li>
+<li><b>2010</b><span>Recurrent neural network language model (Mikolov et al.).</span></li>
+<li><b>2013</b><span>word2vec.</span></li>
+<li><b>2014</b><span>Sequence-to-sequence learning; additive attention.</span></li>
+<li><b>2017</b><span>The Transformer; sparsely-gated Mixture-of-Experts layers (Shazeer et al.).</span></li>
+<li><b>2023–25</b><span>State-space and hybrid models revisit constant-size state (Chapter 21).</span></li>
 </ul>
 </div>
 
-<h2 id="s1-7">1.7 Pre-training and scale (2018–2020)</h2>
-<p>The Transformer's parallelism made it practical to train on far more text. Three ideas compounded:</p>
-<ul>
-<li><strong>Generative pre-training.</strong> GPT-1 (OpenAI, 2018; 117M parameters)<span class="cite"><a href="#ref-gpt1">[13]</a></span> pre-trained a decoder-only Transformer on books and fine-tuned it for downstream tasks. BERT (Google, 2018; up to 340M)<span class="cite"><a href="#ref-bert">[14]</a></span> used a bidirectional encoder with masked-token prediction and dominated benchmarks—but an encoder cannot generate text autoregressively, so the decoder-only line is the one that leads to today's LLMs.</li>
-<li><strong>Zero-shot behaviour.</strong> GPT-2 (2019; 1.5B)<span class="cite"><a href="#ref-gpt2">[15]</a></span> showed that a sufficiently large LM performs tasks it was never fine-tuned for, simply by being prompted.</li>
-<li><strong>In-context learning.</strong> GPT-3 (2020; 175B parameters, ~300B training tokens)<span class="cite"><a href="#ref-gpt3">[16]</a></span> showed that few-shot examples in the prompt substitute for fine-tuning. Prompts got long; long prompts mean large prefill costs and large KV caches.</li>
-</ul>
+<h2 id="s1-6">1.6 Scale (2018–2020)</h2>
+<p>Parallel training removed the practical ceiling on how much text a model could learn from. Three ideas, arriving in quick succession, turned that capacity into capability.</p>
+<p>The first was <strong>generative pre-training</strong>. OpenAI's GPT-1 (2018, 117 million parameters)<span class="cite"><a href="#ref-gpt1">[13]</a></span> pre-trained a decoder-only Transformer, one that simply predicts the next token, on a large corpus of books, then fine-tuned it on downstream tasks. Google's BERT (2018, up to 340 million)<span class="cite"><a href="#ref-bert">[14]</a></span> used a bidirectional encoder trained to fill in masked words, and briefly dominated every benchmark. But a model that sees both sides of a blank does not define \(p(x_t\mid x_{&lt;t})\) and cannot generate text left to right. The line that leads to today's assistants is the decoder-only one.</p>
+<p>The second was <strong>zero-shot behaviour</strong>. GPT-2 (2019, 1.5 billion parameters)<span class="cite"><a href="#ref-gpt2">[15]</a></span> showed that a large enough language model performs tasks it was never trained for, such as summarisation or translation, if the task is phrased as text to be continued.</p>
+<p>The third was <strong>in-context learning</strong>. GPT-3 (2020, 175 billion parameters trained on about 300 billion tokens)<span class="cite"><a href="#ref-gpt3">[16]</a></span> showed that a few worked examples placed in the prompt can replace fine-tuning altogether. For inference this was a turning point, though few noticed at the time. Prompts became long, and long prompts mean more computation before the first output token and larger KV caches during generation.</p>
 
 <figure class="chart" id="fig-1-2">
 <div class="chart-root"></div>
@@ -224,28 +199,31 @@
    [2023.95,4.67e10,"Mixtral 8x7B",{"dx":7,"dy":14}],[2024.95,6.71e11,"DeepSeek-V3",{"dx":-8,"dy":-8,"a":"end"}],[2025.5,1.0e12,"Kimi K2",{"dx":7,"dy":-8}]]}
  ]}
 </script>
-<figcaption><b>Figure 1.2 — Parameter counts of landmark models (log scale).</b> Dense models grew ~4 orders of magnitude in five years, then <em>plateaued</em> after 2022 as Chinchilla scaling (§1.8) and inference cost pushed labs towards smaller-but-longer-trained dense models and towards Mixture-of-Experts, whose <em>total</em> parameters keep growing while <em>active</em> parameters per token stay at tens of billions (DeepSeek-V3: 671B total, 37B active).</figcaption>
-</figure>
+<figcaption><b>Figure 1.2 — Parameter counts of landmark models (log scale).</b> Blue: dense models. Orange: Mixture-of-Experts models, plotted by total parameters.</figcaption></figure>
 
-<h2 id="s1-8">1.8 Scaling laws, and why inference changed them</h2>
-<p>Kaplan et al. (2020)<span class="cite"><a href="#ref-kaplan">[17]</a></span> found that test loss falls as a power law in parameters \(N\), data \(D\) and compute \(C\), e.g. \(L(N)\approx (N_c/N)^{\alpha_N}\) with \(\alpha_N\approx0.076\), over many orders of magnitude. Their compute-optimal recipe favoured making models much bigger rather than training longer. Hoffmann et al. (2022, "Chinchilla")<span class="cite"><a href="#ref-chinchilla">[18]</a></span> revisited the question with better-tuned learning-rate schedules and fitted</p>
-\[ L(N,D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}, \qquad E\approx1.69,\;A\approx406.4,\;B\approx410.7,\;\alpha\approx0.34,\;\beta\approx0.28 . \]
-<p>Minimising \(L\) subject to the training-compute constraint \(C\approx 6ND\) (we derive the 6 in Chapter 2) gives \(N_{\text{opt}}\propto C^{a}\), \(D_{\text{opt}}\propto C^{b}\) with \(a\approx b\approx 0.5\): scale parameters and tokens <em>together</em>, at roughly <strong>20 tokens per parameter</strong>. Chinchilla (70B parameters, 1.4T tokens) beat the 4× larger Gopher (280B, 300B tokens) trained with the same compute.</p>
+<p>Figure 1.2 plots the parameter counts of landmark models on a logarithmic axis, and two phases are visible. From the Transformer to GPT-3, dense models grew by more than three orders of magnitude in three years, from 65 million to 175 billion parameters. Then the growth of <em>dense</em> models stalled. After 2022 the largest open dense model, Llama 3.1 405B, is only about twice GPT-3's size. Growth continued in a different form: Mixture-of-Experts models such as DeepSeek-V3 (671 billion) and Kimi K2 (1 trillion), shown in orange. These activate only a small fraction of their parameters for each token (37 billion of 671 billion for DeepSeek-V3), so their cost per token is much lower than their size suggests. Why did dense growth stop? Part of the answer is the next section: labs learned they had been training models that were too big for their data. The rest of the answer is the subject of this book: big models are expensive to serve.</p>
+
+<h2 id="s1-7">1.7 Scaling laws, and why inference changed them</h2>
+<p>If loss keeps improving with scale, how should a fixed compute budget be split between a bigger model and more training data? Kaplan et al. (2020)<span class="cite"><a href="#ref-kaplan">[17]</a></span> measured test loss across many model and data sizes and found smooth power laws, for example \(\mathcal L(N)\propto N^{-0.076}\) in the number of parameters \(N\), holding over seven orders of magnitude. Their compute-optimal recipe recommended growing models much faster than datasets, and the 175-billion-parameter GPT-3, trained on only 300 billion tokens, reflects that advice.</p>
+<p>Hoffmann et al. (2022)<span class="cite"><a href="#ref-chinchilla">[18]</a></span> revisited the question with learning-rate schedules tuned to each training length, and reached a different answer. They fitted</p>
+\[ \mathcal L(N,D) = E + \frac{c_N}{N^{\alpha_N}} + \frac{c_D}{D^{\alpha_D}}, \qquad E\approx1.69,\;c_N\approx406.4,\;c_D\approx410.7,\;\alpha_N\approx0.34,\;\alpha_D\approx0.28, \]
+<p>where \(D\) is the number of training tokens and \(E\) is the irreducible entropy term from §1.1. Training compute is well approximated by \(C\approx 6ND\) FLOPs: about six floating-point operations per parameter per training token, a count we derive in Chapter 2. The question "how should I spend \(C\)?" becomes a clean optimisation problem.</p>
 
 <div class="box thm">
-<div class="box-title">Derivation sketch — the compute-optimal split</div>
-<p>Substitute \(D = C/(6N)\): \(L(N) = E + A N^{-\alpha} + B (6N/C)^{\beta}\). Setting \(dL/dN=0\) gives \(\alpha A N^{-\alpha-1} = \beta B\,6^{\beta} N^{\beta-1} C^{-\beta}\), hence
-\[ N_{\text{opt}} = G\Big(\frac{C}{6}\Big)^{\frac{\beta}{\alpha+\beta}},\quad D_{\text{opt}} = G^{-1}\Big(\frac{C}{6}\Big)^{\frac{\alpha}{\alpha+\beta}},\quad G=\Big(\frac{\alpha A}{\beta B}\Big)^{\frac{1}{\alpha+\beta}} . \]
-With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
+<div class="box-title">Derivation — the compute-optimal split</div>
+<p>Substitute \(D = C/(6N)\) to get a function of \(N\) alone: \(f(N) = c_N N^{-\alpha_N} + c_D\,(6N/C)^{\alpha_D}\). The first term decreases in \(N\) and the second increases, so \(f\) has a unique minimum where \(f'(N)=0\):
+\[ \alpha_N c_N N^{-\alpha_N-1} = \alpha_D c_D\, 6^{\alpha_D} N^{\alpha_D-1} C^{-\alpha_D} \;\Longrightarrow\; N_{\text{opt}} = G\Big(\frac{C}{6}\Big)^{\frac{\alpha_D}{\alpha_N+\alpha_D}},\quad D_{\text{opt}} = G^{-1}\Big(\frac{C}{6}\Big)^{\frac{\alpha_N}{\alpha_N+\alpha_D}}, \]
+with \(G=(\alpha_N c_N/\alpha_D c_D)^{1/(\alpha_N+\alpha_D)}\). With \(\alpha_N\approx\alpha_D\), both exponents are close to \(\tfrac12\): parameters and data should grow <em>together</em>, in proportion to \(\sqrt{C}\).</p>
 </div>
 
+<p>Empirically the optimum sits at roughly <strong>20 training tokens per parameter</strong>. To test it, Hoffmann et al. trained Chinchilla, a 70-billion-parameter model on 1.4 trillion tokens. It used the same compute as their earlier 280-billion-parameter Gopher, which had seen only 300 billion tokens, and Chinchilla beat Gopher across the board. Models of the GPT-3 era had been badly under-trained.</p>
+
 <h3 id="inference-aware">Inference-aware scaling</h3>
-<p>Chinchilla optimises <em>training</em> compute only. But a model that will serve \(D_{\text{inf}}\) tokens over its life costs roughly</p>
+<p>Chinchilla minimises the cost of <em>training</em>. But a model is trained once and then served, possibly for years. Each token it processes at inference costs about \(2N\) FLOPs: one multiplication and one addition per parameter, as Chapter 2 shows. If a model will process \(D_{\text{inf}}\) tokens over its lifetime, the total cost is</p>
 <div class="box formula">
-\[ C_{\text{lifetime}} \;\approx\; \underbrace{6\,N\,D_{\text{train}}}_{\text{training}} \;+\; \underbrace{2\,N\,D_{\text{inf}}}_{\text{inference}} \]
-<p class="small">(forward pass ≈ \(2N\) FLOPs/token, forward+backward ≈ \(6N\); attention terms ignored—see Chapter 2).</p>
+\[ C_{\text{lifetime}} \;\approx\; \underbrace{6\,N\,D}_{\text{training}} \;+\; \underbrace{2\,N\,D_{\text{inf}}}_{\text{inference}} . \]
 </div>
-<p>If \(D_{\text{inf}}\) is large, it pays to shrink \(N\) and compensate with more training tokens: you reach the same loss with a smaller model that is cheaper on <em>every</em> future request. Sardana and Frankle (2023)<span class="cite"><a href="#ref-sardana">[19]</a></span> formalised this "beyond Chinchilla-optimal" regime. Practice had already moved: LLaMA-7B (2023) saw 1T tokens (~140 tokens/parameter); Llama 3 8B (2024) saw over 15T tokens<span class="cite"><a href="#ref-llama3">[20]</a></span>—nearly 1,900 tokens per parameter, ~90× past Chinchilla-optimal.</p>
+<p>When \(D_{\text{inf}}\) is large, the second term dominates, and it penalises \(N\) directly. It then pays to choose a <em>smaller</em> model and train it on <em>more</em> data than Chinchilla recommends. You reach the same loss, pay a one-off premium in training, and every future request becomes cheaper. Smaller models are also faster, which matters for latency, and they fit on fewer GPUs. Sardana and Frankle formalised this trade-off as "beyond Chinchilla-optimal" scaling<span class="cite"><a href="#ref-sardana">[19]</a></span>, but practice had already moved there. LLaMA-7B (2023) was trained on one trillion tokens, about 140 per parameter. Llama 3 8B (2024) was trained on more than 15 trillion<span class="cite"><a href="#ref-llama3">[20]</a></span>, nearly 1,900 tokens per parameter and almost a hundred times past the Chinchilla ratio.</p>
 
 <figure class="chart" id="fig-1-3">
 <div class="chart-root"></div>
@@ -258,22 +236,18 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
    [2020.4,1.7,"GPT-3 175B"],[2021.95,1.1,"Gopher 280B",{"dx":-8,"dy":-8,"a":"end"}],[2022.25,20,"Chinchilla 70B",{"dx":7,"dy":-10}],
    [2023.15,143,"LLaMA-7B"],[2023.55,286,"Llama 2-7B",{"dx":7,"dy":14}],[2024.3,1875,"Llama 3-8B"],[2024.3,214,"Llama 3-70B",{"dx":7,"dy":14}],[2024.95,400,"DeepSeek-V3 (active)",{"dx":-8,"a":"end","dy":-8}]]}]}
 </script>
-<figcaption><b>Figure 1.3 — Over-training for inference.</b> Tokens per parameter for selected models (DeepSeek-V3: 14.8T tokens / 37B active parameters). Since 2023, small open models are trained one to two orders of magnitude beyond the Chinchilla ratio because they will be <em>served</em> far more than they are trained.</figcaption>
-</figure>
+<figcaption><b>Figure 1.3 — Training tokens per parameter.</b> The dashed line is the Chinchilla-optimal ratio of about 20. For DeepSeek-V3 the ratio uses its 37B active parameters.</figcaption></figure>
+
+<p>Figure 1.3 shows the change of regime. Before 2022 the large models sat <em>below</em> the Chinchilla line (GPT-3 at 1.7 tokens per parameter, Gopher at about 1). After 2023, the models most widely deployed sit one to two orders of magnitude <em>above</em> it. The shift is the economics of inference reaching back to reshape training.</p>
 
 <details class="drill">
 <summary>Drill 1.1 — When does serving cost more than training?</summary>
-<p>Llama 3 8B: \(N=8\times10^{9}\), \(D_{\text{train}}=15\times10^{12}\). Training compute \(\approx 6ND = 7.2\times10^{23}\) FLOPs. Inference compute equals training compute when \(2ND_{\text{inf}} = 6ND_{\text{train}}\), i.e. \(D_{\text{inf}} = 3D_{\text{train}} = 45\)T tokens. A popular open model served by many providers can plausibly process this many tokens within months. (In wall-clock and dollars the crossover comes even sooner, because inference—especially decode—runs at much lower hardware utilisation than training; Chapter 5.)</p>
+<p>For Llama 3 8B, \(N=8\times10^{9}\) and \(D=15\times10^{12}\). Training compute is \(6ND\approx 7.2\times10^{23}\) FLOPs. Inference compute equals that when \(2ND_{\text{inf}} = 6ND\), that is \(D_{\text{inf}} = 3D = 45\) trillion tokens. A popular open model, served by many providers, can plausibly process that many tokens within months. In dollars the crossover comes even sooner, because, as we shall see in §1.9, inference runs hardware far less efficiently than training does.</p>
 </details>
 
-<h2 id="s1-9">1.9 The ChatGPT moment and the economics of inference</h2>
-<p>InstructGPT (2022)<span class="cite"><a href="#ref-instructgpt">[21]</a></span> showed that supervised fine-tuning plus reinforcement learning from human feedback (RLHF) turns a pre-trained LM into an assistant that follows instructions. ChatGPT, released on 30 November 2022, packaged this as a chat product and reportedly reached 100 million users in about two months. Overnight, the bottleneck of the AI industry became <em>serving</em>: how many conversations per second can a GPU sustain, at what latency, at what cost?</p>
-<p>Three economic facts define the field since then:</p>
-<ol>
-<li><strong>Price per token falls fast.</strong> The price of a given capability level has fallen by roughly an order of magnitude per year (a16z's "LLMflation" analysis<span class="cite"><a href="#ref-llmflation">[22]</a></span>). Much of that decline is inference engineering: better kernels, batching, quantisation, MoE, speculative decoding, newer hardware.</li>
-<li><strong>Output tokens cost more than input tokens.</strong> API prices for output tokens are typically 3–5× input prices. You will be able to explain why after Chapter 2: input tokens are processed in a parallel, compute-efficient <em>prefill</em>; output tokens are produced one at a time in a memory-bandwidth-bound <em>decode</em>.</li>
-<li><strong>Cached input is cheaper still.</strong> Providers discount repeated prompt prefixes ("prompt caching"), because the KV cache for a shared prefix can be stored and reused (Chapter 9).</li>
-</ol>
+<h2 id="s1-8">1.8 Inference becomes the bottleneck</h2>
+<p>Scaled-up models were impressive but awkward to use. They continued text rather than following instructions. InstructGPT (2022)<span class="cite"><a href="#ref-instructgpt">[21]</a></span> showed that supervised fine-tuning on demonstrations, followed by reinforcement learning from human feedback, turns a pre-trained model into an assistant. ChatGPT, released on 30 November 2022, packaged this in a chat interface and became one of the fastest-growing consumer products ever launched. Within weeks, the bottleneck of the AI industry was no longer "can we build it?" but "can we serve it?": how many conversations per second can a GPU sustain, at what latency, and at what cost?</p>
+<p>It helps at this point to name the two phases of serving a request, which we will make precise in Chapter 3. When a request arrives, the model first <strong>reads the prompt</strong>. All prompt tokens are known in advance, so they can be processed together in one parallel pass, like training without the backward pass. This phase is called <strong>prefill</strong>. The model then <strong>writes the answer</strong>, one token per pass, each pass depending on the previous one. This phase is called <strong>decode</strong>. The two phases stress the hardware completely differently, as the next two sections explain.</p>
 
 <figure class="chart" id="fig-1-4">
 <div class="chart-root"></div>
@@ -287,51 +261,42 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
   {"name":"Inference: 2·N·D_inf","color":"s2","markers":false,"points":[[1e12,1.6e22],[1e15,1.6e25]]}
  ]}
 </script>
-<figcaption><b>Figure 1.4 — Inference eventually dominates.</b> For a model trained on 15T tokens, serving more than three times that many tokens costs more FLOPs than training did. Frontier APIs serve trillions of tokens per day.</figcaption>
-</figure>
+<figcaption><b>Figure 1.4 — Inference eventually dominates.</b> Cumulative FLOPs for Llama 3 8B: training is a one-off \(6ND\); serving grows linearly with the number of tokens processed.</figcaption></figure>
 
-<h2 id="s1-10">1.10 The systems explosion (2019–2026)</h2>
-<p>Inference engineering grew from a handful of vendor libraries into a vibrant open-source ecosystem in under four years. Each innovation responded to a specific bottleneck; the rest of the book treats each in depth.</p>
+<p>Figure 1.4 draws the lifetime-compute formula for Llama 3 8B on log–log axes. The training cost is a horizontal line, and the serving cost is a rising one that crosses it at 45 trillion tokens. Frontier providers now report processing trillions of tokens per day, so for any successful model the crossing happens early in its life. Three features of today's API prices follow from the economics we have just described. Prices for a fixed level of capability have fallen by roughly an order of magnitude per year<span class="cite"><a href="#ref-llmflation">[22]</a></span>, and much of that is inference engineering. Output tokens are typically priced several times higher than input tokens, because, as §1.10 shows, writing is far less hardware-efficient than reading. And repeated prompt prefixes are discounted ("prompt caching"), because their KV cache can be kept and reused (Chapter 10).</p>
 
-<div class="table-wrap">
-<table>
-<thead><tr><th>Year</th><th>Innovation</th><th>Bottleneck it attacked</th><th>Ch.</th></tr></thead>
-<tbody>
-<tr><td>2019–21</td><td>NVIDIA FasterTransformer; DeepSpeed-Inference</td><td>Unfused PyTorch kernels; models that do not fit on one GPU</td><td>6, 16</td></tr>
-<tr><td>2019</td><td>Multi-Query Attention (Shazeer)</td><td>KV cache bandwidth during decode</td><td>7</td></tr>
-<tr><td>2022</td><td>FlashAttention (Dao et al.)</td><td>HBM traffic of the \(T\times T\) attention matrix</td><td>8</td></tr>
-<tr><td>2022</td><td>Orca: iteration-level ("continuous") batching</td><td>Requests in a static batch finish at different times; GPU idles</td><td>10</td></tr>
-<tr><td>2022</td><td>Pope et al., "Efficiently Scaling Transformer Inference"</td><td>Systematic partitioning and cost model for TPU inference</td><td>5, 16</td></tr>
-<tr><td>2022–23</td><td>Speculative decoding (Leviathan et al.; Chen et al.)</td><td>Sequential decode underuses compute at small batch</td><td>18</td></tr>
-<tr><td>2022–23</td><td>LLM.int8(), SmoothQuant, GPTQ, AWQ</td><td>Weight memory and bandwidth</td><td>13</td></tr>
-<tr><td>2023</td><td>llama.cpp; Text Generation Inference; vLLM / PagedAttention</td><td>Running on laptops; KV-cache fragmentation wasting 60–80% of memory</td><td>9, 11, 24</td></tr>
-<tr><td>2023</td><td>Grouped-Query Attention; FlashAttention-2; TensorRT-LLM; SGLang</td><td>KV size vs quality; kernel efficiency; prefix reuse</td><td>7, 8, 9, 11</td></tr>
-<tr><td>2023–24</td><td>Mixtral, DeepSeek-MoE, DeepSeek-V2 (MLA)</td><td>FLOPs per token; KV size</td><td>7, 17</td></tr>
-<tr><td>2024</td><td>Sarathi-Serve (chunked prefill); Splitwise, DistServe, Mooncake (disaggregation)</td><td>Prefill–decode interference; tail latency</td><td>10, 12</td></tr>
-<tr><td>2024</td><td>FlashAttention-3; Medusa, EAGLE; FP8 inference on Hopper</td><td>Hopper utilisation; draft quality</td><td>8, 13, 18</td></tr>
-<tr><td>2025</td><td>vLLM V1; DeepSeek open-infra (FlashMLA, DeepEP, DeepGEMM); NVIDIA Dynamo; EAGLE-3; FP4 on Blackwell</td><td>CPU overheads; MoE communication; datacenter-scale orchestration</td><td>11, 12, 17</td></tr>
-<tr><td>2026</td><td>FlashAttention-4 (Blackwell); Rubin-generation GPUs with HBM4</td><td>Exponential/softmax throughput lagging tensor-core throughput</td><td>4, 8</td></tr>
-</tbody>
-</table>
-</div>
+<h2 id="s1-9">1.9 The machine: compute outruns memory</h2>
+<p>To see why writing is expensive, we need a minimal picture of the hardware. Chapter 5 gives the full story; here is just enough. A modern accelerator such as NVIDIA's H100 has two resources that matter to us. The first is <strong>compute</strong>: thousands of arithmetic units, including specialised <em>tensor cores</em> that multiply small matrices in a single instruction. Together they perform about \(\pi\approx 989\) trillion floating-point operations per second (TFLOP/s) on 16-bit numbers. The second is <strong>memory</strong>: 80 GB of high-bandwidth memory (HBM) stacked beside the chip, which holds the model's weights and the KV caches. Data must travel from HBM to the arithmetic units before it can be used, and that link delivers about \(\beta\approx 3.35\) terabytes per second.</p>
 
-<h2 id="s1-11">1.11 The reasoning era (2024–)</h2>
-<p>Chain-of-thought prompting (Wei et al., 2022)<span class="cite"><a href="#ref-cot">[23]</a></span> showed that letting a model "think out loud" improves multi-step reasoning. OpenAI's o1 (September 2024) and DeepSeek-R1 (January 2025)<span class="cite"><a href="#ref-r1">[24]</a></span> trained models with reinforcement learning to produce long internal reasoning traces—often thousands to tens of thousands of tokens—before answering. Snell et al. (2024)<span class="cite"><a href="#ref-snell">[25]</a></span> showed that, for some problems, spending more compute at test time can be more effective than scaling parameters.</p>
-<p>For inference engineering this is a regime change:</p>
-<ul>
-<li><strong>Decode dominates.</strong> A chat turn with a 2,000-token prompt and a 300-token answer is prefill-heavy in tokens; a reasoning turn with a 20,000-token trace is overwhelmingly decode.</li>
-<li><strong>The KV cache explodes.</strong> Long outputs grow the cache throughout generation, limiting how many requests fit on a GPU. KV compression methods designed for long <em>inputs</em> often fail for long <em>outputs</em>.</li>
-<li><strong>Latency is product quality.</strong> A model that thinks 3× faster can think 3× longer under the same latency budget—so tokens/s translates directly into answer accuracy.</li>
-<li><strong>RL training is an inference workload.</strong> Generating rollouts dominates the cost of RL post-training, so training clusters now embed inference engines.</li>
-</ul>
+<figure class="diagram" id="fig-1-5">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="A GPU as a fast factory fed by a slower warehouse link">
+<defs><marker id="ah5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<rect x="20" y="40" width="250" height="150" rx="14" class="bx4"/>
+<text x="145" y="68" text-anchor="middle" class="t-b">HBM (the warehouse)</text>
+<text x="145" y="92" text-anchor="middle" class="t-sm">80 GB on an H100</text>
+<rect x="45" y="108" width="200" height="16" rx="3" class="fill-s4" opacity=".6"/><text x="145" y="120" text-anchor="middle" class="t-xs">model weights</text>
+<rect x="45" y="130" width="140" height="16" rx="3" class="fill-s5" opacity=".5"/><text x="115" y="142" text-anchor="middle" class="t-xs">KV caches</text>
+<text x="145" y="172" text-anchor="middle" class="t-xs">everything the model needs lives here</text>
+<line x1="275" y1="115" x2="440" y2="115" class="ln-acc" stroke-width="6" marker-end="url(#ah5)"/>
+<text x="358" y="98" text-anchor="middle" class="t-sm t-b t-acc">β ≈ 3.35 TB/s</text>
+<text x="358" y="142" text-anchor="middle" class="t-xs">every byte used must cross here</text>
+<rect x="450" y="40" width="250" height="150" rx="14" class="bx2"/>
+<text x="575" y="68" text-anchor="middle" class="t-b">Compute units (the factory)</text>
+<g>
+<rect x="476" y="84" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/><rect x="522" y="84" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/><rect x="568" y="84" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/><rect x="614" y="84" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/>
+<rect x="476" y="118" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/><rect x="522" y="118" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/><rect x="568" y="118" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/><rect x="614" y="118" width="40" height="28" rx="4" class="fill-s2" opacity=".55"/>
+</g>
+<text x="575" y="168" text-anchor="middle" class="t-sm t-b">π ≈ 989 TFLOP/s (BF16)</text>
+<text x="360" y="218" text-anchor="middle" class="t-sm">π / β ≈ 295: the factory can do ~295 operations in the time one byte arrives</text>
+</svg>
+<figcaption><b>Figure 1.5 — A GPU as a factory and a warehouse.</b> Arithmetic is fast; fetching operands is comparatively slow. Unless each byte fetched is used for many operations, the factory waits on deliveries. (The analogy is Horace He's<span class="cite"><a href="#ref-brrr">[29]</a></span>.)</figcaption></figure>
 
-<h2 id="s1-12">1.12 Hardware co-evolution and the memory wall</h2>
-<p>LLMs and GPUs co-evolved. NVIDIA added <strong>tensor cores</strong>—units that perform small dense matrix multiply-accumulates—in Volta (V100, 2017), BF16 and TF32 in Ampere (A100, 2020), FP8 and the Transformer Engine in Hopper (H100, 2022), and FP4 in Blackwell (B200, 2024–25). Google built TPUs around systolic arrays from 2015 onwards<span class="cite"><a href="#ref-tpu">[26]</a></span>. Each generation multiplied <em>arithmetic throughput</em> much faster than <em>memory bandwidth</em>.</p>
+<p>Horace He describes this situation as a factory and a warehouse<span class="cite"><a href="#ref-brrr">[29]</a></span>, and Figure 1.5 draws it that way. The factory (the compute units) can process material extraordinarily quickly, but all material sits in a warehouse (HBM) connected to the factory by a road of limited capacity. The ratio of the two rates, \(\pi/\beta\approx 989\times10^{12}/3.35\times10^{12}\approx 295\), is the number of arithmetic operations the H100 can perform in the time it takes to fetch one byte. If an algorithm performs fewer than about 295 operations for every byte it fetches, the factory sits idle waiting for deliveries and the algorithm runs at the speed of the road, not the factory. We will call this ratio the <em>ridge point</em> when we formalise it in Chapter 3.</p>
 
 <div class="table-wrap">
 <table>
-<caption>Approximate datasheet figures for the SXM / flagship variants; dense (non-sparse) tensor throughput. Values vary by SKU, clocks and power limit; Chapter 4 discusses how to read spec sheets.</caption>
-<thead><tr><th>GPU (year)</th><th class="num">FP16/BF16 dense TFLOP/s</th><th class="num">HBM capacity</th><th class="num">HBM bandwidth TB/s</th><th class="num">FLOPs per byte (ridge)</th></tr></thead>
+<caption>Approximate datasheet figures for the SXM (server-module) variants, with dense (non-sparse) 16-bit tensor throughput. Values vary with SKU, clock and power limit; Chapter 5 explains how to read a spec sheet.</caption>
+<thead><tr><th>GPU (year)</th><th class="num">BF16/FP16 dense TFLOP/s (π)</th><th class="num">HBM capacity</th><th class="num">HBM bandwidth TB/s (β)</th><th class="num">π / β (FLOPs per byte)</th></tr></thead>
 <tbody>
 <tr><td>P100 (2016)</td><td class="num">21</td><td class="num">16 GB</td><td class="num">0.73</td><td class="num">≈ 29</td></tr>
 <tr><td>V100 (2017)</td><td class="num">125</td><td class="num">32 GB</td><td class="num">0.90</td><td class="num">≈ 139</td></tr>
@@ -343,7 +308,9 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 </table>
 </div>
 
-<figure class="chart" id="fig-1-5">
+<p>The table shows how this ratio has evolved. NVIDIA added tensor cores in the V100 (2017), the BF16 format in the A100 (2020), 8-bit floating point in the H100 (2022) and 4-bit floating point in the Blackwell B200 (2025). Each step multiplied arithmetic throughput. Memory bandwidth grew too, but much more slowly, because it is limited by the physics of moving signals off the chip.</p>
+
+<figure class="chart" id="fig-1-6">
 <div class="chart-root"></div>
 <script type="application/json" class="chart-spec">
 {"title":"The memory wall","height":330,
@@ -354,15 +321,74 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
   {"name":"HBM bandwidth","color":"s1","labels":true,"points":[[2016.3,1],[2017.5,1.23],[2020.4,2.79],[2022.7,4.58],[2024.3,6.56,"H200",{"dx":0,"dy":16,"a":"middle"}],[2025,10.9]]}
  ]}
 </script>
-<figcaption><b>Figure 1.5 — Compute outran bandwidth.</b> From P100 to B200, dense half-precision tensor throughput grew ~100× while HBM bandwidth grew ~11×. Gholami et al. measured the same trend over two decades: peak FLOP/s roughly 3.0× every two years versus DRAM bandwidth 1.6× and interconnect 1.4×<span class="cite"><a href="#ref-memwall">[27]</a></span>. Anything that must stream bytes from memory for each FLOP—like LLM decoding—falls further behind each generation.</figcaption>
-</figure>
+<figcaption><b>Figure 1.6 — The memory wall.</b> Dense 16-bit tensor throughput and HBM bandwidth of successive NVIDIA GPUs, each relative to the P100. Lower-precision formats (FP8, FP4) widen the gap further.</figcaption></figure>
 
-<p>The last column of the table, <strong>FLOPs per byte</strong>, is the hardware's <em>ridge point</em>: an algorithm must perform at least this many floating-point operations per byte it moves from memory, or the GPU's arithmetic units will sit idle waiting for data. Chapter 2 shows that decoding a single sequence performs about <strong>one</strong> FLOP per byte of weights read. That gap—roughly 300× on an H100—is the most important number in LLM inference.</p>
+<p>Figure 1.6 makes the divergence vivid: from the P100 to the B200, dense half-precision throughput grew about 100-fold while HBM bandwidth grew about 11-fold. Gholami et al. measured the same trend across two decades of server hardware. Peak FLOP/s grew about 3.0× every two years, DRAM bandwidth 1.6× and interconnect bandwidth only 1.4×<span class="cite"><a href="#ref-memwall">[27]</a></span>. They called it the <strong>memory wall</strong>. Every generation, algorithms that cannot reuse fetched data many times fall further behind the hardware's arithmetic capability. As we are about to see, writing text is exactly such an algorithm.</p>
 
-<h2 id="s1-13">1.13 The metrics vocabulary</h2>
-<p>Before we optimise anything we must define what "fast" and "cheap" mean. A request arrives with \(n_{\text{in}}\) prompt tokens and produces \(n_{\text{out}}\) output tokens, which are typically streamed to the user as they are generated.</p>
+<h2 id="s1-10">1.10 A first estimate: why writing is slow</h2>
+<p>Consider a single user generating text, so the batch holds one sequence. At each decode step the model must apply every one of its weight matrices to the vector representing the newest token. Applying a matrix to a vector performs two floating-point operations, a multiply and an add, for each matrix entry. And since the weights live in HBM, every entry must be fetched once per step. Write \(N\) for the number of parameters and \(b\) for the bytes used to store each one (\(b=2\) for 16-bit formats). Then, per step,</p>
+\[ \text{FLOPs} \approx 2N, \qquad \text{bytes fetched} \approx N b, \qquad \frac{\text{FLOPs}}{\text{byte}} \approx \frac{2}{b} = 1 . \]
+<p>One operation per byte, against an H100 that needs 295 to keep its arithmetic units busy. The factory is idle more than 99% of the time, and the speed of generation is set entirely by the road:</p>
+<div class="box formula">
+\[ t_{\text{step}} \;\gtrsim\; \frac{N\,b + \text{(bytes of KV cache read)}}{\beta}, \qquad \text{tokens per second for one user} \;\lesssim\; \frac{\beta}{N b}. \]
+</div>
 
-<figure class="diagram" id="fig-1-6">
+<div class="box example">
+<div class="box-title">Worked example — the running examples at batch size 1</div>
+<p><strong>Llama 3 8B</strong> in BF16 has 16 GB of weights. On an H100: \(t_{\text{step}}\ge 16/3350\) s \(\approx 4.8\) ms, so at most about 210 tokens per second.</p>
+<p><strong>Llama 3 70B</strong> in BF16 has about 141 GB of weights, which does not fit in one H100's 80 GB.</p>
+<ul>
+<li>On one <strong>H200</strong> (141 GB, 4.8 TB/s) it barely fits, with no room left for the KV cache. If it did fit, the bound would be \(141/4800\approx 29\) ms per step, or about 34 tokens per second.</li>
+<li>On <strong>two H100s</strong>, each holding and reading half the weights, the aggregate bandwidth is 6.7 TB/s, giving about 21 ms per step or roughly 47 tokens per second, minus the cost of communication between the GPUs (Chapter 17).</li>
+<li>Stored in 8-bit precision on <strong>one B200</strong> (8 TB/s), 70.6 GB of weights gives about 8.8 ms, or roughly 113 tokens per second.</li>
+</ul>
+<p>Real systems reach perhaps 60–85% of these bounds. Meanwhile an H100 could perform \(989\times10^{12}\times 0.0048\approx 4.7\times10^{12}\) operations in 4.8 ms, but the 8B model uses only \(1.6\times10^{10}\) of them, about 0.3%.</p>
+</div>
+
+<p>This one calculation explains a great deal. It explains why output tokens are priced higher than input tokens. During prefill, every weight fetched is applied to <em>all</em> the prompt's tokens at once, thousands of operations per byte, so the factory is busy. During decode, each weight fetched serves just one token per sequence. It explains why a GPU with twice the FLOP/s but the same bandwidth would not make a chatbot write any faster. And it points to the most important remedy: <strong>batching</strong>. If 64 users' decode steps are processed together, each weight fetched from HBM is used 64 times, so the same road carries 64 times as much useful work, and total throughput rises almost 64-fold. Batching is nearly free until either the arithmetic units become the bottleneck or memory runs out. Memory runs out because each of those 64 users brings a KV cache, and that is the tension at the centre of Chapters 3, 8, 10 and 11.</p>
+
+<div class="box interview">
+<div class="box-title">What interviewers listen for</div>
+<p>Asked "how fast can model X run on GPU Y?", strong candidates (1) say which regime applies (memory-bound at small batch), (2) compute weight bytes and divide by bandwidth, (3) add KV-cache bytes for long contexts, (4) apply a realistic efficiency factor, and (5) explain what changes with large batches, quantisation, tensor parallelism or speculative decoding. Weak candidates divide FLOPs by peak FLOP/s and get an answer a hundred times too optimistic.</p>
+</div>
+
+<h2 id="s1-11">1.11 The systems response (2019–2026)</h2>
+<p>Once inference became expensive, a remarkable burst of engineering followed. It is best read not as a list of techniques but as a chain of cause and effect, each idea relieving one bottleneck and exposing the next. The rest of the book follows this chain in detail. Here is its outline.</p>
+<p><strong>Shrinking the state.</strong> As early as 2019, Noam Shazeer observed that decoding was limited by the bandwidth needed to read keys and values, not by arithmetic. He proposed <em>multi-query attention</em>, in which all attention heads share one key and one value per token, shrinking the cache many-fold<span class="cite"><a href="#ref-mqa">[30]</a></span>. The quality cost led to <em>grouped-query attention</em> (2023), now standard, and DeepSeek's <em>multi-head latent attention</em> (2024) compressed the cache further (Chapter 8).</p>
+<p><strong>Reading the state efficiently.</strong> For long sequences, the attention computation itself became expensive because it wrote a \(T\times T\) matrix of scores to memory and read it back. FlashAttention (2022) computed exactly the same result in tiles small enough to stay in on-chip memory, never materialising the matrix<span class="cite"><a href="#ref-fa">[31]</a></span>. Its successors (2023, 2024, 2026) chased each new GPU generation (Chapter 9).</p>
+<p><strong>Keeping the factory busy.</strong> Batching helps only if requests can be batched. Early servers waited for a whole batch to finish before admitting new requests, so GPUs idled as short answers finished early. Orca (2022) scheduled at the granularity of single decode steps, letting requests join and leave the batch at every iteration<span class="cite"><a href="#ref-orca">[32]</a></span>. This <em>continuous batching</em> is now universal (Chapter 11).</p>
+<p><strong>Not wasting memory.</strong> With continuous batching, the KV cache became the limiting resource, and it was being wasted. Servers reserved a contiguous block for each request's maximum possible length. vLLM's <em>PagedAttention</em> (2023) borrowed virtual memory from operating systems, allocating the cache in small pages on demand. Kwon et al. found that earlier systems used only 20–38% of the memory they reserved for actual tokens<span class="cite"><a href="#ref-vllm">[33]</a></span> (Chapter 10).</p>
+<p><strong>Fewer bytes per weight.</strong> Since decode time is proportional to bytes, storing weights in 8 or 4 bits instead of 16 speeds it up almost proportionally. A series of methods (LLM.int8, SmoothQuant, GPTQ, AWQ, then FP8 and FP4 hardware formats) made this practical without ruining accuracy (Chapter 14).</p>
+<p><strong>More than one token per step.</strong> If the factory is idle during decode anyway, why not verify several guessed tokens per weight fetch? <em>Speculative decoding</em> (2022–23) uses a cheap draft to propose tokens and the large model to check them all in one pass. It is mathematically guaranteed to produce the same distribution of outputs<span class="cite"><a href="#ref-spec">[34]</a></span> (Chapter 19).</p>
+<p><strong>Fewer FLOPs per token.</strong> Mixture-of-Experts models (Mixtral 2023, DeepSeek-V2/V3 2024) route each token through a few of many expert sub-networks. They decouple capacity from per-token cost, at the price of new communication patterns between GPUs (Chapter 18).</p>
+<p><strong>Separating reading from writing.</strong> Prefill is compute-bound and decode is memory-bound, so running both on the same GPUs makes each interfere with the other. Systems of 2024 (Sarathi-Serve, Splitwise, DistServe, Mooncake) split prefills into chunks or moved them onto separate machines, transferring the KV cache between them (Chapters 11 and 13). By 2025 datacenter-scale orchestration such as NVIDIA Dynamo and open engines such as vLLM V1 and SGLang combined all of the above.</p>
+
+<div class="table-wrap">
+<table>
+<caption>Summary of the causal chain. Chapters refer to this book.</caption>
+<thead><tr><th>Year</th><th>Innovation</th><th>Bottleneck relieved</th><th>New bottleneck exposed</th><th>Ch.</th></tr></thead>
+<tbody>
+<tr><td>2019</td><td>Multi-query attention</td><td>KV bandwidth in decode</td><td>Quality loss → GQA (2023), MLA (2024)</td><td>8</td></tr>
+<tr><td>2022</td><td>FlashAttention</td><td>HBM traffic of the attention matrix</td><td>Kernel tuning per GPU generation</td><td>9</td></tr>
+<tr><td>2022</td><td>Continuous batching (Orca)</td><td>Idle batch slots</td><td>KV memory fragmentation</td><td>11</td></tr>
+<tr><td>2022–23</td><td>Speculative decoding</td><td>One token per weight fetch</td><td>Draft quality; batching interaction</td><td>19</td></tr>
+<tr><td>2022–25</td><td>Weight and KV quantisation</td><td>Bytes per parameter</td><td>Accuracy; outliers</td><td>14</td></tr>
+<tr><td>2023</td><td>PagedAttention (vLLM)</td><td>Fragmentation, over-reservation</td><td>Prefix reuse; scheduling</td><td>10</td></tr>
+<tr><td>2023–24</td><td>Mixture-of-Experts at scale</td><td>FLOPs per token</td><td>All-to-all communication; load balance</td><td>18</td></tr>
+<tr><td>2024</td><td>Chunked prefill; disaggregation</td><td>Prefill–decode interference</td><td>KV transfer bandwidth</td><td>11, 13</td></tr>
+<tr><td>2025–26</td><td>vLLM V1, SGLang, Dynamo; FlashAttention-4; FP4</td><td>CPU overhead; cluster orchestration; Blackwell utilisation</td><td>Reasoning workloads (§1.12)</td><td>12, 13</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="s1-12">1.12 The reasoning era (2024–)</h2>
+<p>Just as these techniques matured, the workload changed. Wei et al. (2022) showed that prompting a model to write out intermediate steps, a "chain of thought", improves multi-step reasoning<span class="cite"><a href="#ref-cot">[23]</a></span>. OpenAI's o1 (September 2024) and DeepSeek-R1 (January 2025)<span class="cite"><a href="#ref-r1">[24]</a></span> went further, training models with reinforcement learning to think at length before answering, often producing thousands to tens of thousands of reasoning tokens. Snell et al. (2024)<span class="cite"><a href="#ref-snell">[25]</a></span> showed that for some problems, spending more computation at test time is more effective than using a larger model. Inference became not just a cost but a lever on capability.</p>
+<p>For inference engineering, this was a change of regime. A typical chat turn reads a prompt of a few thousand tokens and writes a few hundred, so most tokens are processed in the efficient prefill phase. A reasoning turn may write twenty thousand tokens, almost all in the memory-bound decode phase. The KV cache now grows <em>during</em> generation to tens of thousands of entries, limiting how many requests fit on a GPU. Compression techniques designed for long inputs often fail on long outputs. Latency becomes capability: a system that decodes three times faster can let a model think three times longer within the same wait. And reinforcement-learning training itself is now dominated by generating rollouts, so inference engines sit inside training clusters. Every chapter of this book has to be read with this workload in mind; Chapter 22 treats it directly.</p>
+
+<h2 id="s1-13">1.13 Measuring what matters</h2>
+<p>To optimise inference we need precise words for "fast" and "cheap", and the field has settled on a small vocabulary. Consider a request with \(n_{\text{in}}\) prompt tokens that produces \(n_{\text{out}}\) output tokens, streamed to the user as they are generated.</p>
+
+<figure class="diagram" id="fig-1-7">
 <svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Timeline of an LLM request showing queueing, prefill, and decode with TTFT and TPOT">
 <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
 <line x1="20" y1="110" x2="705" y2="110" class="ln" marker-end="url(#ah2)"/><text x="700" y="130" text-anchor="end" class="t-xs">time</text>
@@ -384,79 +410,40 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <line x1="560" y1="116" x2="560" y2="186" class="ln dash"/>
 <text x="296" y="50" class="t-xs">← first token is produced by the prefill pass</text>
 </svg>
-<figcaption><b>Figure 1.6 — Anatomy of a streamed request.</b> The prefill pass processes the whole prompt in parallel and emits the first output token; each subsequent token takes one decode step. TTFT includes queueing; inter-token latency (ITL) is the gap between consecutive tokens, whose mean over a request is TPOT.</figcaption>
-</figure>
+<figcaption><b>Figure 1.7 — Anatomy of a streamed request.</b> Queueing and prefill come before the first token; each later token costs one decode step.</figcaption></figure>
 
-<div class="table-wrap">
-<table>
-<thead><tr><th>Metric</th><th>Definition</th><th>Who cares</th></tr></thead>
-<tbody>
-<tr><td><strong>TTFT</strong> (time to first token)</td><td>Arrival → first output token. Queueing + prefill (+ network).</td><td>Interactive chat ("is it responding?"), code completion, voice agents.</td></tr>
-<tr><td><strong>TPOT</strong> (time per output token)</td><td>\((\text{E2E}-\text{TTFT})/(n_{\text{out}}-1)\), averaged over a request.</td><td>Streaming readability (humans read ~4–8 tokens/s), reasoning models, agents.</td></tr>
-<tr><td><strong>ITL</strong> (inter-token latency)</td><td>Each individual gap; look at its distribution (P99 spikes = stutter).</td><td>Smooth streaming; voice.</td></tr>
-<tr><td><strong>E2E latency</strong></td><td>\(\text{TTFT} + (n_{\text{out}}-1)\cdot\text{TPOT}\).</td><td>Non-streamed APIs, tool calls, agents chaining many calls.</td></tr>
-<tr><td><strong>Throughput</strong></td><td>Output (or total) tokens/s across all requests on a deployment; also requests/s.</td><td>Cost; batch/offline jobs.</td></tr>
-<tr><td><strong>Goodput</strong></td><td>Requests/s that <em>meet</em> all SLOs (e.g. TTFT ≤ 500 ms and TPOT ≤ 50 ms at P90)<span class="cite"><a href="#ref-distserve">[28]</a></span>.</td><td>Capacity planning under SLOs.</td></tr>
-<tr><td><strong>Cost / M tokens</strong></td><td>\(\dfrac{\text{\$ per GPU-hour}\times \#\text{GPUs}}{\text{tokens/s}\times 3600}\times10^{6}\).</td><td>Everyone.</td></tr>
-</tbody>
-</table>
-</div>
-
-<p>Two structural facts recur throughout the book:</p>
-<ol>
-<li><strong>Latency and throughput trade off.</strong> Batching more requests together raises throughput (better hardware utilisation) but raises each request's TPOT (each step does more work) and may raise TTFT (queueing). The art is choosing the operating point on this Pareto frontier that satisfies the SLO at minimum cost.</li>
-<li><strong>Percentiles matter more than means.</strong> Users experience the tail. A system with mean TTFT 200 ms and P99 4 s feels broken. Interviewers will ask you which percentile an SLO refers to.</li>
-</ol>
+<p>Figure 1.7 follows a request through time. It may first wait in a <em>queue</em> for capacity. Then the <em>prefill</em> pass processes all \(n_{\text{in}}\) prompt tokens and produces the first output token. The interval from arrival to that moment is the <strong>time to first token (TTFT)</strong>, which is what a user experiences as responsiveness. Each subsequent token then takes one decode step. The gap between consecutive tokens is the <strong>inter-token latency (ITL)</strong>, and its average over a request is the <strong>time per output token (TPOT)</strong>:</p>
+\[ \text{TPOT} = \frac{\text{E2E} - \text{TTFT}}{n_{\text{out}}-1}, \qquad \text{E2E} = \text{TTFT} + (n_{\text{out}}-1)\cdot\text{TPOT}, \]
+<p>where E2E is the end-to-end latency. Different products care about different terms. A voice assistant lives or dies by TTFT, since silence is noticed within a few hundred milliseconds. A reading user needs TPOT below roughly 100–200 ms, which corresponds to human reading speed. An agent that chains dozens of model calls cares about E2E. An offline job, such as summarising a million documents, cares about none of them, only about <strong>throughput</strong>: total tokens (or requests) completed per second across the deployment.</p>
+<p>Throughput and latency pull against each other. As §1.10 showed, batching more requests raises throughput, but each decode step then does more work, so TPOT rises. Admitting more requests than the system can absorb makes queues grow, so TTFT rises. Raw throughput can therefore be inflated by configurations that make users miserable. DistServe proposed measuring <strong>goodput</strong> instead: the request rate a system sustains while meeting its <em>service-level objectives</em> (SLOs), for example "90% of requests have TTFT ≤ 500 ms and TPOT ≤ 50 ms"<span class="cite"><a href="#ref-distserve">[28]</a></span>. The percentile matters. Users experience the tail: a service with a median TTFT of 200 ms and a 99th-percentile TTFT of 4 s feels broken, and interviewers will ask which percentile an SLO refers to.</p>
 
 <div class="box bridge">
-<div class="box-title">Software-engineering bridge — Little's law</div>
-<p>For any stable queueing system in steady state, \(L=\lambda W\): mean number of requests in the system = arrival rate × mean time in system. If a deployment receives \(\lambda=20\) requests/s and each takes \(W=8\) s end to end, then on average \(L=160\) requests are in flight—so your engine must hold 160 concurrent KV caches. This one identity converts latency targets into memory requirements.</p>
+<div class="box-title">For the mathematician — Little's law</div>
+<p>For any queueing system in steady state, the mean number of items in the system equals the arrival rate times the mean time each item spends there: \(\bar n=\lambda W\). The law needs no distributional assumptions. In serving it converts latency into memory. If a deployment receives \(\lambda=20\) requests per second and each spends \(W=8\) s in the system, then on average \(\bar n=160\) requests are in flight, and the deployment must hold 160 KV caches at once.</p>
 </div>
+
+<p>Finally, everything has a price. A deployment of \(G\) GPUs rented at \(c\) dollars per GPU-hour that sustains a throughput of \(\Lambda\) tokens per second costs</p>
+\[ \text{cost per million tokens} = \frac{G\cdot c}{\Lambda\cdot 3600}\times10^{6}\ \text{dollars}. \]
 
 <details class="drill">
 <summary>Drill 1.2 — Cost per million tokens</summary>
-<p>An 8×H100 node rents for $2.50 per GPU-hour and sustains 12,000 output tokens/s aggregated across all requests at your SLO. Cost per million output tokens \(= \frac{8\times 2.50}{12{,}000\times3600}\times10^{6} = \frac{20}{4.32\times10^{7}}\times10^{6}\approx \$0.46\). Doubling throughput by better batching halves this number—which is why throughput engineering is worth millions.</p>
+<p>An 8×H100 server rents for $2.50 per GPU-hour and sustains 12,000 output tokens per second at your SLO. The cost is \(\frac{8\times 2.50}{12{,}000\times3600}\times10^{6}\approx \$0.46\) per million output tokens. Doubling throughput through better batching halves it. At billions of tokens per day, such factors are worth millions of dollars a year, which is why the industry hires inference engineers.</p>
 </details>
 
-<h2 id="s1-14">1.14 Your first back-of-the-envelope: the bandwidth bound</h2>
-<p>Consider generating with batch size 1 (a single user). Each decode step must apply every weight matrix to one new token vector. Matrix–vector products perform \(2\) FLOPs (one multiply, one add) for each weight, and each weight must be read from HBM once. So per step:</p>
-\[ \text{FLOPs} \approx 2N, \qquad \text{bytes read} \approx N\cdot b, \qquad \text{arithmetic intensity} \approx \frac{2N}{Nb} = \frac{2}{b}\ \text{FLOPs/byte}, \]
-<p>where \(b\) is bytes per parameter (2 for BF16). That is about 1 FLOP/byte—two orders of magnitude below any modern GPU's ridge point. The step time is therefore governed by memory, not arithmetic:</p>
-<div class="box formula">
-\[ t_{\text{step}} \;\gtrsim\; \frac{N\,b + \text{(KV-cache bytes)}}{\text{HBM bandwidth}}, \qquad \text{tokens/s per sequence} \;\lesssim\; \frac{\text{bandwidth}}{N b}. \]
-</div>
+<h2 id="s1-14">1.14 A map of the book</h2>
+<p>We can now state the plan. Figure 1.8 shows how the eight parts of the book depend on one another. Part I finishes the foundations. Chapter 2 dissects the Transformer into an exact inventory of tensors, parameters and operations. Chapter 3 turns that inventory into a cost model of generation: what the KV cache holds, why decode is memory-bound, and how long a request takes. Chapter 4 covers how tokens are chosen from the model's output. Part II opens the machine: GPU architecture, the roofline model of performance, and how fast code is written. Part III attacks the KV cache by shrinking it, reading it efficiently and managing it like virtual memory. Part IV builds a serving system with scheduling, engines and disaggregation. Parts V and VI make the model smaller and spread it across many GPUs. Part VII makes decoding faster and contexts longer. Part VIII puts everything into production, from reasoning models to fleet-scale serving and the design interview.</p>
 
-<div class="box example">
-<div class="box-title">Worked example — Llama-class 70B at batch 1</div>
-<p>Weights in BF16: \(70\times10^9\times 2 = 140\) GB.</p>
-<ul>
-<li><strong>One H100 (80 GB, 3.35 TB/s):</strong> does not fit in BF16. In FP8 (70 GB) it barely fits with almost no room for KV cache: \(t \ge 70/3350\,\text{s}\approx 21\) ms → at most ≈ 48 tokens/s.</li>
-<li><strong>One H200 (141 GB, 4.8 TB/s):</strong> BF16 fits: \(t\ge 140/4800\approx 29\) ms → at most ≈ 34 tokens/s.</li>
-<li><strong>Two H100s with tensor parallelism:</strong> each GPU holds and reads half the weights, so aggregate bandwidth is 6.7 TB/s: \(t\gtrsim 21\) ms → ≈ 48 tokens/s, minus communication overhead (Chapter 16).</li>
-<li><strong>One B200 (8 TB/s):</strong> \(t\ge 140/8000\approx 17.5\) ms → at most ≈ 57 tokens/s in BF16; ≈ 114 tokens/s in FP8.</li>
-</ul>
-<p>Real systems reach perhaps 60–85% of these bounds ("memory bandwidth utilisation", MBU). Meanwhile, compute utilisation is below 1%: an H100 could do \(989\times10^{12}\times 0.021\approx 2\times10^{13}\) FLOPs in those 21 ms but we used only \(1.4\times10^{11}\).</p>
-</div>
-<p>The obvious fix is to <strong>batch</strong>: if 64 users share each weight read, we do 64× more useful FLOPs per byte. Batching is free up to the point where the GPU becomes compute-bound—or runs out of memory for 64 KV caches. That tension, between amortising weight reads and holding per-request state, is the plot of Chapters 2, 5, 7, 9 and 10.</p>
-
-<div class="box interview">
-<div class="box-title">What interviewers listen for</div>
-<p>When asked "how fast can model X run on GPU Y?", strong candidates (1) state the regime (memory-bound at small batch), (2) compute the weight bytes and divide by bandwidth, (3) add the KV-cache bytes for long contexts, (4) mention a realistic efficiency factor, and (5) say what changes at large batch (compute-bound) or with quantisation, tensor parallelism or speculative decoding. Weak candidates divide FLOPs by peak FLOP/s and get an answer 100× too optimistic.</p>
-</div>
-
-<h2 id="s1-15">1.15 A map of the book</h2>
-
-<figure class="diagram" id="fig-1-7">
+<figure class="diagram" id="fig-1-8">
 <svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Map of the eight parts of the book">
 <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
-<rect x="10" y="20" width="160" height="96" rx="10" class="bx"/><text x="90" y="44" text-anchor="middle" class="t-b">I · Foundations</text><text x="90" y="66" text-anchor="middle" class="t-sm">history, Transformer</text><text x="90" y="82" text-anchor="middle" class="t-sm">anatomy, decoding</text><text x="90" y="102" text-anchor="middle" class="t-xs">Ch. 1–3</text>
-<rect x="190" y="20" width="160" height="96" rx="10" class="bx4"/><text x="270" y="44" text-anchor="middle" class="t-b">II · The Machine</text><text x="270" y="66" text-anchor="middle" class="t-sm">GPU architecture,</text><text x="270" y="82" text-anchor="middle" class="t-sm">roofline, kernels</text><text x="270" y="102" text-anchor="middle" class="t-xs">Ch. 4–6</text>
-<rect x="370" y="20" width="160" height="96" rx="10" class="bx5"/><text x="450" y="44" text-anchor="middle" class="t-b">III · Attention &amp; Memory</text><text x="450" y="66" text-anchor="middle" class="t-sm">KV cache, FlashAttention,</text><text x="450" y="82" text-anchor="middle" class="t-sm">PagedAttention</text><text x="450" y="102" text-anchor="middle" class="t-xs">Ch. 7–9</text>
-<rect x="550" y="20" width="160" height="96" rx="10" class="bx2"/><text x="630" y="44" text-anchor="middle" class="t-b">IV · Serving Systems</text><text x="630" y="66" text-anchor="middle" class="t-sm">batching, engines,</text><text x="630" y="82" text-anchor="middle" class="t-sm">disaggregation</text><text x="630" y="102" text-anchor="middle" class="t-xs">Ch. 10–12</text>
-<rect x="10" y="180" width="160" height="96" rx="10" class="bx3"/><text x="90" y="204" text-anchor="middle" class="t-b">V · Smaller Models</text><text x="90" y="226" text-anchor="middle" class="t-sm">quantisation, pruning,</text><text x="90" y="242" text-anchor="middle" class="t-sm">distillation</text><text x="90" y="262" text-anchor="middle" class="t-xs">Ch. 13–14</text>
-<rect x="190" y="180" width="160" height="96" rx="10" class="bx"/><text x="270" y="204" text-anchor="middle" class="t-b">VI · Distributed</text><text x="270" y="226" text-anchor="middle" class="t-sm">collectives, TP/PP/CP,</text><text x="270" y="242" text-anchor="middle" class="t-sm">MoE &amp; expert parallel</text><text x="270" y="262" text-anchor="middle" class="t-xs">Ch. 15–17</text>
-<rect x="370" y="180" width="160" height="96" rx="10" class="bx4"/><text x="450" y="204" text-anchor="middle" class="t-b">VII · Faster &amp; Longer</text><text x="450" y="226" text-anchor="middle" class="t-sm">speculative decoding,</text><text x="450" y="242" text-anchor="middle" class="t-sm">long context, SSMs</text><text x="450" y="262" text-anchor="middle" class="t-xs">Ch. 18–20</text>
-<rect x="550" y="180" width="160" height="96" rx="10" class="bx2"/><text x="630" y="204" text-anchor="middle" class="t-b">VIII · Production</text><text x="630" y="226" text-anchor="middle" class="t-sm">reasoning, scale, edge,</text><text x="630" y="242" text-anchor="middle" class="t-sm">design interviews</text><text x="630" y="262" text-anchor="middle" class="t-xs">Ch. 21–25</text>
+<rect x="10" y="20" width="160" height="96" rx="10" class="bx"/><text x="90" y="44" text-anchor="middle" class="t-b">I · Foundations</text><text x="90" y="66" text-anchor="middle" class="t-sm">history, Transformer,</text><text x="90" y="82" text-anchor="middle" class="t-sm">generation, decoding</text><text x="90" y="102" text-anchor="middle" class="t-xs">Ch. 1–4</text>
+<rect x="190" y="20" width="160" height="96" rx="10" class="bx4"/><text x="270" y="44" text-anchor="middle" class="t-b">II · The Machine</text><text x="270" y="66" text-anchor="middle" class="t-sm">GPU architecture,</text><text x="270" y="82" text-anchor="middle" class="t-sm">roofline, kernels</text><text x="270" y="102" text-anchor="middle" class="t-xs">Ch. 5–7</text>
+<rect x="370" y="20" width="160" height="96" rx="10" class="bx5"/><text x="450" y="44" text-anchor="middle" class="t-b">III · Attention &amp; Memory</text><text x="450" y="66" text-anchor="middle" class="t-sm">KV cache, FlashAttention,</text><text x="450" y="82" text-anchor="middle" class="t-sm">PagedAttention</text><text x="450" y="102" text-anchor="middle" class="t-xs">Ch. 8–10</text>
+<rect x="550" y="20" width="160" height="96" rx="10" class="bx2"/><text x="630" y="44" text-anchor="middle" class="t-b">IV · Serving Systems</text><text x="630" y="66" text-anchor="middle" class="t-sm">batching, engines,</text><text x="630" y="82" text-anchor="middle" class="t-sm">disaggregation</text><text x="630" y="102" text-anchor="middle" class="t-xs">Ch. 11–13</text>
+<rect x="10" y="180" width="160" height="96" rx="10" class="bx3"/><text x="90" y="204" text-anchor="middle" class="t-b">V · Smaller Models</text><text x="90" y="226" text-anchor="middle" class="t-sm">quantisation, pruning,</text><text x="90" y="242" text-anchor="middle" class="t-sm">distillation</text><text x="90" y="262" text-anchor="middle" class="t-xs">Ch. 14–15</text>
+<rect x="190" y="180" width="160" height="96" rx="10" class="bx"/><text x="270" y="204" text-anchor="middle" class="t-b">VI · Distributed</text><text x="270" y="226" text-anchor="middle" class="t-sm">collectives, TP/PP/CP,</text><text x="270" y="242" text-anchor="middle" class="t-sm">MoE &amp; expert parallel</text><text x="270" y="262" text-anchor="middle" class="t-xs">Ch. 16–18</text>
+<rect x="370" y="180" width="160" height="96" rx="10" class="bx4"/><text x="450" y="204" text-anchor="middle" class="t-b">VII · Faster &amp; Longer</text><text x="450" y="226" text-anchor="middle" class="t-sm">speculative decoding,</text><text x="450" y="242" text-anchor="middle" class="t-sm">long context, SSMs</text><text x="450" y="262" text-anchor="middle" class="t-xs">Ch. 19–21</text>
+<rect x="550" y="180" width="160" height="96" rx="10" class="bx2"/><text x="630" y="204" text-anchor="middle" class="t-b">VIII · Production</text><text x="630" y="226" text-anchor="middle" class="t-sm">reasoning, scale, edge,</text><text x="630" y="242" text-anchor="middle" class="t-sm">design interviews</text><text x="630" y="262" text-anchor="middle" class="t-xs">Ch. 22–26</text>
 <line x1="170" y1="68" x2="188" y2="68" class="ln" marker-end="url(#ah3)"/>
 <line x1="350" y1="68" x2="368" y2="68" class="ln" marker-end="url(#ah3)"/>
 <line x1="530" y1="68" x2="548" y2="68" class="ln" marker-end="url(#ah3)"/>
@@ -465,26 +452,26 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <line x1="350" y1="228" x2="368" y2="228" class="ln" marker-end="url(#ah3)"/>
 <line x1="530" y1="228" x2="548" y2="228" class="ln" marker-end="url(#ah3)"/>
 </svg>
-<figcaption><b>Figure 1.7 — How the parts depend on each other.</b> Parts I–II give you the model and the machine; Part III attacks the KV cache; Part IV builds a server; Parts V–VII make it smaller, wider and faster; Part VIII puts it in production and in the interview room.</figcaption>
-</figure>
+<figcaption><b>Figure 1.8 — How the parts depend on each other.</b> Each part answers the open question left by the one before it.</figcaption></figure>
+
+<h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
+<p>This chapter treated the Transformer as a black box with \(N\) parameters, a KV cache that grows with every token, and a cost of about \(2N\) operations per token. Those three facts were enough for a first estimate, but they hide everything we need in order to <em>improve</em> on it. How many of those parameters sit in attention and how many in the feed-forward layers? Exactly how many bytes does each token add to the cache, and what architectural choices control that number? Where does the "2" in \(2N\) come from, and when does attention add significantly to it? Chapter 2 opens the box, tensor by tensor, and builds the exact inventory on which every later cost calculation rests.</p>
 
 <h2 id="summary">Chapter summary</h2>
 <ul>
-<li>Language modelling is estimating \(p(x_t\mid x_{&lt;t})\); loss is cross-entropy, bounded below by the entropy of language; perplexity \(=e^{H}\); compare across tokenisers in bits per byte.</li>
-<li>Each era solved its predecessor's bottleneck: n-gram sparsity → embeddings; fixed windows → recurrence; vanishing gradients → LSTM; fixed-vector bottleneck → attention; sequential training → the Transformer.</li>
-<li>The Transformer bought parallel training by keeping an explicit record of the past: the KV cache, which grows with context length. RNNs have constant-size state.</li>
-<li>Chinchilla: ~20 tokens/parameter is compute-optimal for <em>training</em>. Counting lifetime inference (\(2ND_{\text{inf}}\)), smaller, over-trained models win; hence 1,000+ tokens/parameter today.</li>
-<li>The cost centre moved to inference after ChatGPT (2022) and accelerated with reasoning models (2024–).</li>
-<li>Hardware FLOP/s outgrew memory bandwidth (the memory wall); decode at batch 1 runs at ~1 FLOP/byte versus ridge points of ~150–300.</li>
-<li>Metrics: TTFT, TPOT/ITL, E2E, throughput, goodput, cost/M tokens; tails matter; Little's law links load to concurrency.</li>
-<li>Decode speed at small batch ≤ bandwidth / (weight bytes + KV bytes).</li>
+<li>A language model is \(p(x_{1:T})=\prod_t p(x_t\mid x_{&lt;t})\). Training on known text can be parallel; generation is inherently sequential. The loss is cross-entropy, bounded below by the entropy of language. Perplexity is \(e^{H}\); compare across tokenisers in bits per byte.</li>
+<li>Each era removed the previous bottleneck. Embeddings removed n-gram sparsity, recurrence removed fixed windows, LSTMs removed vanishing gradients, attention removed the fixed-vector bottleneck, and the Transformer removed sequential training.</li>
+<li>The Transformer's bargain: parallel training and exact recall, paid for with a KV cache that grows with context. An RNN's state is constant in size.</li>
+<li>Chinchilla: about 20 training tokens per parameter minimises <em>training</em> compute. Counting lifetime inference (\(2ND_{\text{inf}}\)) favours smaller, over-trained models, which is why many modern models see 1,000+ tokens per parameter.</li>
+<li>After ChatGPT (2022) the industry's cost centre moved to inference, and reasoning models (2024–) shifted it further towards decode.</li>
+<li>The memory wall: an H100 performs about 295 operations in the time it fetches one byte, but single-user decode performs about one. Decode speed is bounded by \(\beta/(Nb)\), and batching is the first remedy.</li>
+<li>Vocabulary: TTFT, ITL/TPOT, E2E, throughput, goodput under percentile SLOs, Little's law \(\bar n=\lambda W\), and cost per million tokens.</li>
 </ul>
 
 <h2 id="mcq">Multiple-choice questions</h2>
-<p class="muted small">Click an option to lock in your answer. Questions marked "select all that apply" need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
 <div class="quiz-section">
-
-<div class="mcq" data-id="ch01-mcq-01" data-topic="Probability">
+<div class="mcq" data-id="ch01-mcq-01" data-topic="§1.1 Probability">
 <p class="q">The chain-rule factorisation \(p(x_{1:T})=\prod_t p(x_t\mid x_{&lt;t})\) used by autoregressive LMs is:</p>
 <ol class="opts">
 <li>An approximation that becomes exact only for Markov sources</li>
@@ -495,7 +482,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">The chain rule of probability is an identity. The <em>approximation</em> in an n-gram model is truncating the conditioning set; in a neural model, it is the finite capacity of the parameterisation. The direction (left-to-right) is a modelling choice, not a validity condition.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-02" data-topic="Perplexity">
+<div class="mcq" data-id="ch01-mcq-02" data-topic="§1.1 Perplexity">
 <p class="q">A model's validation loss is 2.0 nats per token. Its perplexity is closest to:</p>
 <ol class="opts">
 <li>2.0</li><li>4.0</li><li data-correct>7.4</li><li>100</li>
@@ -503,7 +490,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">\(\mathrm{PP}=e^{H}=e^{2}\approx7.39\). If the loss were 2.0 <em>bits</em>, the perplexity would be \(2^2=4\).</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-03" data-topic="Perplexity">
+<div class="mcq" data-id="ch01-mcq-03" data-topic="§1.1 Perplexity">
 <p class="q">Model A (32k-token vocabulary) has perplexity 9.1; model B (128k-token vocabulary) has perplexity 11.4 on the same text. What can you conclude?</p>
 <ol class="opts">
 <li>A is better because its perplexity is lower</li>
@@ -514,7 +501,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">B's tokens are longer on average, so each prediction carries more information; a higher per-token perplexity can still mean lower bits per byte. Normalise total log-loss by the number of bytes (or characters) in the text.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-04" data-topic="Information theory">
+<div class="mcq" data-id="ch01-mcq-04" data-topic="§1.1 Cross-entropy">
 <p class="q">Why can a language model's cross-entropy on real text never go below the entropy rate of the text distribution?</p>
 <ol class="opts">
 <li>Because of the vanishing-gradient problem</li>
@@ -522,10 +509,10 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <li>Because softmax outputs are bounded away from 1</li>
 <li>Because of finite vocabulary size</li>
 </ol>
-<div class="explain">Gibbs' inequality. The irreducible term reappears as the constant \(E\) in the Chinchilla law \(L=E+A/N^\alpha+B/D^\beta\).</div>
+<div class="explain">Gibbs' inequality. The irreducible term reappears as the constant \(E\) in the Chinchilla law \(\mathcal L=E+c_N N^{-\alpha_N}+c_D D^{-\alpha_D}\).</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-05" data-topic="n-grams">
+<div class="mcq" data-id="ch01-mcq-05" data-topic="§1.2 n-grams">
 <p class="q">The main reason classical n-gram models could not simply increase \(n\) to capture long-range context was:</p>
 <ol class="opts">
 <li>Counting is computationally expensive</li>
@@ -536,7 +523,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Sparsity is exponential in \(n\). Smoothing (Kneser–Ney etc.) mitigates but cannot overcome it; neural embeddings attack it by sharing statistical strength between similar contexts.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-06" data-topic="n-grams">
+<div class="mcq" data-id="ch01-mcq-06" data-topic="§1.2 n-grams">
 <p class="q">Kneser–Ney smoothing's key idea for the lower-order (back-off) distribution is to use:</p>
 <ol class="opts">
 <li>Raw unigram frequency</li>
@@ -547,7 +534,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">"Francisco" is frequent but almost always follows "San"; its continuation count is low, so it gets little back-off mass in novel contexts.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-07" data-topic="Neural LMs">
+<div class="mcq" data-id="ch01-mcq-07" data-topic="§1.3 Neural LMs">
 <p class="q">In Bengio et al.'s 2003 neural probabilistic LM, which component was the dominant computational cost?</p>
 <ol class="opts">
 <li>The embedding lookup</li>
@@ -558,7 +545,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">The output layer scales with \(|V|\times h\). Today's LM heads (e.g. \(128{,}256\times4096\) in Llama 3 8B, ~0.5B parameters) remain among the largest single matrices.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-08" data-topic="RNNs">
+<div class="mcq" data-id="ch01-mcq-08" data-topic="§1.4 RNNs">
 <p class="q">For a vanilla RNN \(h_t=\tanh(Wh_{t-1}+Ux_t)\), the gradient \(\partial h_t/\partial h_s\) is bounded in norm by \((\gamma\|W\|)^{t-s}\). This implies:</p>
 <ol class="opts">
 <li>Gradients always explode</li>
@@ -569,7 +556,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Product of Jacobians; with \(|\tanh'|\le1\), if \(\|W\|&lt;1\) the bound decays geometrically. (Explosion is possible—not guaranteed—when the spectral radius exceeds 1.)</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-09" data-topic="RNNs">
+<div class="mcq" data-id="ch01-mcq-09" data-topic="§1.4 RNNs">
 <p class="q">Why does the LSTM mitigate vanishing gradients?</p>
 <ol class="opts">
 <li>It uses ReLU activations</li>
@@ -580,7 +567,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">The "constant error carousel": gradient flows through \(\prod f_t\) rather than through repeated multiplication by a full matrix and squashing derivative.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-10" data-topic="Inference state">
+<div class="mcq" data-id="ch01-mcq-10" data-topic="§1.5 Transformer state">
 <p class="q">Per generated token at context length \(t\), which statement best compares the inference state of an RNN and a Transformer?</p>
 <ol class="opts">
 <li>Both need \(O(t)\) memory</li>
@@ -591,7 +578,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">This is the central trade-off of Figure 1.1, and it motivates MQA/GQA/MLA, sliding windows, PagedAttention, KV quantisation and the renewed interest in state-space models.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-11" data-topic="Transformer">
+<div class="mcq" data-id="ch01-mcq-11" data-topic="§1.5 Transformer">
 <p class="q">The decisive advantage of the Transformer over RNNs <em>for training</em> was:</p>
 <ol class="opts">
 <li>Fewer FLOPs per token</li>
@@ -602,7 +589,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Causal masking lets all \(T\) next-token losses be computed in one pass. Attention is actually \(O(T^2)\) in sequence length and does need positional encodings.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-12" data-topic="Attention history">
+<div class="mcq" data-id="ch01-mcq-12" data-topic="§1.4 Attention">
 <p class="q">Bahdanau-style attention (2014) was originally introduced to solve which problem?</p>
 <ol class="opts">
 <li>Slow training of language models</li>
@@ -613,7 +600,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Instead of compressing the whole source into one vector, the decoder computes a fresh weighted average of all encoder states at each step.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-13" data-topic="Pre-training">
+<div class="mcq" data-id="ch01-mcq-13" data-topic="§1.6 Scale">
 <p class="q">Why did the decoder-only (GPT) lineage, rather than encoder-only BERT, become the basis for chat LLMs?</p>
 <ol class="opts">
 <li>BERT was smaller</li>
@@ -624,7 +611,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Masked LMs see both sides of a blank; they are excellent encoders but do not define \(p(x_t\mid x_{&lt;t})\).</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-14" data-topic="Scaling laws">
+<div class="mcq" data-id="ch01-mcq-14" data-topic="§1.7 Scaling laws">
 <p class="q">Under the Chinchilla analysis, if you are given 4× more training compute, you should scale model size and data by roughly:</p>
 <ol class="opts">
 <li>4× parameters, same data</li>
@@ -635,7 +622,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">\(N_{\text{opt}}\propto C^{0.5}\), \(D_{\text{opt}}\propto C^{0.5}\), and \(C\approx6ND\): \(2\times2=4\).</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-15" data-topic="Scaling laws">
+<div class="mcq" data-id="ch01-mcq-15" data-topic="§1.7 Scaling laws">
 <p class="q">Training compute for a dense Transformer is commonly approximated as \(C\approx 6ND\). The factor 6 comes from:</p>
 <ol class="opts">
 <li>Six layers in the original Transformer</li>
@@ -646,7 +633,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Forward: one multiply-add per weight per token (2 FLOPs). Backward: gradients w.r.t. activations and w.r.t. weights, each about the same as the forward (4 FLOPs). Derived carefully in Chapter 2.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-16" data-topic="Inference-aware scaling">
+<div class="mcq" data-id="ch01-mcq-16" data-topic="§1.7 Inference-aware scaling">
 <p class="q">Llama 3 8B was trained on ~15T tokens, far beyond the Chinchilla-optimal ~160B. The best justification is:</p>
 <ol class="opts">
 <li>Chinchilla's law was proven wrong</li>
@@ -657,7 +644,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Chinchilla minimises training FLOPs only. When a model will be served heavily, extra training tokens are a one-off cost that buys a permanently cheaper model.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-17" data-topic="Economics">
+<div class="mcq" data-id="ch01-mcq-17" data-topic="§1.8 Economics">
 <p class="q">A model with \(N\) parameters was trained on \(D\) tokens. Ignoring attention FLOPs and efficiency differences, after how many served tokens does cumulative inference compute equal training compute?</p>
 <ol class="opts">
 <li>\(D/3\)</li><li>\(D\)</li><li data-correct>\(3D\)</li><li>\(6D\)</li>
@@ -665,7 +652,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">\(2ND_{\text{inf}}=6ND\Rightarrow D_{\text{inf}}=3D\).</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-18" data-topic="Economics">
+<div class="mcq" data-id="ch01-mcq-18" data-topic="§1.8 Economics">
 <p class="q">Why do LLM APIs usually charge more for output tokens than for input tokens?</p>
 <ol class="opts">
 <li>Output tokens are longer strings</li>
@@ -676,7 +663,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Prefill amortises each weight read over thousands of tokens; decode amortises it only over the batch. Cached-prefix discounts are a separate, further reduction for repeated input.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-19" data-topic="Metrics">
+<div class="mcq" data-id="ch01-mcq-19" data-topic="§1.13 Metrics">
 <p class="q">A request has TTFT = 400 ms, 201 output tokens and end-to-end latency 6.4 s. Its TPOT is:</p>
 <ol class="opts">
 <li>32 ms</li><li data-correct>30 ms</li><li>31.8 ms</li><li>6.0 s</li>
@@ -684,7 +671,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">\(\text{TPOT}=(6.4-0.4)/(201-1)=6.0/200=30\) ms.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-20" data-topic="Metrics">
+<div class="mcq" data-id="ch01-mcq-20" data-topic="§1.13 Metrics">
 <p class="q">Which metric is most important for an IDE code-completion product that shows a 20-token suggestion as the developer types?</p>
 <ol class="opts">
 <li>Throughput in tokens/s per GPU</li>
@@ -695,7 +682,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Completions are short outputs over long contexts (the file); the user waits for the whole suggestion, so TTFT + 20×TPOT must be ~100–300 ms. Prefix caching of the file context is crucial.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-21" data-topic="Metrics">
+<div class="mcq" data-id="ch01-mcq-21" data-topic="§1.13 Metrics">
 <p class="q">Goodput, as defined by DistServe, measures:</p>
 <ol class="opts">
 <li>Total tokens per second regardless of latency</li>
@@ -706,7 +693,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Throughput can be inflated by batching that violates latency targets; goodput counts only requests that satisfy the SLOs.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-22" data-topic="Little's law">
+<div class="mcq" data-id="ch01-mcq-22" data-topic="§1.13 Little's law">
 <p class="q">A service receives 50 requests/s; each spends on average 4 s in the system. How many requests are in flight on average (and so need KV-cache space)?</p>
 <ol class="opts">
 <li>12.5</li><li>54</li><li data-correct>200</li><li>Cannot be determined without the arrival distribution</li>
@@ -714,7 +701,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Little's law \(L=\lambda W=50\times4=200\), valid for any stable system in steady state regardless of distributions.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-23" data-topic="Bandwidth bound">
+<div class="mcq" data-id="ch01-mcq-23" data-topic="§1.10 Bandwidth bound">
 <p class="q">At batch size 1 in BF16, the arithmetic intensity of applying an \(m\times n\) weight matrix to one token vector is about:</p>
 <ol class="opts">
 <li data-correct>1 FLOP/byte</li><li>\(n\) FLOPs/byte</li><li>300 FLOPs/byte</li><li>\(mn\) FLOPs/byte</li>
@@ -722,7 +709,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">\(2mn\) FLOPs over \(2mn\) bytes of weights (vector I/O negligible). An H100's ridge point is ≈295 FLOPs/byte, so the GPU is ~300× under-utilised in compute.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-24" data-topic="Bandwidth bound">
+<div class="mcq" data-id="ch01-mcq-24" data-topic="§1.10 Bandwidth bound">
 <p class="q">An 8B-parameter model in BF16 runs at batch 1 on a GPU with 3.35 TB/s of HBM bandwidth. Ignoring the KV cache, the best achievable decode speed is about:</p>
 <ol class="opts">
 <li>~20 tokens/s</li><li data-correct>~210 tokens/s</li><li>~2,000 tokens/s</li><li>~60,000 tokens/s</li>
@@ -730,7 +717,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">16 GB / 3.35 TB/s ≈ 4.8 ms per step → ≈ 210 tokens/s. Realistically 60–85% of that.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-25" data-topic="Bandwidth bound">
+<div class="mcq" data-id="ch01-mcq-25" data-topic="§1.10 Bandwidth bound">
 <p class="q">Which of the following increase the maximum batch-1 decode speed of a memory-bound model? (select all that apply)</p>
 <ol class="opts">
 <li data-correct>Quantising weights from BF16 to 4-bit</li>
@@ -741,7 +728,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">The bound is bandwidth / bytes. Fewer bytes (quantisation), more bandwidth (new GPU, or aggregate bandwidth of several GPUs) all help. More FLOP/s does nothing when you are memory-bound.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-26" data-topic="Memory wall">
+<div class="mcq" data-id="ch01-mcq-26" data-topic="§1.9 Memory wall">
 <p class="q">The "memory wall" refers to:</p>
 <ol class="opts">
 <li>The maximum HBM capacity of a GPU</li>
@@ -752,7 +739,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Gholami et al. estimated ~3.0× per two years for peak FLOP/s versus ~1.6× for DRAM bandwidth. The ridge point rises, making memory-bound workloads relatively slower.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-27" data-topic="Hardware">
+<div class="mcq" data-id="ch01-mcq-27" data-topic="§1.9 Hardware">
 <p class="q">Which GPU generation first introduced tensor cores?</p>
 <ol class="opts">
 <li>Pascal (P100)</li><li data-correct>Volta (V100)</li><li>Ampere (A100)</li><li>Hopper (H100)</li>
@@ -760,7 +747,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Volta (2017) introduced FP16 tensor cores. Ampere added TF32/BF16 and structured sparsity; Hopper added FP8; Blackwell FP4.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-28" data-topic="Reasoning era">
+<div class="mcq" data-id="ch01-mcq-28" data-topic="§1.12 Reasoning">
 <p class="q">Reasoning models that emit 10k+ token traces shift the serving bottleneck mainly towards:</p>
 <ol class="opts">
 <li>Tokenisation throughput</li>
@@ -771,7 +758,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Long outputs mean many sequential bandwidth-bound decode steps and a KV cache that keeps growing during generation, limiting batch size.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-29" data-topic="Systems history">
+<div class="mcq" data-id="ch01-mcq-29" data-topic="§1.11 Systems history">
 <p class="q">Match the bottleneck: PagedAttention (vLLM, 2023) primarily addressed:</p>
 <ol class="opts">
 <li>The \(O(T^2)\) HBM traffic of attention</li>
@@ -782,7 +769,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Earlier systems reserved a contiguous max-length buffer per request; vLLM measured that only 20–38% of KV memory held real tokens in such systems. Paging fixes it. The \(T^2\) traffic problem is FlashAttention's.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-30" data-topic="Systems history">
+<div class="mcq" data-id="ch01-mcq-30" data-topic="§1.11 Systems history">
 <p class="q">Orca's (2022) key scheduling contribution was:</p>
 <ol class="opts">
 <li>Pipeline parallelism across nodes</li>
@@ -793,7 +780,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Now called continuous batching. Combined with selective batching (batching non-attention ops across requests of different lengths).</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-31" data-topic="Latency vs throughput">
+<div class="mcq" data-id="ch01-mcq-31" data-topic="§1.10 Batching">
 <p class="q">Increasing the decode batch size from 1 to 32 on a memory-bound model typically:</p>
 <ol class="opts">
 <li>Increases both per-user tokens/s and total throughput ~32×</li>
@@ -804,19 +791,17 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <div class="explain">Weight reads are shared by the batch; while still memory-bound, step time grows slowly (mostly due to extra KV reads), so throughput scales almost linearly. Eventually compute or KV memory limits kick in.</div>
 </div>
 
-<div class="mcq" data-id="ch01-mcq-32" data-topic="Cost">
+<div class="mcq" data-id="ch01-mcq-32" data-topic="§1.13 Cost">
 <p class="q">A 4-GPU deployment costs $3/GPU-hour and sustains 6,000 output tokens/s. Cost per million output tokens ≈</p>
 <ol class="opts">
 <li>$0.14</li><li data-correct>$0.56</li><li>$2.00</li><li>$5.60</li>
 </ol>
 <div class="explain">\(\$12/\text{h} \div (6000\times3600\ \text{tokens/h}) \times10^6 = 12/21.6 \approx \$0.56\).</div>
 </div>
-
 </div>
 
 <h2 id="interview">Interview questions</h2>
-<p class="muted small">Answer aloud (or on paper) before revealing. Then rate yourself—"review again" items appear on your progress page.</p>
-
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
 <details class="qa" data-id="ch01-qa-01">
 <summary><span class="lvl warm">Warm-up</span> What is perplexity, and why is it a poor metric for comparing two LLMs with different tokenisers?</summary>
 <div class="answer">
@@ -861,7 +846,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <details class="qa" data-id="ch01-qa-06">
 <summary><span class="lvl core">Core</span> Explain the Chinchilla scaling result and why most production models deliberately violate it.</summary>
 <div class="answer">
-<p>Hoffmann et al. fitted \(L(N,D)=E+A N^{-\alpha}+B D^{-\beta}\) and minimised it under \(C=6ND\), finding \(N_{\text{opt}},D_{\text{opt}}\propto C^{\approx0.5}\), about 20 tokens per parameter; Chinchilla-70B trained on 1.4T tokens beat Gopher-280B at equal compute. But this minimises <em>training</em> FLOPs only. Total cost is \(6ND_{\text{train}}+2ND_{\text{inf}}\) (plus memory and latency costs that also scale with \(N\)). For heavily-served models, a smaller \(N\) trained on many more tokens achieves the same loss with much cheaper inference, lower latency, and the ability to run on fewer or smaller GPUs. Hence LLaMA-7B (1T tokens), Llama 3 8B (15T tokens, ~1,900 tokens/param), and the general "over-training" trend; Sardana &amp; Frankle formalised the inference-aware optimum. Caveat: returns diminish, and data quality/availability becomes the constraint.</p>
+<p>Hoffmann et al. fitted \(\mathcal L(N,D)=E+c_N N^{-\alpha_N}+c_D D^{-\alpha_D}\) and minimised it under \(C=6ND\), finding \(N_{\text{opt}},D_{\text{opt}}\propto C^{\approx0.5}\), about 20 tokens per parameter; Chinchilla-70B trained on 1.4T tokens beat Gopher-280B at equal compute. But this minimises <em>training</em> FLOPs only. Total cost is \(6ND_{\text{train}}+2ND_{\text{inf}}\) (plus memory and latency costs that also scale with \(N\)). For heavily-served models, a smaller \(N\) trained on many more tokens achieves the same loss with much cheaper inference, lower latency, and the ability to run on fewer or smaller GPUs. Hence LLaMA-7B (1T tokens), Llama 3 8B (15T tokens, ~1,900 tokens/param), and the general "over-training" trend; Sardana &amp; Frankle formalised the inference-aware optimum. Caveat: returns diminish, and data quality/availability becomes the constraint.</p>
 </div>
 </details>
 
@@ -880,9 +865,9 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 </details>
 
 <details class="qa" data-id="ch01-qa-09">
-<summary><span class="lvl deep">Deep-dive</span> Derive the compute-optimal \(N\) and \(D\) from the Chinchilla loss \(L=E+AN^{-\alpha}+BD^{-\beta}\) under \(C=6ND\).</summary>
+<summary><span class="lvl deep">Deep-dive</span> Derive the compute-optimal \(N\) and \(D\) from the Chinchilla loss \(\mathcal L=E+c_NN^{-\alpha_N}+c_DD^{-\alpha_D}\) under \(C=6ND\).</summary>
 <div class="answer">
-<p>Substitute \(D=C/(6N)\): \(f(N)=AN^{-\alpha}+B(6N/C)^{\beta}\). Then \(f'(N)=-\alpha AN^{-\alpha-1}+\beta B(6/C)^{\beta}N^{\beta-1}=0\), so \(N^{\alpha+\beta}=\frac{\alpha A}{\beta B}\left(\frac{C}{6}\right)^{\beta}\), giving \(N_{\text{opt}}=G\,(C/6)^{\beta/(\alpha+\beta)}\) with \(G=(\alpha A/\beta B)^{1/(\alpha+\beta)}\), and \(D_{\text{opt}}=C/(6N_{\text{opt}})=G^{-1}(C/6)^{\alpha/(\alpha+\beta)}\). Since \(f\) is a sum of a decreasing and an increasing power of \(N\), it is unimodal—so this is the minimum. With \(\alpha=0.34,\beta=0.28\), the exponents are 0.45 and 0.55; Hoffmann et al.'s other estimation approaches give ≈0.5 each. Extension for inference-awareness: add \(2ND_{\text{inf}}\) to the cost and minimise total cost subject to \(L(N,D)=L^{*}\); the optimum moves to smaller \(N\), larger \(D\).</p>
+<p>Substitute \(D=C/(6N)\): \(f(N)=c_NN^{-\alpha_N}+c_D(6N/C)^{\alpha_D}\). Then \(f'(N)=-\alpha_Nc_NN^{-\alpha_N-1}+\alpha_Dc_D(6/C)^{\alpha_D}N^{\alpha_D-1}=0\), so \(N^{\alpha_N+\alpha_D}=\frac{\alpha_Nc_N}{\alpha_Dc_D}\left(\frac{C}{6}\right)^{\alpha_D}\), giving \(N_{\text{opt}}=G\,(C/6)^{\alpha_D/(\alpha_N+\alpha_D)}\) with \(G=(\alpha_Nc_N/\alpha_Dc_D)^{1/(\alpha_N+\alpha_D)}\), and \(D_{\text{opt}}=C/(6N_{\text{opt}})=G^{-1}(C/6)^{\alpha_N/(\alpha_N+\alpha_D)}\). Because \(f\) is the sum of a decreasing and an increasing power of \(N\), it is unimodal, so this is the minimum. With \(\alpha_N=0.34,\alpha_D=0.28\) the exponents are 0.45 and 0.55; Hoffmann et al.'s other estimation approaches give about 0.5 each. For the inference-aware version, add \(2ND_{\text{inf}}\) to the cost and minimise total cost subject to \(\mathcal L(N,D)=\mathcal L^{*}\). The optimum moves to smaller \(N\) and larger \(D\).</p>
 </div>
 </details>
 
@@ -968,7 +953,7 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <li id="ref-bahdanau">D. Bahdanau, K. Cho, Y. Bengio. Neural Machine Translation by Jointly Learning to Align and Translate. <a href="https://arxiv.org/abs/1409.0473">arXiv:1409.0473</a>, 2014.</li>
 <li id="ref-vaswani">A. Vaswani et al. Attention Is All You Need. <em>NeurIPS</em>, 2017. <a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762</a>.</li>
 <li id="ref-gpt1">A. Radford, K. Narasimhan, T. Salimans, I. Sutskever. Improving Language Understanding by Generative Pre-Training. OpenAI, 2018.</li>
-<li id="ref-bert">J. Devlin, M.-W. Chang, K. Lee, K. Toutanova. BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. <a href="https://arxiv.org/abs/1810.04805">arXiv:1810.04805</a>, 2018.</li>
+<li id="ref-bert">J. Devlin, M.-W. Chang, K. Lee, K. Toutanova. BERT. <a href="https://arxiv.org/abs/1810.04805">arXiv:1810.04805</a>, 2018.</li>
 <li id="ref-gpt2">A. Radford et al. Language Models are Unsupervised Multitask Learners. OpenAI, 2019.</li>
 <li id="ref-gpt3">T. Brown et al. Language Models are Few-Shot Learners. <em>NeurIPS</em>, 2020. <a href="https://arxiv.org/abs/2005.14165">arXiv:2005.14165</a>.</li>
 <li id="ref-kaplan">J. Kaplan et al. Scaling Laws for Neural Language Models. <a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a>, 2020.</li>
@@ -983,13 +968,13 @@ With \(\alpha\approx\beta\) both exponents are \(\approx\tfrac12\).</p>
 <li id="ref-tpu">N. P. Jouppi et al. In-Datacenter Performance Analysis of a Tensor Processing Unit. <em>ISCA</em>, 2017. <a href="https://arxiv.org/abs/1704.04760">arXiv:1704.04760</a>.</li>
 <li id="ref-memwall">A. Gholami, Z. Yao, S. Kim, C. Hooper, M. W. Mahoney, K. Keutzer. AI and Memory Wall. <em>IEEE Micro</em>, 2024. <a href="https://arxiv.org/abs/2403.14123">arXiv:2403.14123</a>.</li>
 <li id="ref-distserve">Y. Zhong et al. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2401.09670">arXiv:2401.09670</a>.</li>
-<li>G.-I. Yu et al. Orca: A Distributed Serving System for Transformer-Based Generative Models. <em>OSDI</em>, 2022.</li>
-<li>W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
-<li>T. Dao, D. Y. Fu, S. Ermon, A. Rudra, C. Ré. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a>, 2022.</li>
-<li>R. Pope et al. Efficiently Scaling Transformer Inference. <em>MLSys</em>, 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a>.</li>
-<li>Y. Leviathan, M. Kalman, Y. Matias. Fast Inference from Transformers via Speculative Decoding. <a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a>, 2022.</li>
-<li>DeepSeek-AI. DeepSeek-V3 Technical Report. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>, 2024.</li>
-<li>Further reading: J. Austin et al. <em>How to Scale Your Model</em> (Google DeepMind, 2025), <a href="https://jax-ml.github.io/scaling-book/">jax-ml.github.io/scaling-book</a>; D. Jurafsky and J. H. Martin, <em>Speech and Language Processing</em> (3rd ed. draft), Ch. 3 (n-grams) and Ch. 9–10 (Transformers).</li>
+<li id="ref-brrr">H. He. Making Deep Learning Go Brrrr From First Principles. 2022. <a href="https://horace.io/brrr_intro.html">horace.io</a>.</li>
+<li id="ref-mqa">N. Shazeer. Fast Transformer Decoding: One Write-Head is All You Need. <a href="https://arxiv.org/abs/1911.02150">arXiv:1911.02150</a>, 2019.</li>
+<li id="ref-fa">T. Dao, D. Y. Fu, S. Ermon, A. Rudra, C. Ré. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. <a href="https://arxiv.org/abs/2205.14135">arXiv:2205.14135</a>, 2022.</li>
+<li id="ref-orca">G.-I. Yu, J. S. Jeong, G.-W. Kim, S. Kim, B.-G. Chun. Orca: A Distributed Serving System for Transformer-Based Generative Models. <em>OSDI</em>, 2022.</li>
+<li id="ref-vllm">W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+<li id="ref-spec">Y. Leviathan, M. Kalman, Y. Matias. Fast Inference from Transformers via Speculative Decoding. <a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a>, 2022; C. Chen et al. Accelerating Large Language Model Decoding with Speculative Sampling. <a href="https://arxiv.org/abs/2302.01318">arXiv:2302.01318</a>, 2023.</li>
+<li>Further reading: J. Austin et al. <em>How to Scale Your Model</em> (Google DeepMind, 2025), <a href="https://jax-ml.github.io/scaling-book/">jax-ml.github.io/scaling-book</a>; L. Weng, Large Transformer Model Inference Optimization (2023), <a href="https://lilianweng.github.io/posts/2023-01-10-inference-optimization/">lilianweng.github.io</a>; D. Jurafsky and J. H. Martin, <em>Speech and Language Processing</em> (3rd ed. draft).</li>
 </ol>
 
 </article>
