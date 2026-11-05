@@ -98,7 +98,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Static and dynamic batching → continuous batching (Orca) → chunked prefill (Sarathi) → preemption → fairness, priorities and SLO-aware scheduling → length prediction.
 **Refs.** Yu 2022; Agrawal 2024; Sheng 2024 (VTC); Fu 2024.
 
-### Chapter 12 — Inside an Inference Engine
+### Chapter 12 — Inside an Inference Engine ✅ *(v2)*
 **Motivating question.** How do all these ideas fit together into software such as vLLM or SGLang?
 **Arc.** Anatomy of an engine → vLLM V0 → V1 → SGLang → TensorRT-LLM, TGI, llama.cpp → APIs and streaming.
 **Refs.** Gordić 2025 (*Inside vLLM*); vLLM and SGLang docs; Park 2025 (engine survey).
@@ -183,4 +183,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 9 | IO-Aware Attention: FlashAttention 1 → 4 | ✅ v2 |
 | 10 | Memory Management: PagedAttention and Prefix Caching | ✅ v2 |
 | 11 | Batching and Scheduling | ✅ v2 |
-| 12–26 | — | ⏳ planned |
+| 12 | Inside an Inference Engine | ✅ v2 |
+| 13–26 | — | ⏳ planned |
