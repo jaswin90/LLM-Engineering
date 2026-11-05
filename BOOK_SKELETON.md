@@ -129,7 +129,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Collectives as linear-algebra operations → the α–β cost model → ring and tree all-reduce (proof of bandwidth optimality) → NVLink, InfiniBand, RoCE, topologies → NCCL, NVSHMEM, overlap.
 **Refs.** Thakur 2005; Patarasuk & Yuan 2009; NCCL docs.
 
-### Chapter 17 — Parallelism Strategies for Inference
+### Chapter 17 — Parallelism Strategies for Inference ✅ *(v2)*
 **Arc.** Data parallelism → tensor parallelism (Megatron) → pipeline parallelism → sequence and context parallelism (Ring, Ulysses) → choosing a configuration.
 **Refs.** Shoeybi 2019; Narayanan 2021; Pope 2022; Liu 2023; Jacobs 2023.
 
@@ -188,4 +188,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 14 | Quantisation | ✅ v2 |
 | 15 | Pruning, Sparsity and Distillation | ✅ v2 |
 | 16 | Distributed Computing Fundamentals | ✅ v2 |
-| 17–26 | — | ⏳ planned |
+| 17 | Parallelism Strategies for Inference | ✅ v2 |
+| 18–26 | — | ⏳ planned |

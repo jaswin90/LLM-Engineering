@@ -25,7 +25,7 @@
     { id: 'ch14', n: 14, part: 'V', title: 'Quantisation', sub: 'FP8, INT4, MXFP4/NVFP4, GPTQ, AWQ, SmoothQuant, rotations', file: 'chapters/ch14.html', ready: true },
     { id: 'ch15', n: 15, part: 'V', title: 'Pruning, Sparsity and Distillation', sub: 'SparseGPT, Wanda, 2:4, Minitron, distillation', file: 'chapters/ch15.html', ready: true },
     { id: 'ch16', n: 16, part: 'VI', title: 'Distributed Computing Fundamentals', sub: 'Collectives, the α–β model, ring all-reduce, NVLink, InfiniBand, NCCL', file: 'chapters/ch16.html', ready: true },
-    { id: 'ch17', n: 17, part: 'VI', title: 'Parallelism Strategies for Inference', sub: 'Tensor, pipeline, sequence and context parallelism', ready: false },
+    { id: 'ch17', n: 17, part: 'VI', title: 'Parallelism Strategies for Inference', sub: 'Tensor, pipeline, sequence and context parallelism', file: 'chapters/ch17.html', ready: true },
     { id: 'ch18', n: 18, part: 'VI', title: 'Mixture of Experts at Inference', sub: 'Routing, expert parallelism, all-to-all, the DeepSeek-V3 deployment', ready: false },
     { id: 'ch19', n: 19, part: 'VII', title: 'Speculative Decoding', sub: 'Exactness proof, Medusa, EAGLE 1–3, MTP, tree verification', ready: false },
     { id: 'ch20', n: 20, part: 'VII', title: 'Long-Context Inference', sub: 'RoPE scaling, sparse attention, context parallelism', ready: false },

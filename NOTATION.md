@@ -108,6 +108,9 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(\nu\) | bytes in each rank's buffer for a collective (the message size) |
 | \(\alpha\) | per-step (per-message) latency of a communication step, seconds |
 | \(\beta_{\text{link}}\) | per-GPU, per-direction link bandwidth, bytes/s (NVLink on H100: 450 GB/s) |
+| \(n_{\text{TP}}, n_{\text{PP}}, n_{\text{DP}}, n_{\text{CP}}, n_{\text{EP}}\) | degrees of tensor, pipeline, data, context and expert parallelism (Ch. 17–18) |
+| \(n_\mu\) | number of micro-batches in flight in a pipeline (Ch. 17) |
+| \(T_c\) | tokens of a sequence held by one device under context parallelism (Ch. 17) |
 
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.

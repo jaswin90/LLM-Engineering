@@ -117,6 +117,9 @@
 <tr><td>\(\nu\)</td><td>bytes in each rank's buffer for a collective (the message size)</td></tr>
 <tr><td>\(\alpha\)</td><td>per-step (per-message) latency of a communication step, seconds</td></tr>
 <tr><td>\(\beta_{\text{link}}\)</td><td>per-GPU, per-direction link bandwidth, bytes/s (NVLink on H100: 450 GB/s)</td></tr>
+<tr><td>\(n_{\text{TP}}, n_{\text{PP}}, n_{\text{DP}}, n_{\text{CP}}, n_{\text{EP}}\)</td><td>degrees of tensor, pipeline, data, context and expert parallelism (Ch. 17–18)</td></tr>
+<tr><td>\(n_\mu\)</td><td>number of micro-batches in flight in a pipeline (Ch. 17)</td></tr>
+<tr><td>\(T_c\)</td><td>tokens of a sequence held by one device under context parallelism (Ch. 17)</td></tr>
 </tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
