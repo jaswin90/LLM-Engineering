@@ -33,3 +33,10 @@ This file records weaknesses found in the drafts and what was done about them. E
 5. **Chapter 1 rewritten.** The history is expanded into continuous narrative; hardware intuition comes before any FLOPs-per-byte argument; prefill and decode are introduced informally when first needed; the systems history is told as a causal chain.
 6. **Chapters 2 and 3 rewritten** to the new standard. Horace He's compute/memory/overhead lens now motivates arithmetic intensity, and a complete numerical "life of a request" ties Chapter 3 together.
 7. Every chapter now opens with a motivation section and closes with a "Looking ahead" bridge. Every figure is discussed in the body text. Quizzes point back to their sections.
+
+---
+
+## Review 2 — Correction found while writing Chapter 7 (Nov 2026)
+- **Error:** Chapter 5's tiling box claimed that shared-memory tiling alone raises a GEMM's HBM intensity "comfortably above" the H100 ridge. A \(t\times t\) block tile gives intensity ≈ \(t/b\) (≈ 85 FLOP/B for 128 × 256 BF16 tiles), which is below the ridge. Fast GEMMs also rely on L2 reuse across concurrently scheduled blocks (rasterisation/swizzling).
+- **Fix:** rewrote the Ch 5 box and interview answer ch05-qa-08 to give the correct two-level argument; Ch 7 now derives it with a chart.
+- **Rule added to practice:** recompute every quantitative claim from the formula before publishing, even "obvious" ones.

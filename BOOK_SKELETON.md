@@ -65,7 +65,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Roofline as \(\min(\pi, I\beta)\) → hierarchical rooflines → operators of an LLM on the roofline → critical batch size, including KV traffic → MFU and MBU → Little's law and the latency–throughput frontier → profiling (Nsight, PyTorch profiler).
 **Refs.** Williams 2009; Pope 2022; Austin 2025; Yuan 2024.
 
-### Chapter 7 — GPU Programming for Mathematicians
+### Chapter 7 — GPU Programming for Mathematicians ✅ *(v2)*
 **Motivating question.** Why does fusing operations or changing a loop order make code 10× faster, and how is a fast kernel written?
 **Arc.** Kernels as maps over index spaces → coalescing, shared memory, occupancy → tiled GEMM → reductions and online softmax → fusion → Triton → CUDA Graphs and launch overhead → torch.compile → CuTe-DSL, ThunderKittens, TileLang.
 **Refs.** CUDA Guide; Tillet 2019; Spector 2024; Ansel 2024; Milakov 2018.
@@ -178,4 +178,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 4 | Decoding: From Logits to Text | ✅ v2 |
 | 5 | GPU Architecture from First Principles | ✅ v2 |
 | 6 | The Roofline Model and Performance Analysis | ✅ v2 |
-| 7–26 | — | ⏳ planned |
+| 7 | GPU Programming for Mathematicians | ✅ v2 |
+| 8–26 | — | ⏳ planned |
