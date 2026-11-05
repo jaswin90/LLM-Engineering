@@ -111,6 +111,13 @@
 <tr><td>\(p_{\text{te}}\), \(p_{\text{st}}\)</td><td>teacher and student next-token distributions (distillation)</td></tr>
 <tr><td>\(\mathrm{KL}(p\,\Vert\,q)\)</td><td>Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\)</td></tr>
 </tbody></table></div>
+<h2>Communication (Ch. 16 onwards)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_p\)</td><td>number of GPUs (ranks) taking part in a collective</td></tr>
+<tr><td>\(\nu\)</td><td>bytes in each rank's buffer for a collective (the message size)</td></tr>
+<tr><td>\(\alpha\)</td><td>per-step (per-message) latency of a communication step, seconds</td></tr>
+<tr><td>\(\beta_{\text{link}}\)</td><td>per-GPU, per-direction link bandwidth, bytes/s (NVLink on H100: 450 GB/s)</td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

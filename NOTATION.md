@@ -101,6 +101,14 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(p_{\text{te}}\), \(p_{\text{st}}\) | teacher and student next-token distributions (distillation) |
 | \(\mathrm{KL}(p\,\Vert\,q)\) | Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\) |
 
+## Communication (Ch. 16 onwards)
+| Symbol | Meaning |
+|---|---|
+| \(n_p\) | number of GPUs (ranks) taking part in a collective |
+| \(\nu\) | bytes in each rank's buffer for a collective (the message size) |
+| \(\alpha\) | per-step (per-message) latency of a communication step, seconds |
+| \(\beta_{\text{link}}\) | per-GPU, per-direction link bandwidth, bytes/s (NVLink on H100: 450 GB/s) |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.

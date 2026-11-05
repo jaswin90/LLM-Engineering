@@ -124,7 +124,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ## Part VI — Distributed Inference
 
-### Chapter 16 — Distributed Computing Fundamentals
+### Chapter 16 — Distributed Computing Fundamentals ✅ *(v2)*
 **Motivating question.** The model or its cache does not fit on one GPU. What does it cost to move data between GPUs?
 **Arc.** Collectives as linear-algebra operations → the α–β cost model → ring and tree all-reduce (proof of bandwidth optimality) → NVLink, InfiniBand, RoCE, topologies → NCCL, NVSHMEM, overlap.
 **Refs.** Thakur 2005; Patarasuk & Yuan 2009; NCCL docs.
@@ -187,4 +187,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 13 | Disaggregated Serving | ✅ v2 |
 | 14 | Quantisation | ✅ v2 |
 | 15 | Pruning, Sparsity and Distillation | ✅ v2 |
-| 16–26 | — | ⏳ planned |
+| 16 | Distributed Computing Fundamentals | ✅ v2 |
+| 17–26 | — | ⏳ planned |
