@@ -93,7 +93,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ## Part IV — Serving Systems
 
-### Chapter 11 — Batching and Scheduling
+### Chapter 11 — Batching and Scheduling ✅ *(v2)*
 **Motivating question.** Requests arrive at random and finish at different times. How do we keep the GPU busy without making anyone wait too long?
 **Arc.** Static and dynamic batching → continuous batching (Orca) → chunked prefill (Sarathi) → preemption → fairness, priorities and SLO-aware scheduling → length prediction.
 **Refs.** Yu 2022; Agrawal 2024; Sheng 2024 (VTC); Fu 2024.
@@ -182,4 +182,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 8 | The KV Cache: Shrinking It | ✅ v2 |
 | 9 | IO-Aware Attention: FlashAttention 1 → 4 | ✅ v2 |
 | 10 | Memory Management: PagedAttention and Prefix Caching | ✅ v2 |
-| 11–26 | — | ⏳ planned |
+| 11 | Batching and Scheduling | ✅ v2 |
+| 12–26 | — | ⏳ planned |
