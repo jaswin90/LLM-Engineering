@@ -103,7 +103,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Anatomy of an engine → vLLM V0 → V1 → SGLang → TensorRT-LLM, TGI, llama.cpp → APIs and streaming.
 **Refs.** Gordić 2025 (*Inside vLLM*); vLLM and SGLang docs; Park 2025 (engine survey).
 
-### Chapter 13 — Disaggregated Serving
+### Chapter 13 — Disaggregated Serving ✅ *(v2)*
 **Motivating question.** Prefill and decode want different hardware and interfere with each other. Should they run on different machines?
 **Arc.** Interference and goodput → Splitwise, DistServe → Mooncake → KV transfer (RDMA, NIXL) → Dynamo, llm-d → attention/FFN disaggregation.
 **Refs.** Patel 2024; Zhong 2024; Qin 2025.
@@ -184,4 +184,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 10 | Memory Management: PagedAttention and Prefix Caching | ✅ v2 |
 | 11 | Batching and Scheduling | ✅ v2 |
 | 12 | Inside an Inference Engine | ✅ v2 |
-| 13–26 | — | ⏳ planned |
+| 13 | Disaggregated Serving | ✅ v2 |
+| 14–26 | — | ⏳ planned |

@@ -176,6 +176,7 @@ svg.dg .t-xs { font-size: 10px; fill: var(--muted); }
 svg.dg .t-b { font-weight: 700; }
 svg.dg .t-acc { fill: var(--accent-ink); }
 svg.dg .t-s2 { fill: var(--s2); } svg.dg .t-s3 { fill: var(--s3); } svg.dg .t-s5 { fill: var(--s5); }
+svg.dg .t-on { fill: #fff; font-weight: 600; } svg.dg .t-on-dark { fill: #1b1b1b; font-weight: 600; }
 svg.dg .bx { fill: var(--d-fill); stroke: var(--d-stroke); stroke-width: 1.2; }
 svg.dg .bx2 { fill: var(--d-fill-2); stroke: var(--s2); stroke-width: 1.2; }
 svg.dg .bx3 { fill: var(--d-fill-3); stroke: var(--s3); stroke-width: 1.2; }

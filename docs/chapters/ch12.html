@@ -88,13 +88,13 @@
  "x":{"label":"GPU time per step (ms)","min":0,"max":32,"ticks":[0,5,10,15,20,25,30]},
  "y":{"label":"Fraction of ideal throughput","min":0,"max":1.05,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
  "series":[
-  {"name":"Serial: CPU work between GPU steps, g / (g + c)","color":"s2","points":[[1,0.25],[2,0.4],[3,0.5],[5,0.625],[10,0.769],[20,0.87],[30,0.909]]},
-  {"name":"Overlapped: CPU work hidden behind GPU, g / max(g, c)","color":"s1","points":[[1,0.333],[2,0.667],[3,1],[5,1],[10,1],[20,1],[30,1]]}
+  {"name":"Serial: CPU work between GPU steps, t_gpu / (t_gpu + t_cpu)","color":"s2","points":[[1,0.25],[2,0.4],[3,0.5],[5,0.625],[10,0.769],[20,0.87],[30,0.909]]},
+  {"name":"Overlapped: CPU work hidden behind GPU, t_gpu / max(t_gpu, t_cpu)","color":"s1","points":[[1,0.333],[2,0.667],[3,1],[5,1],[10,1],[20,1],[30,1]]}
  ]}
 </script>
 <figcaption><b>Figure 12.2 — CPU overhead hurts small, fast steps most.</b> A simple model with a fixed 3 ms of CPU work per step. Run serially, it costs 23% of throughput at a 10 ms GPU step and 60% at 2 ms. Overlapped with GPU execution, it costs nothing once the GPU step is longer than the CPU work.</figcaption></figure>
 
-<p>Figure 12.2 quantifies the effect with a deliberately simple model: \(c=3\) ms of CPU work per step and a GPU step of \(g\) milliseconds. If the CPU work runs between GPU steps, throughput is \(g/(g+c)\) of ideal: 77% for a 10 ms step, and only 40% for a 2 ms step such as a small model or a tensor-parallel shard. If the CPU work for step \(k+1\) can run <em>while</em> the GPU executes step \(k\), throughput is \(g/\max(g,c)\), which is 100% whenever the GPU step is longer than the CPU work. That is why overlapping matters most for small models and large tensor-parallel degrees, exactly what SGLang reported for its overlap scheduler.</p>
+<p>Figure 12.2 quantifies the effect with a deliberately simple model: \(t_{\text{cpu}}=3\) ms of CPU work per step and a GPU step of \(t_{\text{gpu}}\) milliseconds. If the CPU work runs between GPU steps, throughput is \(t_{\text{gpu}}/(t_{\text{gpu}}+t_{\text{cpu}})\) of ideal: 77% for a 10 ms step, and only 40% for a 2 ms step such as a small model or a tensor-parallel shard. If the CPU work for step \(k+1\) can run <em>while</em> the GPU executes step \(k\), throughput is \(t_{\text{gpu}}/\max(t_{\text{gpu}},t_{\text{cpu}})\), which is 100% whenever the GPU step is longer than the CPU work. That is why overlapping matters most for small models and large tensor-parallel degrees, exactly what SGLang reported for its overlap scheduler.</p>
 <p>Engines attack the problem with three techniques. <strong>Process separation</strong> moves work that need not be on the critical path (HTTP handling, tokenisation, detokenisation, streaming) into processes of their own, so it neither competes for the GIL nor delays the step loop. <strong>Incremental state</strong> means that the GPU workers keep a persistent copy of the batch's metadata and receive only <em>changes</em> each step, a few requests added or removed and new tokens appended, rather than rebuilding everything. <strong>Overlapped (asynchronous) scheduling</strong> lets the engine core schedule step \(k+1\) while the GPU runs step \(k\). The difficulty is that step \(k+1\)'s inputs include the tokens sampled at step \(k\), which are not yet known. The solution is to schedule with placeholders ("future tokens") that the GPU fills in from step \(k\)'s output buffer when step \(k+1\) actually executes, with CUDA events enforcing the ordering. The cost is that some decisions, such as noticing that a request has produced its end-of-sequence token, are made one step late, so a finished request may run one wasted step.</p>
 
 <figure class="diagram" id="fig-12-3">
@@ -117,8 +117,8 @@
 
 <details class="drill">
 <summary>Drill 12.1 — When is tensor parallelism too much?</summary>
-<p>Llama 3 8B serves 64 decodes at 2k context. Compare one H100 (TP = 1) with eight H100s (TP = 8), assuming \(c=3\) ms of CPU work per step and about 15 µs per all-reduce. What fraction of the GPU time is useful in each case, with and without overlapped scheduling?</p>
-<p><em>Solution.</em> At TP = 1 a step reads 16.06 GB of weights plus \(64\times2048\times128\) KiB \(\approx17.2\) GB of cache, about 33.3 GB, which takes \(g\approx9.9\) ms at 3.35 TB/s. Serial efficiency is \(9.9/12.9\approx77\%\), and overlapped it is 100%. At TP = 8 each GPU reads one eighth of both, about 4.2 GB, or 1.24 ms, plus \(2\times32=64\) all-reduces at 15 µs, about 1 ms, so \(g\approx2.2\) ms. Serial efficiency is \(2.2/5.2\approx42\%\). Even overlapped it is only \(2.2/3\approx73\%\), because the CPU now takes longer than the GPU. The eight GPUs deliver well under eight times the throughput of one, and for an 8B model eight independent replicas would be far better. Overlap hides CPU work only while there is GPU work long enough to hide it behind.</p>
+<p>Llama 3 8B serves 64 decodes at 2k context. Compare one H100 (TP = 1) with eight H100s (TP = 8), assuming \(t_{\text{cpu}}=3\) ms of CPU work per step and about 15 µs per all-reduce. What fraction of the GPU time is useful in each case, with and without overlapped scheduling?</p>
+<p><em>Solution.</em> At TP = 1 a step reads 16.06 GB of weights plus \(64\times2048\times128\) KiB \(\approx17.2\) GB of cache, about 33.3 GB, which takes \(t_{\text{gpu}}\approx9.9\) ms at 3.35 TB/s. Serial efficiency is \(9.9/12.9\approx77\%\), and overlapped it is 100%. At TP = 8 each GPU reads one eighth of both, about 4.2 GB, or 1.24 ms, plus \(2\times32=64\) all-reduces at 15 µs, about 1 ms, so \(t_{\text{gpu}}\approx2.2\) ms. Serial efficiency is \(2.2/5.2\approx42\%\). Even overlapped it is only \(2.2/3\approx73\%\), because the CPU now takes longer than the GPU. The eight GPUs deliver well under eight times the throughput of one, and for an 8B model eight independent replicas would be far better. Overlap hides CPU work only while there is GPU work long enough to hide it behind.</p>
 </details>
 
 <h3 id="cuda-graph-buckets">An engine-level trade-off: CUDA-graph buckets</h3>
@@ -253,7 +253,7 @@
 <h2 id="summary">Chapter summary</h2>
 <ul>
 <li>An engine comprises an API server (templates, tokenisation, streaming), an engine core (scheduler, KV manager), GPU workers (model runner, sampler) and an output processor (detokenisation, stop checks).</li>
-<li>CPU overhead per step (scheduling, input preparation, bookkeeping, detokenisation) can cost a large fraction of throughput when GPU steps are short: \(g/(g+c)\) serial versus \(g/\max(g,c)\) overlapped. It is hidden by process separation, incremental state and overlapped scheduling with future-token placeholders.</li>
+<li>CPU overhead per step (scheduling, input preparation, bookkeeping, detokenisation) can cost a large fraction of throughput when GPU steps are short: \(t_{\text{gpu}}/(t_{\text{gpu}}+t_{\text{cpu}})\) serial versus \(t_{\text{gpu}}/\max(t_{\text{gpu}},t_{\text{cpu}})\) overlapped. It is hidden by process separation, incremental state and overlapped scheduling with future-token placeholders.</li>
 <li>CUDA-graph buckets trade capture cost against padding waste; fine-grained buckets (every 8) keep padding below 10% at large batch.</li>
 <li>vLLM: V0 (single process, PagedAttention) → V1 (2025: API server ↔ engine core over ZMQ, one worker per GPU, unified token-budget scheduler, persistent batch, default-on prefix caching, torch.compile with piecewise CUDA graphs).</li>
 <li>SGLang: frontend language for LLM programs, RadixAttention with cache-aware scheduling, compressed FSMs, zero-overhead overlap scheduler, strong MoE/MLA serving.</li>
@@ -286,14 +286,14 @@
 </div>
 
 <div class="mcq" data-id="ch12-mcq-04" data-topic="§12.2 CPU overhead">
-<p class="q">With \(c=3\) ms of CPU work and a \(g=2\) ms GPU step run serially, the fraction of ideal throughput is:</p>
+<p class="q">With \(t_{\text{cpu}}=3\) ms of CPU work and a \(t_{\text{gpu}}=2\) ms GPU step run serially, the fraction of ideal throughput is:</p>
 <ol class="opts"><li>100%</li><li>77%</li><li data-correct>40%</li><li>67%</li></ol>
-<div class="explain">\(g/(g+c)=2/5=40\%\).</div>
+<div class="explain">\(t_{\text{gpu}}/(t_{\text{gpu}}+t_{\text{cpu}})=2/5=40\%\).</div>
 </div>
 
 <div class="mcq" data-id="ch12-mcq-05" data-topic="§12.2 CPU overhead">
 <p class="q">With perfect overlap, throughput relative to ideal is:</p>
-<ol class="opts"><li>\(g/(g+c)\)</li><li data-correct>\(g/\max(g,c)\)</li><li>\(c/g\)</li><li>always 100%</li></ol>
+<ol class="opts"><li>\(t_{\text{gpu}}/(t_{\text{gpu}}+t_{\text{cpu}})\)</li><li data-correct>\(t_{\text{gpu}}/\max(t_{\text{gpu}},t_{\text{cpu}})\)</li><li>\(t_{\text{cpu}}/t_{\text{gpu}}\)</li><li>always 100%</li></ol>
 <div class="explain">Overlap hides CPU work only when the GPU step is longer than it.</div>
 </div>
 
@@ -497,14 +497,14 @@
 <details class="qa" data-id="ch12-qa-03">
 <summary><span class="lvl core">Core</span> Why did CPU overhead become a first-class problem for inference engines around 2024?</summary>
 <div class="answer">
-<p>Two trends shrank the GPU's share of each step. Kernels got much better (FlashAttention, FlashInfer, fused GEMMs, FP8), and serving moved to smaller, efficient models and to tensor-parallel shards whose steps are only a few milliseconds. Meanwhile a Python engine does per-request work every step: scheduling, rebuilding token-id, position and block-table tensors, copying them to the GPU, copying sampled tokens back, stop checks, detokenisation and streaming. A few microseconds per request per operation adds up to milliseconds at batch sizes of hundreds. With CPU time \(c\) run serially between GPU steps of length \(g\), throughput is \(g/(g+c)\): 3 ms of CPU work costs 23% at a 10 ms step and 60% at a 2 ms step. SGLang reported unoptimised engines spending up to half their time on overhead. The second generation of engines (vLLM V1, SGLang's overlap scheduler, TensorRT-LLM's PyTorch backend) was largely a response.</p>
+<p>Two trends shrank the GPU's share of each step. Kernels got much better (FlashAttention, FlashInfer, fused GEMMs, FP8), and serving moved to smaller, efficient models and to tensor-parallel shards whose steps are only a few milliseconds. Meanwhile a Python engine does per-request work every step: scheduling, rebuilding token-id, position and block-table tensors, copying them to the GPU, copying sampled tokens back, stop checks, detokenisation and streaming. A few microseconds per request per operation adds up to milliseconds at batch sizes of hundreds. With CPU time \(t_{\text{cpu}}\) run serially between GPU steps of length \(t_{\text{gpu}}\), throughput is \(t_{\text{gpu}}/(t_{\text{gpu}}+t_{\text{cpu}})\): 3 ms of CPU work costs 23% at a 10 ms step and 60% at a 2 ms step. SGLang reported unoptimised engines spending up to half their time on overhead. The second generation of engines (vLLM V1, SGLang's overlap scheduler, TensorRT-LLM's PyTorch backend) was largely a response.</p>
 </div>
 </details>
 
 <details class="qa" data-id="ch12-qa-04">
 <summary><span class="lvl core">Core</span> Explain overlapped (zero-overhead) scheduling. What is the hard part and what does it cost?</summary>
 <div class="answer">
-<p>The engine core schedules and prepares step \(k+1\) while the GPU executes step \(k\), so the GPU timeline is continuous and throughput becomes \(g/\max(g,c)\) instead of \(g/(g+c)\). The hard part is a data dependency: step \(k+1\)'s inputs include the tokens sampled in step \(k\), which do not exist yet when scheduling happens. Engines schedule with placeholder (future) tokens; when step \(k+1\) runs, the GPU reads the real tokens from step \(k\)'s output buffer, with CUDA events ordering the two. The costs: decisions that depend on sampled tokens, such as stopping at end-of-sequence or a stop string, are made one step late, so a finished request may run one wasted step and its blocks are freed a step later; the code is more complex, particularly with speculative decoding and structured outputs, whose next-step constraints depend on the current token. The gain is largest for small models and high TP degrees, where \(g\) is short.</p>
+<p>The engine core schedules and prepares step \(k+1\) while the GPU executes step \(k\), so the GPU timeline is continuous and throughput becomes \(t_{\text{gpu}}/\max(t_{\text{gpu}},t_{\text{cpu}})\) instead of \(t_{\text{gpu}}/(t_{\text{gpu}}+t_{\text{cpu}})\). The hard part is a data dependency: step \(k+1\)'s inputs include the tokens sampled in step \(k\), which do not exist yet when scheduling happens. Engines schedule with placeholder (future) tokens; when step \(k+1\) runs, the GPU reads the real tokens from step \(k\)'s output buffer, with CUDA events ordering the two. The costs: decisions that depend on sampled tokens, such as stopping at end-of-sequence or a stop string, are made one step late, so a finished request may run one wasted step and its blocks are freed a step later; the code is more complex, particularly with speculative decoding and structured outputs, whose next-step constraints depend on the current token. The gain is largest for small models and high TP degrees, where \(t_{\text{gpu}}\) is short.</p>
 </div>
 </details>
 

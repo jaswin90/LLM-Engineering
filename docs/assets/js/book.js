@@ -21,7 +21,7 @@
     { id: 'ch10', n: 10, part: 'III', title: 'Memory Management: PagedAttention and Prefix Caching', sub: 'Block tables, copy-on-write, radix trees, KV hierarchies', file: 'chapters/ch10.html', ready: true },
     { id: 'ch11', n: 11, part: 'IV', title: 'Batching and Scheduling', sub: 'Continuous batching, chunked prefill, preemption, SLO-aware scheduling', file: 'chapters/ch11.html', ready: true },
     { id: 'ch12', n: 12, part: 'IV', title: 'Inside an Inference Engine', sub: 'vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp', file: 'chapters/ch12.html', ready: true },
-    { id: 'ch13', n: 13, part: 'IV', title: 'Disaggregated Serving', sub: 'Splitwise, DistServe, Mooncake, Dynamo, KV transfer', ready: false },
+    { id: 'ch13', n: 13, part: 'IV', title: 'Disaggregated Serving', sub: 'Splitwise, DistServe, Mooncake, Dynamo, KV transfer', file: 'chapters/ch13.html', ready: true },
     { id: 'ch14', n: 14, part: 'V', title: 'Quantisation', sub: 'FP8, INT4, MXFP4/NVFP4, GPTQ, AWQ, SmoothQuant, rotations', ready: false },
     { id: 'ch15', n: 15, part: 'V', title: 'Pruning, Sparsity and Distillation', sub: 'SparseGPT, Wanda, 2:4, Minitron, distillation', ready: false },
     { id: 'ch16', n: 16, part: 'VI', title: 'Distributed Computing Fundamentals', sub: 'Collectives, the α–β model, ring all-reduce, NVLink, InfiniBand, NCCL', ready: false },

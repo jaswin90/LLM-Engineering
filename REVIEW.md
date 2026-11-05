@@ -40,3 +40,8 @@ This file records weaknesses found in the drafts and what was done about them. E
 - **Error:** Chapter 5's tiling box claimed that shared-memory tiling alone raises a GEMM's HBM intensity "comfortably above" the H100 ridge. A \(t\times t\) block tile gives intensity ≈ \(t/b\) (≈ 85 FLOP/B for 128 × 256 BF16 tiles), which is below the ridge. Fast GEMMs also rely on L2 reuse across concurrently scheduled blocks (rasterisation/swizzling).
 - **Fix:** rewrote the Ch 5 box and interview answer ch05-qa-08 to give the correct two-level argument; Ch 7 now derives it with a chart.
 - **Rule added to practice:** recompute every quantitative claim from the formula before publishing, even "obvious" ones.
+
+## Review 3 — Part IV notation and figure pass (Chapters 12–13)
+- **Notation collision (Ch 12).** §12.2 used \(g\) and \(c\) for GPU and CPU step times; \(g\) is the GQA group size. Renamed to \(t_{\text{gpu}}\), \(t_{\text{cpu}}\) throughout the chapter and its questions, and added them to `NOTATION.md`, with the Chapter 13 symbols \(G\), \(q\), \(\beta_{\text{net}}\), \(\chi\), \(n_P\), \(n_D\).
+- **Figure legibility.** Labels drawn on saturated bars (Figures 12.3, 13.1, 13.4, 13.9) were low-contrast; added `t-on` / `t-on-dark` text classes in `book.css`. KaTeX does not render inside SVG `<text>`; Figure 13.2 uses `<tspan>` subscripts instead. Rule: never put `\( … \)` inside an SVG.
+- **Honest framing of disaggregation (Ch 13).** Headline speed-ups from Splitwise and DistServe are reported with their baselines, and §13.6 proves the colocation bound so that readers see which assumptions disaggregation exploits.

@@ -75,6 +75,11 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 |---|---|
 | TTFT, TPOT, ITL | time to first token; mean time per output token after the first; inter-token latency |
 | \(\lambda\), \(W\), \(\bar n\) | arrival rate; mean time in system; mean number in system (\(\bar n=\lambda W\), Little's law) |
+| \(t_{\text{gpu}}\), \(t_{\text{cpu}}\) | GPU time and CPU time of one engine step (Ch. 12) |
+| \(G\), \(q\) | goodput: highest arrival rate at which a fraction \(q\) of requests meet both TTFT and TPOT targets (Ch. 13) |
+| \(\beta_{\text{net}}\) | network (scale-out) bandwidth available per GPU, bytes/s; 400 Gb/s = 50 GB/s (Ch. 13) |
+| \(\chi\) | KV-transfer ratio: time to send a prompt's KV cache divided by the time to prefill it (Ch. 13) |
+| \(n_P\), \(n_D\) | numbers of prefill and decode GPUs in a disaggregated deployment (Ch. 13) |
 
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.

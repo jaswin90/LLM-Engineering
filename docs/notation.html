@@ -87,6 +87,11 @@
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
 <tr><td>TTFT, TPOT, ITL</td><td>time to first token; mean time per output token after the first; inter-token latency</td></tr>
 <tr><td>\(\lambda\), \(W\), \(\bar n\)</td><td>arrival rate; mean time in system; mean number in system (\(\bar n=\lambda W\), Little's law)</td></tr>
+<tr><td>\(t_{\text{gpu}}\), \(t_{\text{cpu}}\)</td><td>GPU time and CPU time of one engine step (Ch. 12)</td></tr>
+<tr><td>\(G\), \(q\)</td><td>goodput: highest arrival rate at which a fraction \(q\) of requests meet both TTFT and TPOT targets (Ch. 13)</td></tr>
+<tr><td>\(\beta_{\text{net}}\)</td><td>network (scale-out) bandwidth available per GPU, bytes/s; 400 Gb/s = 50 GB/s (Ch. 13)</td></tr>
+<tr><td>\(\chi\)</td><td>KV-transfer ratio: time to send a prompt's KV cache divided by the time to prefill it (Ch. 13)</td></tr>
+<tr><td>\(n_P\), \(n_D\)</td><td>numbers of prefill and decode GPUs in a disaggregated deployment (Ch. 13)</td></tr>
 </tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
