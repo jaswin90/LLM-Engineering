@@ -55,7 +55,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ## Part II — The Machine: Hardware for Mathematicians
 
-### Chapter 5 — GPU Architecture from First Principles
+### Chapter 5 — GPU Architecture from First Principles ✅ *(v2)*
 **Motivating question.** Chapter 3 showed that decode is limited by memory bandwidth. What is inside a GPU that makes arithmetic cheap and data movement expensive?
 **Arc.** Latency vs throughput machines → SIMT (grids, blocks, warps; divergence) → the streaming multiprocessor → the memory hierarchy and its bandwidth/latency pyramid → tensor cores, Volta → Rubin (FP16 → FP8 → FP4) → HBM → NVLink/NVSwitch and rack-scale systems → TPUs, MI300X/MI355X, Trainium, Groq, Cerebras → reading a spec sheet.
 **Refs.** NVIDIA whitepapers; Jouppi 2017/2023; Kirk & Hwu (PMPP); Luo 2024 (dissecting Hopper).
@@ -176,4 +176,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 2 | The Transformer, Dissected | ✅ v2 (rewritten, split) |
 | 3 | Running the Model: Prefill, Decode and the KV Cache | ✅ v2 (new) |
 | 4 | Decoding: From Logits to Text | ✅ v2 |
-| 5–26 | — | ⏳ planned |
+| 5 | GPU Architecture from First Principles | ✅ v2 |
+| 6–26 | — | ⏳ planned |

@@ -13,7 +13,7 @@
     { id: 'ch02', n: 2, part: 'I', title: 'The Transformer, Dissected', sub: 'Tokenisation, attention, RoPE, normalisation, SwiGLU; counting parameters, FLOPs and bytes', file: 'chapters/ch02.html', ready: true },
     { id: 'ch03', n: 3, part: 'I', title: 'Running the Model: Prefill, Decode and the KV Cache', sub: 'The KV cache, compute vs memory vs overhead, the roofline, and latency models for TTFT and TPOT', file: 'chapters/ch03.html', ready: true },
     { id: 'ch04', n: 4, part: 'I', title: 'Decoding: From Logits to Text', sub: 'Greedy, beam, temperature, top-k/top-p/min-p, GPU sampling, structured output, determinism', file: 'chapters/ch04.html', ready: true },
-    { id: 'ch05', n: 5, part: 'II', title: 'GPU Architecture from First Principles', sub: 'SIMT, SMs, tensor cores, HBM, NVLink; Volta → Blackwell → Rubin; TPUs and others', ready: false },
+    { id: 'ch05', n: 5, part: 'II', title: 'GPU Architecture from First Principles', sub: 'SIMT, SMs, tensor cores, HBM, NVLink; Volta → Blackwell → Rubin; TPUs and others', file: 'chapters/ch05.html', ready: true },
     { id: 'ch06', n: 6, part: 'II', title: 'The Roofline Model and Performance Analysis', sub: 'Hierarchical rooflines, critical batch size, MFU/MBU, profiling', ready: false },
     { id: 'ch07', n: 7, part: 'II', title: 'GPU Programming for Mathematicians', sub: 'CUDA, Triton, tiling, online softmax, fusion, CUDA graphs', ready: false },
     { id: 'ch08', n: 8, part: 'III', title: 'The KV Cache: Shrinking It', sub: 'MQA, GQA, MLA, sliding windows, KV quantisation, eviction', ready: false },

@@ -62,6 +62,8 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(b\) | bytes per element (\(b_w\) weights, \(b_{kv}\) KV cache); BF16 = 2, FP8 = 1 | |
 | \(s_{kv}\) | KV-cache bytes per token \(=2\,L\,n_{kv}\,d_h\,b_{kv}\) | |
 | \(t_{\text{step}}\) | time of one forward pass (decode step) | |
+| \(f_{\text{clk}}\) | clock frequency (Ch. 5) | ≈ 1.83 GHz |
+| \(\delta_{\text{mem}}\) | main-memory access latency (Ch. 5) | ≈ 600–800 ns |
 
 ## Serving
 | Symbol | Meaning |

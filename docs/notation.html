@@ -75,6 +75,8 @@
 <tr><td>\(b\)</td><td>bytes per element (\(b_w\) weights, \(b_{kv}\) KV cache); BF16 = 2, FP8 = 1</td><td></td></tr>
 <tr><td>\(s_{kv}\)</td><td>KV-cache bytes per token \(=2\,L\,n_{kv}\,d_h\,b_{kv}\)</td><td></td></tr>
 <tr><td>\(t_{\text{step}}\)</td><td>time of one forward pass (decode step)</td><td></td></tr>
+<tr><td>\(f_{\text{clk}}\)</td><td>clock frequency (Ch. 5)</td><td>≈ 1.83 GHz</td></tr>
+<tr><td>\(\delta_{\text{mem}}\)</td><td>main-memory access latency (Ch. 5)</td><td>≈ 600–800 ns</td></tr>
 </tbody></table></div>
 <h2>Serving</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
