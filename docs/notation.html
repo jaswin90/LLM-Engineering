@@ -121,6 +121,16 @@
 <tr><td>\(n_\mu\)</td><td>number of micro-batches in flight in a pipeline (Ch. 17)</td></tr>
 <tr><td>\(T_c\)</td><td>tokens of a sequence held by one device under context parallelism (Ch. 17)</td></tr>
 </tbody></table></div>
+<h2>Mixture of experts (Ch. 18)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th><th>DeepSeek-V3</th></tr></thead><tbody>
+<tr><td>\(n_{\text{exp}}\)</td><td>routed experts per MoE layer</td><td>256</td></tr>
+<tr><td>\(k_r\)</td><td>experts selected per token (top-\(k_r\))</td><td>8</td></tr>
+<tr><td>\(d_e\)</td><td>hidden width of one expert's FFN</td><td>2048</td></tr>
+<tr><td>\(W_r\)</td><td>router (gate) matrix, \(d\times n_{\text{exp}}\); affinities \(s_{t,i}\)</td><td></td></tr>
+<tr><td>\(m_e\)</td><td>tokens routed to one expert in a step, \(\approx Bk_r/n_{\text{exp}}\)</td><td></td></tr>
+<tr><td>\(f_i\), \(\bar p_i\)</td><td>fraction of tokens routed to expert \(i\); mean router probability of expert \(i\)</td><td></td></tr>
+<tr><td>\(\omega_i\)</td><td>routing bias of expert \(i\) (auxiliary-loss-free balancing)</td><td></td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

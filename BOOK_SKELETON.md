@@ -133,7 +133,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Data parallelism → tensor parallelism (Megatron) → pipeline parallelism → sequence and context parallelism (Ring, Ulysses) → choosing a configuration.
 **Refs.** Shoeybi 2019; Narayanan 2021; Pope 2022; Liu 2023; Jacobs 2023.
 
-### Chapter 18 — Mixture of Experts at Inference
+### Chapter 18 — Mixture of Experts at Inference ✅ *(v2)*
 **Arc.** From Shazeer 2017 to DeepSeek-V3 and Kimi K2 → routing and balancing → expert parallelism (all-to-all, DeepEP, EPLB) → MoE arithmetic intensity → the DeepSeek-V3 deployment case study.
 **Refs.** Shazeer 2017; Fedus 2021; Jiang 2024; DeepSeek-AI 2024/2025.
 
@@ -189,4 +189,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 15 | Pruning, Sparsity and Distillation | ✅ v2 |
 | 16 | Distributed Computing Fundamentals | ✅ v2 |
 | 17 | Parallelism Strategies for Inference | ✅ v2 |
-| 18–26 | — | ⏳ planned |
+| 18 | Mixture of Experts at Inference | ✅ v2 |
+| 19–26 | — | ⏳ planned |

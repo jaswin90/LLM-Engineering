@@ -112,6 +112,17 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(n_\mu\) | number of micro-batches in flight in a pipeline (Ch. 17) |
 | \(T_c\) | tokens of a sequence held by one device under context parallelism (Ch. 17) |
 
+## Mixture of experts (Ch. 18)
+| Symbol | Meaning | DeepSeek-V3 |
+|---|---|---|
+| \(n_{\text{exp}}\) | routed experts per MoE layer | 256 |
+| \(k_r\) | experts selected per token (top-\(k_r\)) | 8 |
+| \(d_e\) | hidden width of one expert's FFN | 2048 |
+| \(W_r\) | router (gate) matrix, \(d\times n_{\text{exp}}\); affinities \(s_{t,i}\) | |
+| \(m_e\) | tokens routed to one expert in a step, \(\approx Bk_r/n_{\text{exp}}\) | |
+| \(f_i\), \(\bar p_i\) | fraction of tokens routed to expert \(i\); mean router probability of expert \(i\) | |
+| \(\omega_i\) | routing bias of expert \(i\) (auxiliary-loss-free balancing) | |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.
