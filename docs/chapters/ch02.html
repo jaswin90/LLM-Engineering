@@ -1,0 +1,1085 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · The Transformer, Dissected for Inference — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 2: every tensor of a decoder-only LLM, parameter and FLOP counting, prefill vs decode, KV cache size, arithmetic intensity and the roofline, with MCQs and interview questions.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-chapter="ch02" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+
+<div class="chapter-kicker">Part I · Foundations — Chapter 2</div>
+<h1 id="top">The Transformer, Dissected for Inference</h1>
+<p class="lede">Every tensor, every shape, every FLOP and every byte of a modern decoder-only LLM—and the two numbers that govern its speed: the size of the KV cache and the arithmetic intensity of each step.</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Draw a Llama-style decoder block from memory and annotate every tensor with its shape.</li>
+<li>Explain the architectural evolution 2017 → 2025: Post-LN → Pre-LN, LayerNorm → RMSNorm, ReLU → SwiGLU, sinusoidal → RoPE, MHA → MQA → GQA → MLA.</li>
+<li>Count the parameters of any dense Transformer from its config (and check against published numbers).</li>
+<li>Derive the \(2N\) FLOPs/token rule for inference and \(6N\) for training, and know when the attention term matters.</li>
+<li>Distinguish prefill from decode; prove that KV caching is exact; compute KV-cache size per token.</li>
+<li>Compute arithmetic intensity, place operators on a roofline, and predict decode step time and maximum batch size.</li>
+<li>Read and modify a 70-line KV-cached decoder in PyTorch.</li>
+</ol>
+</div>
+
+<h2 id="s2-1">2.1 Notation and the big picture</h2>
+<p>We study the <strong>decoder-only</strong> Transformer, the architecture of GPT, Llama, Mistral, Qwen, Gemma, DeepSeek and essentially every chat LLM. We use the following symbols throughout the book.</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Symbol</th><th>Meaning</th><th>Llama 3 8B</th><th>Llama 2 70B</th></tr></thead>
+<tbody>
+<tr><td>\(L\)</td><td>number of layers (blocks)</td><td class="num">32</td><td class="num">80</td></tr>
+<tr><td>\(d\)</td><td>model (residual-stream) width, <code>hidden_size</code></td><td class="num">4096</td><td class="num">8192</td></tr>
+<tr><td>\(n_h\)</td><td>number of query heads</td><td class="num">32</td><td class="num">64</td></tr>
+<tr><td>\(n_{kv}\)</td><td>number of key/value heads</td><td class="num">8</td><td class="num">8</td></tr>
+<tr><td>\(d_h\)</td><td>head dimension \(=d/n_h\)</td><td class="num">128</td><td class="num">128</td></tr>
+<tr><td>\(d_{ff}\)</td><td>FFN hidden width, <code>intermediate_size</code></td><td class="num">14336</td><td class="num">28672</td></tr>
+<tr><td>\(|V|\)</td><td>vocabulary size</td><td class="num">128256</td><td class="num">32000</td></tr>
+<tr><td>\(T\)</td><td>sequence length (context so far)</td><td colspan="2">variable</td></tr>
+<tr><td>\(B\)</td><td>batch size (number of sequences)</td><td colspan="2">variable</td></tr>
+<tr><td>\(b\)</td><td>bytes per element (2 for BF16/FP16, 1 for FP8/INT8)</td><td colspan="2">2 unless stated</td></tr>
+</tbody>
+</table>
+</div>
+
+<figure class="diagram" id="fig-2-1">
+<svg class="dg" viewBox="0 0 720 470" role="img" aria-label="Decoder-only Transformer block diagram">
+<defs><marker id="a21" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<!-- left: stack -->
+<rect x="30" y="420" width="200" height="34" rx="8" class="fill-muted"/><text x="130" y="442" text-anchor="middle" class="t-sm">token ids (B, T)</text>
+<line x1="130" y1="420" x2="130" y2="398" class="ln" marker-end="url(#a21)"/>
+<rect x="30" y="364" width="200" height="34" rx="8" class="bx4"/><text x="130" y="386" text-anchor="middle" class="t-sm">embedding lookup → (B, T, d)</text>
+<line x1="130" y1="364" x2="130" y2="342" class="ln" marker-end="url(#a21)"/>
+<rect x="20" y="168" width="220" height="174" rx="12" class="bx" stroke-dasharray="5 4"/>
+<text x="130" y="188" text-anchor="middle" class="t-b">decoder block × L</text>
+<rect x="45" y="200" width="170" height="40" rx="8" class="bx5"/><text x="130" y="225" text-anchor="middle" class="t-sm">attention sub-layer</text>
+<rect x="45" y="270" width="170" height="40" rx="8" class="bx3"/><text x="130" y="295" text-anchor="middle" class="t-sm">feed-forward sub-layer</text>
+<line x1="130" y1="342" x2="130" y2="312" class="ln" marker-end="url(#a21)"/>
+<line x1="130" y1="270" x2="130" y2="242" class="ln" marker-end="url(#a21)"/>
+<line x1="130" y1="168" x2="130" y2="146" class="ln" marker-end="url(#a21)"/>
+<rect x="30" y="112" width="200" height="34" rx="8" class="bx"/><text x="130" y="134" text-anchor="middle" class="t-sm">final RMSNorm</text>
+<line x1="130" y1="112" x2="130" y2="90" class="ln" marker-end="url(#a21)"/>
+<rect x="30" y="56" width="200" height="34" rx="8" class="bx4"/><text x="130" y="78" text-anchor="middle" class="t-sm">LM head → logits (B, T, |V|)</text>
+<line x1="130" y1="56" x2="130" y2="34" class="ln" marker-end="url(#a21)"/>
+<text x="130" y="24" text-anchor="middle" class="t-sm">sampler → next token</text>
+<!-- right: zoomed block -->
+<line x1="240" y1="200" x2="300" y2="110" class="ln dash"/><line x1="240" y1="310" x2="300" y2="440" class="ln dash"/>
+<rect x="300" y="20" width="410" height="440" rx="12" class="bx" fill-opacity=".35"/>
+<text x="505" y="42" text-anchor="middle" class="t-b">One Llama-style block (Pre-norm)</text>
+<line x1="340" y1="445" x2="340" y2="60" class="ln-acc" marker-end="url(#a21)"/>
+<text x="330" y="455" text-anchor="end" class="t-xs">x</text>
+<text x="334" y="74" text-anchor="end" class="t-xs t-acc">residual</text><text x="334" y="86" text-anchor="end" class="t-xs t-acc">stream</text>
+<!-- attention path -->
+<path d="M340,420 H400" class="ln" marker-end="url(#a21)"/>
+<rect x="400" y="404" width="100" height="32" rx="7" class="bx"/><text x="450" y="425" text-anchor="middle" class="t-sm">RMSNorm</text>
+<line x1="500" y1="420" x2="520" y2="420" class="ln" marker-end="url(#a21)"/>
+<rect x="520" y="396" width="170" height="48" rx="7" class="bx5"/><text x="605" y="416" text-anchor="middle" class="t-sm">Q = hW_Q, K = hW_K, V = hW_V</text><text x="605" y="434" text-anchor="middle" class="t-xs">RoPE on Q, K · append K,V to cache</text>
+<line x1="605" y1="396" x2="605" y2="372" class="ln" marker-end="url(#a21)"/>
+<rect x="520" y="330" width="170" height="42" rx="7" class="bx5"/><text x="605" y="349" text-anchor="middle" class="t-sm">softmax(QKᵀ/√d_h + M)·V</text><text x="605" y="365" text-anchor="middle" class="t-xs">n_h query heads, n_kv KV heads</text>
+<line x1="605" y1="330" x2="605" y2="306" class="ln" marker-end="url(#a21)"/>
+<rect x="545" y="276" width="120" height="30" rx="7" class="bx5"/><text x="605" y="296" text-anchor="middle" class="t-sm">· W_O</text>
+<path d="M545,291 H352" class="ln" marker-end="url(#a21)"/>
+<circle cx="340" cy="291" r="11" class="bx"/><text x="340" y="296" text-anchor="middle" class="t-b">+</text>
+<!-- ffn path -->
+<path d="M340,240 H400" class="ln" marker-end="url(#a21)"/>
+<rect x="400" y="224" width="100" height="32" rx="7" class="bx"/><text x="450" y="245" text-anchor="middle" class="t-sm">RMSNorm</text>
+<line x1="500" y1="240" x2="520" y2="240" class="ln" marker-end="url(#a21)"/>
+<rect x="520" y="196" width="170" height="74" rx="7" class="bx3" fill-opacity=".8"/>
+<text x="605" y="214" text-anchor="middle" class="t-sm">SwiGLU FFN</text>
+<text x="605" y="231" text-anchor="middle" class="t-xs">u = SiLU(hW₁) ⊙ (hW₃)</text>
+<text x="605" y="246" text-anchor="middle" class="t-xs">out = u W₂</text>
+<text x="605" y="261" text-anchor="middle" class="t-xs">d → d_ff → d</text>
+<path d="M520,180 H352" class="ln" marker-end="url(#a21)"/><line x1="605" y1="196" x2="605" y2="180" class="ln"/><line x1="605" y1="180" x2="520" y2="180" class="ln"/>
+<circle cx="340" cy="180" r="11" class="bx"/><text x="340" y="185" text-anchor="middle" class="t-b">+</text>
+<text x="505" y="120" text-anchor="middle" class="t-sm">x ← x + Attn(Norm(x))</text>
+<text x="505" y="140" text-anchor="middle" class="t-sm">x ← x + FFN(Norm(x))</text>
+<text x="505" y="76" text-anchor="middle" class="t-xs">shape of x stays (B, T, d) throughout</text>
+</svg>
+<figcaption><b>Figure 2.1 — The decoder-only Transformer.</b> Left: the stack. Right: one Pre-norm block as used by Llama, Mistral, Qwen and most open models. Sub-layers <em>read</em> from the residual stream through a normalisation and <em>add</em> their output back; the stream itself is never normalised in place.</figcaption>
+</figure>
+
+<div class="box bridge">
+<div class="box-title">Software-engineering bridge — reading a model config</div>
+<p>Hugging Face models ship a <code>config.json</code>. The fields you need are <code>num_hidden_layers</code> (\(L\)), <code>hidden_size</code> (\(d\)), <code>num_attention_heads</code> (\(n_h\)), <code>num_key_value_heads</code> (\(n_{kv}\)), <code>head_dim</code> (if absent, \(d/n_h\)), <code>intermediate_size</code> (\(d_{ff}\)), <code>vocab_size</code>, <code>tie_word_embeddings</code>, <code>rope_theta</code>, <code>max_position_embeddings</code> and <code>torch_dtype</code>. With these eight numbers you can compute everything in this chapter. Interviewers often hand you exactly such a config.</p>
+</div>
+
+<h2 id="s2-2">2.2 Tokenisation</h2>
+<p>A model consumes integers. The <strong>tokeniser</strong> maps text to a sequence of ids in \(\{0,\dots,|V|-1\}\) and back. Three families dominate:</p>
+<ul>
+<li><strong>Byte-Pair Encoding (BPE)</strong><span class="cite"><a href="#r-bpe">[3]</a></span>. Start from characters (or bytes). Repeatedly find the most frequent adjacent pair in the training corpus and merge it into a new symbol, until the vocabulary reaches the target size. Encoding applies the learned merges greedily in order. GPT-2 introduced <em>byte-level</em> BPE: the base alphabet is the 256 byte values, so any string—any language, emoji, binary junk—is encodable with no "unknown" token.</li>
+<li><strong>Unigram LM</strong><span class="cite"><a href="#r-unigram">[4]</a></span>. Start with a large candidate vocabulary and prune it, keeping the subset that maximises corpus likelihood under a unigram model; encoding finds the most probable segmentation by Viterbi.</li>
+<li><strong>SentencePiece</strong><span class="cite"><a href="#r-sp">[5]</a></span> is a library implementing both, treating whitespace as a normal symbol (▁), used by Llama 1/2, Gemma and T5. Llama 3 switched to a tiktoken-style byte-level BPE with 128k tokens.</li>
+</ul>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Model family</th><th class="num">\(|V|\)</th><th>Type</th></tr></thead>
+<tbody>
+<tr><td>GPT-2 / GPT-3</td><td class="num">50,257</td><td>byte-level BPE</td></tr>
+<tr><td>LLaMA 1/2</td><td class="num">32,000</td><td>SentencePiece BPE (byte fallback)</td></tr>
+<tr><td>Llama 3 / 3.1</td><td class="num">128,256</td><td>byte-level BPE (tiktoken-style)</td></tr>
+<tr><td>DeepSeek-V3</td><td class="num">129,280</td><td>byte-level BPE</td></tr>
+<tr><td>Qwen 2.5 / 3</td><td class="num">≈151,600</td><td>byte-level BPE</td></tr>
+<tr><td>Gemma 2 / 3</td><td class="num">≈256,000–262,000</td><td>SentencePiece</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="vocab-tradeoff">The vocabulary trade-off, seen by an inference engineer</h3>
+<ul>
+<li><strong>Bigger vocabulary → fewer tokens per text.</strong> Llama 3's tokeniser encodes English with roughly 15% fewer tokens than Llama 2's. Fewer tokens means fewer decode steps, a smaller KV cache and less attention compute—for the same text.</li>
+<li><strong>Bigger vocabulary → bigger embedding and LM head.</strong> The LM head costs \(2d|V|\) FLOPs per token: for Llama 3 8B that is \(2\times4096\times128{,}256\approx1.05\) GFLOPs, about 6.5% of the whole forward pass. In Llama 3.2 1B (\(d=2048\)) the embedding is ~20% of all parameters.</li>
+<li><strong>Bigger vocabulary → bigger softmax and sampling cost.</strong> Top-\(k\)/top-\(p\) sampling over 150k–260k logits per sequence per step is non-trivial on GPU (Chapter 3).</li>
+<li><strong>Prefill needs logits only at the last position.</strong> A naive implementation computes \((T\times d)\cdot(d\times|V|)\) during prefill; a good engine slices to the last token first, saving \(2d|V|(T-1)\) FLOPs and a \(T\times|V|\) activation.</li>
+</ul>
+
+<div class="box interview">
+<div class="box-title">Production gotcha — incremental detokenisation</div>
+<p>With byte-level BPE a single token may contain an incomplete UTF-8 sequence (a Chinese character or an emoji split across two tokens), and SentencePiece tokens carry leading-space markers whose rendering depends on the previous token. Streaming servers therefore decode a sliding window of recent tokens and emit only the newly stable suffix of text. Tokenisation and detokenisation run on the CPU and, at high request rates, can become a real bottleneck—one reason vLLM V1 moved them into separate processes (Chapter 11).</p>
+</div>
+
+<h2 id="s2-3">2.3 Embeddings and the LM head</h2>
+<p>The embedding matrix \(E\in\mathbb{R}^{|V|\times d}\) maps token id \(i\) to row \(E_i\). This is a <em>gather</em>, not a matrix product: zero FLOPs, \(T\cdot d\cdot b\) bytes read. At the top, the <strong>unembedding</strong> or LM head \(W_U\in\mathbb{R}^{d\times|V|}\) maps the final hidden state to logits \(z = h W_U\). Press and Wolf (2016)<span class="cite"><a href="#r-tie">[6]</a></span> showed that tying \(W_U = E^\top\) works well and saves \(|V|d\) parameters; GPT-2, Gemma and small Llama 3.2 models tie, Llama 3 8B/70B do not.</p>
+
+<h2 id="s2-4">2.4 Scaled dot-product attention</h2>
+<p>Let \(X\in\mathbb{R}^{T\times d}\) be the (normalised) inputs of one sequence. For a single head with projections \(W_Q, W_K, W_V\in\mathbb{R}^{d\times d_h}\):</p>
+\[ Q = XW_Q,\quad K = XW_K,\quad V = XW_V \;\in\mathbb{R}^{T\times d_h},\qquad S = \frac{QK^\top}{\sqrt{d_h}} + M \in\mathbb{R}^{T\times T}, \]
+\[ P = \operatorname{softmax}_{\text{row}}(S), \qquad O = PV\in\mathbb{R}^{T\times d_h}, \qquad M_{ij} = \begin{cases}0 & j\le i\\ -\infty & j&gt;i\end{cases}. \]
+<p>Row \(i\) of \(O\) is a convex combination of value vectors of positions \(j\le i\), with weights determined by the similarity \(q_i\cdot k_j\). The causal mask \(M\) is what makes the model autoregressive: position \(i\) cannot see the future.</p>
+
+<div class="box thm">
+<div class="box-title">Why divide by \(\sqrt{d_h}\)?</div>
+<p>Suppose the coordinates of \(q\) and \(k\) are independent with mean 0 and variance 1 (roughly true at initialisation with a normalised input). Then
+\[ \mathbb{E}[q\cdot k] = 0,\qquad \operatorname{Var}(q\cdot k) = \sum_{c=1}^{d_h}\operatorname{Var}(q_c k_c) = \sum_c \mathbb{E}[q_c^2]\,\mathbb{E}[k_c^2] = d_h . \]
+Unscaled logits therefore have standard deviation \(\sqrt{d_h}\) (≈11 for \(d_h=128\)). Softmax of logits that differ by tens is essentially one-hot: the Jacobian \(\operatorname{diag}(p)-pp^\top\) is nearly zero, so gradients vanish and training stalls. Dividing by \(\sqrt{d_h}\) restores unit variance. (Some recent models add <em>QK-norm</em>—RMSNorm on \(q\) and \(k\)—to control logit growth during training.)</p>
+</div>
+
+<h3 id="multihead">Multi-head attention</h3>
+<p>With \(n_h\) heads, each head \(i\) has its own \(W_Q^{(i)},W_K^{(i)},W_V^{(i)}\in\mathbb{R}^{d\times d_h}\) with \(d_h = d/n_h\), producing \(O^{(i)}\in\mathbb{R}^{T\times d_h}\). The outputs are concatenated and mixed:</p>
+\[ \operatorname{MHA}(X) = [O^{(1)};\dots;O^{(n_h)}]\,W_O,\qquad W_O\in\mathbb{R}^{d\times d}. \]
+<p>In implementation, the \(n_h\) query projections are one \(d\times d\) matrix whose output is reshaped to \((T, n_h, d_h)\) and transposed to \((n_h, T, d_h)\): <em>heads are a batch dimension</em>. Each head can specialise (previous-token heads, induction heads, positional heads<span class="cite"><a href="#r-circuits">[7]</a></span>).</p>
+
+<figure class="diagram" id="fig-2-2">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Attention dataflow with tensor shapes">
+<defs><marker id="a22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="105" width="80" height="50" rx="8" class="bx"/><text x="50" y="127" text-anchor="middle" class="t-b">X</text><text x="50" y="145" text-anchor="middle" class="t-xs">(T, d)</text>
+<line x1="90" y1="118" x2="140" y2="50" class="ln" marker-end="url(#a22)"/><line x1="90" y1="130" x2="140" y2="130" class="ln" marker-end="url(#a22)"/><line x1="90" y1="142" x2="140" y2="210" class="ln" marker-end="url(#a22)"/>
+<rect x="140" y="28" width="96" height="44" rx="8" class="bx2"/><text x="188" y="48" text-anchor="middle" class="t-b">Q</text><text x="188" y="64" text-anchor="middle" class="t-xs">(n_h, T, d_h)</text>
+<rect x="140" y="108" width="96" height="44" rx="8" class="bx5"/><text x="188" y="128" text-anchor="middle" class="t-b">K</text><text x="188" y="144" text-anchor="middle" class="t-xs">(n_kv, T, d_h)</text>
+<rect x="140" y="188" width="96" height="44" rx="8" class="bx3"/><text x="188" y="208" text-anchor="middle" class="t-b">V</text><text x="188" y="224" text-anchor="middle" class="t-xs">(n_kv, T, d_h)</text>
+<text x="112" y="24" class="t-xs">·W_Q</text><text x="104" y="124" class="t-xs">·W_K</text><text x="104" y="222" class="t-xs">·W_V</text>
+<line x1="236" y1="50" x2="290" y2="85" class="ln" marker-end="url(#a22)"/><line x1="236" y1="130" x2="290" y2="105" class="ln" marker-end="url(#a22)"/>
+<rect x="290" y="70" width="120" height="50" rx="8" class="bx4"/><text x="350" y="91" text-anchor="middle" class="t-sm">S = QKᵀ/√d_h + M</text><text x="350" y="109" text-anchor="middle" class="t-xs">(n_h, T, T)</text>
+<line x1="410" y1="95" x2="450" y2="95" class="ln" marker-end="url(#a22)"/>
+<rect x="450" y="70" width="90" height="50" rx="8" class="bx4"/><text x="495" y="91" text-anchor="middle" class="t-sm">P = softmax</text><text x="495" y="109" text-anchor="middle" class="t-xs">(n_h, T, T)</text>
+<line x1="540" y1="100" x2="575" y2="140" class="ln" marker-end="url(#a22)"/><line x1="236" y1="210" x2="575" y2="165" class="ln" marker-end="url(#a22)"/>
+<rect x="575" y="128" width="64" height="50" rx="8" class="bx"/><text x="607" y="149" text-anchor="middle" class="t-sm">O = PV</text><text x="607" y="167" text-anchor="middle" class="t-xs">(n_h,T,d_h)</text>
+<line x1="639" y1="153" x2="660" y2="153" class="ln" marker-end="url(#a22)"/>
+<rect x="660" y="128" width="54" height="50" rx="8" class="bx"/><text x="687" y="149" text-anchor="middle" class="t-sm">·W_O</text><text x="687" y="167" text-anchor="middle" class="t-xs">(T, d)</text>
+<text x="350" y="160" text-anchor="middle" class="t-xs">FLOPs: 2·n_h·T²·d_h</text>
+<text x="420" y="214" text-anchor="middle" class="t-xs">FLOPs: 2·n_h·T²·d_h</text>
+<text x="350" y="250" text-anchor="middle" class="t-xs">the T×T matrices S and P are what FlashAttention avoids writing to HBM (Ch. 8)</text>
+</svg>
+<figcaption><b>Figure 2.2 — Attention with shapes</b> (one sequence; add a leading batch dimension \(B\) in practice). With grouped-query attention, each of the \(n_{kv}\) key/value heads is shared by \(g=n_h/n_{kv}\) query heads.</figcaption>
+</figure>
+
+<h3 id="mqa-gqa">From MHA to MQA and GQA: the first KV-cache optimisation</h3>
+<p>During decoding, every step must read the cached \(K\) and \(V\) of every head for every past token. Shazeer (2019)<span class="cite"><a href="#r-mqa">[8]</a></span> observed that this memory traffic, not FLOPs, limits decoding speed, and proposed <strong>multi-query attention (MQA)</strong>: all query heads share a single key head and a single value head (\(n_{kv}=1\)). The KV cache shrinks by \(n_h\times\). Quality degraded slightly and training was sometimes unstable, so Ainslie et al. (2023)<span class="cite"><a href="#r-gqa">[9]</a></span> proposed the interpolation <strong>grouped-query attention (GQA)</strong>: \(n_{kv}\) groups, each shared by \(g=n_h/n_{kv}\) query heads. Llama 2 70B uses \(n_h=64, n_{kv}=8\); Llama 3 uses GQA at every size. Multi-head <em>latent</em> attention (MLA, DeepSeek-V2, 2024)<span class="cite"><a href="#r-dsv2">[10]</a></span> goes further, caching a low-rank latent instead of per-head keys and values; Chapter 7 derives it.</p>
+
+<figure class="diagram" id="fig-2-3">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="MHA, GQA and MQA head sharing">
+<text x="120" y="20" text-anchor="middle" class="t-b">MHA (n_kv = n_h)</text>
+<text x="360" y="20" text-anchor="middle" class="t-b">GQA (n_kv = n_h / g)</text>
+<text x="600" y="20" text-anchor="middle" class="t-b">MQA (n_kv = 1)</text>
+<g>
+<rect x="24" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="72" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="120" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="168" y="40" width="40" height="26" rx="4" class="bx2"/>
+<rect x="24" y="130" width="40" height="26" rx="4" class="bx5"/><rect x="72" y="130" width="40" height="26" rx="4" class="bx5"/><rect x="120" y="130" width="40" height="26" rx="4" class="bx5"/><rect x="168" y="130" width="40" height="26" rx="4" class="bx5"/>
+<line x1="44" y1="66" x2="44" y2="130" class="ln"/><line x1="92" y1="66" x2="92" y2="130" class="ln"/><line x1="140" y1="66" x2="140" y2="130" class="ln"/><line x1="188" y1="66" x2="188" y2="130" class="ln"/>
+</g>
+<g>
+<rect x="264" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="312" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="368" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="416" y="40" width="40" height="26" rx="4" class="bx2"/>
+<rect x="288" y="130" width="40" height="26" rx="4" class="bx5"/><rect x="392" y="130" width="40" height="26" rx="4" class="bx5"/>
+<line x1="284" y1="66" x2="304" y2="130" class="ln"/><line x1="332" y1="66" x2="312" y2="130" class="ln"/><line x1="388" y1="66" x2="408" y2="130" class="ln"/><line x1="436" y1="66" x2="416" y2="130" class="ln"/>
+</g>
+<g>
+<rect x="504" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="552" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="600" y="40" width="40" height="26" rx="4" class="bx2"/><rect x="648" y="40" width="40" height="26" rx="4" class="bx2"/>
+<rect x="576" y="130" width="40" height="26" rx="4" class="bx5"/>
+<line x1="524" y1="66" x2="590" y2="130" class="ln"/><line x1="572" y1="66" x2="594" y2="130" class="ln"/><line x1="620" y1="66" x2="598" y2="130" class="ln"/><line x1="668" y1="66" x2="602" y2="130" class="ln"/>
+</g>
+<text x="12" y="58" class="t-xs t-s2" text-anchor="start"></text>
+<text x="360" y="186" text-anchor="middle" class="t-sm"><tspan class="t-s2">■</tspan> query heads   <tspan class="t-s5">■</tspan> cached key/value heads — the KV cache scales with the number of lower boxes</text>
+</svg>
+<figcaption><b>Figure 2.3 — Sharing keys and values across query heads.</b> MHA caches one K/V head per query head; GQA caches one per group of \(g\); MQA caches one in total. Query-side compute is unchanged, so GQA multiplies the arithmetic intensity of decode attention by \(g\) (§2.11).</figcaption>
+</figure>
+
+<h2 id="s2-5">2.5 Positional information</h2>
+<div class="box thm">
+<div class="box-title">Proposition — attention without positions is permutation-equivariant</div>
+<p>Let \(\Pi\) be a permutation matrix and drop the causal mask. Then \((\Pi X)W_Q (\Pi X W_K)^\top = \Pi\,QK^\top\Pi^\top\); row-softmax commutes with simultaneous row/column permutation, so \(P' = \Pi P\Pi^\top\) and \(O' = \Pi P \Pi^\top \Pi V = \Pi O\). Permuting the inputs merely permutes the outputs: the model cannot tell "dog bites man" from "man bites dog". (The causal mask breaks the symmetry somewhat, which is why decoder-only models without explicit positions—"NoPE"—can still learn some positional information, but explicit encodings work better.)</p>
+</div>
+<p>The field tried several fixes, roughly in this order:</p>
+<ul>
+<li><strong>Sinusoidal absolute encodings</strong> (2017): add \(\mathrm{PE}_{(m,2i)} = \sin(m/10000^{2i/d})\), \(\mathrm{PE}_{(m,2i+1)}=\cos(m/10000^{2i/d})\) to the input embedding.</li>
+<li><strong>Learned absolute embeddings</strong> (GPT-2/3, BERT): a trainable \(T_{\max}\times d\) table. Cannot extrapolate beyond \(T_{\max}\).</li>
+<li><strong>ALiBi</strong><span class="cite"><a href="#r-alibi">[11]</a></span> (2021): no embeddings; add a head-specific linear penalty \(-\lambda_h\,(i-j)\) to attention logits. Extrapolates somewhat to longer sequences; used by BLOOM and MPT.</li>
+<li><strong>Rotary position embedding, RoPE</strong><span class="cite"><a href="#r-rope">[12]</a></span> (2021): rotate queries and keys by a position-dependent angle. The de facto standard since LLaMA (2023).</li>
+</ul>
+
+<h3 id="rope">RoPE, properly</h3>
+<p>Split \(q\in\mathbb{R}^{d_h}\) into \(d_h/2\) pairs \((q_{2i},q_{2i+1})\) and view each pair as a complex number \(\tilde q_i = q_{2i} + \mathrm{i}\,q_{2i+1}\). Choose frequencies \(\theta_i = \beta^{-2i/d_h}\) for \(i = 0,\dots,d_h/2-1\) (base \(\beta=10^4\) in LLaMA, \(5\times10^5\) in Llama 3). At position \(m\), RoPE multiplies each pair by a unit complex number:</p>
+\[ \operatorname{RoPE}(q, m)_i = \tilde q_i\, e^{\mathrm{i} m\theta_i} \quad\Longleftrightarrow\quad \begin{pmatrix} q'_{2i}\\ q'_{2i+1}\end{pmatrix} = \begin{pmatrix}\cos m\theta_i & -\sin m\theta_i\\ \sin m\theta_i & \cos m\theta_i\end{pmatrix}\begin{pmatrix} q_{2i}\\ q_{2i+1}\end{pmatrix}. \]
+<div class="box thm">
+<div class="box-title">Theorem — RoPE logits depend only on relative position</div>
+<p>For a query at position \(m\) and a key at position \(n\),
+\[ \big\langle \operatorname{RoPE}(q,m), \operatorname{RoPE}(k,n)\big\rangle = \operatorname{Re}\sum_i \tilde q_i e^{\mathrm{i}m\theta_i}\,\overline{\tilde k_i e^{\mathrm{i}n\theta_i}} = \operatorname{Re}\sum_i \tilde q_i\,\overline{\tilde k_i}\,e^{\mathrm{i}(m-n)\theta_i}. \]
+Equivalently, with \(R_m\) the block-diagonal rotation, \(R_m^\top R_n = R_{n-m}\) because rotations in each plane form a group. The score is a function of \(q\), \(k\) and \(m-n\) only.</p>
+</div>
+<p>Low-index pairs rotate fast (high frequency, sensitive to nearby positions); high-index pairs rotate slowly and carry long-range information. Context-extension methods (position interpolation, NTK-aware scaling, YaRN; Chapter 19) work by rescaling these frequencies.</p>
+
+<figure class="diagram" id="fig-2-4">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="RoPE rotates query and key pairs in the plane">
+<defs><marker id="a24" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker>
+<marker id="a24b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead-acc"/></marker></defs>
+<g transform="translate(130,120)">
+<circle r="80" class="ln dash"/><line x1="-95" y1="0" x2="95" y2="0" class="grid"/><line x1="0" y1="-95" x2="0" y2="95" class="grid"/>
+<line x1="0" y1="0" x2="76" y2="-25" class="ln-s2" marker-end="url(#a24)"/><text x="82" y="-26" class="t-sm t-s2">q at m</text>
+<line x1="0" y1="0" x2="20" y2="-77" class="ln-acc" marker-end="url(#a24b)"/><text x="24" y="-80" class="t-sm t-acc">k at n</text>
+<path d="M40,-13 A42,42 0 0,0 10,-40" class="ln"/><text x="36" y="-38" class="t-xs">(n−m)θᵢ</text>
+<text x="0" y="110" text-anchor="middle" class="t-sm">pair i of q and k (one 2-D plane)</text>
+</g>
+<g transform="translate(470,120)">
+<text x="0" y="-92" text-anchor="middle" class="t-b">Shift both positions by s</text>
+<circle r="80" class="ln dash"/><line x1="-95" y1="0" x2="95" y2="0" class="grid"/><line x1="0" y1="-95" x2="0" y2="95" class="grid"/>
+<line x1="0" y1="0" x2="42" y2="-68" class="ln-s2" marker-end="url(#a24)"/><text x="46" y="-72" class="t-sm t-s2">q at m+s</text>
+<line x1="0" y1="0" x2="-30" y2="-74" class="ln-acc" marker-end="url(#a24b)"/><text x="-90" y="-74" class="t-sm t-acc">k at n+s</text>
+<path d="M21,-34 A40,40 0 0,0 -15,-37" class="ln"/><text x="-6" y="-46" class="t-xs">same angle</text>
+<text x="0" y="110" text-anchor="middle" class="t-sm">both rotate by sθᵢ: the dot product is unchanged</text>
+</g>
+<text x="660" y="40" text-anchor="middle" class="t-xs">θᵢ = β^(−2i/d_h)</text>
+<text x="660" y="58" text-anchor="middle" class="t-xs">i small: fast rotation</text>
+<text x="660" y="76" text-anchor="middle" class="t-xs">i large: slow rotation</text>
+</svg>
+<figcaption><b>Figure 2.4 — RoPE as rotations.</b> Each coordinate pair of \(q\) and \(k\) is rotated by an angle proportional to its position. Shifting both positions by the same amount rotates both vectors equally, leaving their inner product—and hence the attention logit—unchanged.</figcaption>
+</figure>
+
+<div class="box interview">
+<div class="box-title">Inference consequence — the cache stores <em>rotated</em> keys</div>
+<p>Engines apply RoPE to \(k\) before writing it to the KV cache, so a cached key is bound to its absolute position. Prefix caching therefore reuses KV only for prefixes at the <em>same</em> positions, and techniques that drop or move tokens (StreamingLLM, some KV-eviction schemes, "context shifting" in llama.cpp) must either re-rotate cached keys or accept position gaps. MLA (DeepSeek) keeps a small separate RoPE key precisely because rotation does not commute with its low-rank compression (Chapter 7).</p>
+</div>
+
+<h2 id="s2-6">2.6 Normalisation: LayerNorm → RMSNorm, Post-LN → Pre-LN</h2>
+<p><strong>LayerNorm</strong><span class="cite"><a href="#r-ln">[13]</a></span> normalises each token vector: \(\operatorname{LN}(x) = \gamma\odot\frac{x-\mu}{\sqrt{\sigma^2+\epsilon}}+\beta\), with \(\mu,\sigma^2\) the mean and variance over the \(d\) coordinates. <strong>RMSNorm</strong><span class="cite"><a href="#r-rms">[14]</a></span> drops the centring and the bias:</p>
+\[ \operatorname{RMSNorm}(x) = \gamma\odot \frac{x}{\sqrt{\tfrac{1}{d}\sum_c x_c^2+\epsilon}} . \]
+<p>It is slightly cheaper (one reduction instead of two) and empirically as good, so Llama-family models use it. Both are tiny in FLOPs but are <em>memory-bound</em> reductions: on a GPU their cost is the time to read and write the \(T\times d\) activation, which is why engines fuse "residual add + RMSNorm" into one kernel (Chapter 6).</p>
+
+<p><strong>Where</strong> the normalisation sits matters more. The original Transformer used <strong>Post-LN</strong>: \(x\leftarrow\operatorname{LN}(x+\operatorname{Sublayer}(x))\). Xiong et al. (2020)<span class="cite"><a href="#r-preln">[15]</a></span> showed that with Post-LN the gradients near the output layer are large at initialisation, requiring careful learning-rate warm-up; <strong>Pre-LN</strong>, \(x\leftarrow x + \operatorname{Sublayer}(\operatorname{LN}(x))\), keeps an identity path from input to output (the <em>residual stream</em>) and trains stably without warm-up. GPT-2 onward use Pre-LN; some 2024–25 models (Gemma 2/3, OLMo 2) add extra norms after sub-layers too ("sandwich" norm).</p>
+
+<figure class="diagram" id="fig-2-5">
+<svg class="dg" viewBox="0 0 720 180" role="img" aria-label="Post-LN versus Pre-LN residual blocks">
+<defs><marker id="a25" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="180" y="20" text-anchor="middle" class="t-b">Post-LN (2017)</text>
+<text x="540" y="20" text-anchor="middle" class="t-b">Pre-LN (GPT-2 → today)</text>
+<line x1="360" y1="10" x2="360" y2="170" class="grid"/>
+<text x="30" y="104" class="t-sm">x</text><line x1="42" y1="100" x2="80" y2="100" class="ln" marker-end="url(#a25)"/>
+<rect x="80" y="82" width="90" height="36" rx="7" class="bx5"/><text x="125" y="105" text-anchor="middle" class="t-sm">Sublayer</text>
+<line x1="170" y1="100" x2="196" y2="100" class="ln" marker-end="url(#a25)"/>
+<circle cx="208" cy="100" r="11" class="bx"/><text x="208" y="105" text-anchor="middle" class="t-b">+</text>
+<path d="M60,100 V58 H208 V88" class="ln" marker-end="url(#a25)"/>
+<line x1="219" y1="100" x2="244" y2="100" class="ln" marker-end="url(#a25)"/>
+<rect x="244" y="82" width="70" height="36" rx="7" class="bx"/><text x="279" y="105" text-anchor="middle" class="t-sm">LN</text>
+<line x1="314" y1="100" x2="345" y2="100" class="ln" marker-end="url(#a25)"/>
+<text x="180" y="150" text-anchor="middle" class="t-xs">the residual path passes through LN every layer</text>
+<text x="390" y="104" class="t-sm">x</text><line x1="402" y1="100" x2="436" y2="100" class="ln" marker-end="url(#a25)"/>
+<rect x="436" y="82" width="60" height="36" rx="7" class="bx"/><text x="466" y="105" text-anchor="middle" class="t-sm">LN</text>
+<line x1="496" y1="100" x2="516" y2="100" class="ln" marker-end="url(#a25)"/>
+<rect x="516" y="82" width="90" height="36" rx="7" class="bx5"/><text x="561" y="105" text-anchor="middle" class="t-sm">Sublayer</text>
+<line x1="606" y1="100" x2="634" y2="100" class="ln" marker-end="url(#a25)"/>
+<circle cx="646" cy="100" r="11" class="bx"/><text x="646" y="105" text-anchor="middle" class="t-b">+</text>
+<path d="M418,100 V58 H646 V88" class="ln-acc" marker-end="url(#a25)"/>
+<line x1="657" y1="100" x2="700" y2="100" class="ln" marker-end="url(#a25)"/>
+<text x="540" y="50" text-anchor="middle" class="t-xs t-acc">clean identity path (residual stream)</text>
+<text x="540" y="150" text-anchor="middle" class="t-xs">stable gradients at initialisation; a final norm before the LM head</text>
+</svg>
+<figcaption><b>Figure 2.5 — Where the norm goes.</b> Pre-LN keeps an un-normalised identity path, which is why every modern LLM has a "final norm" just before the LM head.</figcaption>
+</figure>
+
+<h2 id="s2-7">2.7 Feed-forward networks: ReLU → GELU → SwiGLU</h2>
+<p>The original FFN is a two-layer MLP applied to each position independently, \(\operatorname{FFN}(x) = \max(0, xW_1)W_2\) with \(W_1\in\mathbb{R}^{d\times 4d}\). GPT-2 and BERT replaced ReLU by GELU<span class="cite"><a href="#r-gelu">[16]</a></span>. Shazeer (2020)<span class="cite"><a href="#r-glu">[17]</a></span> showed that <strong>gated</strong> linear units train better:</p>
+\[ \operatorname{SwiGLU}(x) = \big(\operatorname{SiLU}(xW_1)\odot xW_3\big)W_2,\qquad \operatorname{SiLU}(z)=z\,\sigma(z),\quad W_1,W_3\in\mathbb{R}^{d\times d_{ff}},\ W_2\in\mathbb{R}^{d_{ff}\times d}. \]
+<p>SwiGLU has three matrices instead of two. To keep the parameter count equal to a \(4d\) ReLU FFN (\(2\cdot 4d^2 = 8d^2\)), set \(3dd_{ff}=8d^2\), i.e. \(d_{ff} = \tfrac{8}{3}d\). LLaMA-7B uses \(d_{ff}=11008\approx 2.69d\) (\(\tfrac83 d\) rounded up to a multiple of 256); Llama 3 8B widened it to \(14336=3.5d\).</p>
+<p>The FFN holds about two-thirds of a dense model's non-embedding parameters, so it dominates weight bytes—and it is the part replaced by a Mixture of Experts in MoE models (Chapter 17).</p>
+
+<h3 id="evolution-table">The architecture, then and now</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Component</th><th>Transformer (2017)</th><th>GPT-2/3 (2019–20)</th><th>LLaMA / Llama 2–3 (2023–24)</th><th>2024–25 frontier open models</th></tr></thead>
+<tbody>
+<tr><td>Layout</td><td>encoder–decoder</td><td>decoder-only</td><td>decoder-only</td><td>decoder-only (dense or MoE)</td></tr>
+<tr><td>Norm</td><td>Post-LN, LayerNorm</td><td>Pre-LN, LayerNorm</td><td>Pre-RMSNorm</td><td>Pre-RMSNorm; QK-norm; sandwich norms</td></tr>
+<tr><td>Positions</td><td>sinusoidal</td><td>learned absolute</td><td>RoPE (β = 10⁴ → 5·10⁵)</td><td>RoPE + YaRN-style scaling; partial/decoupled RoPE</td></tr>
+<tr><td>FFN</td><td>ReLU, 4d</td><td>GELU, 4d</td><td>SwiGLU, ≈8/3 d–3.5 d</td><td>SwiGLU; MoE with shared + routed experts</td></tr>
+<tr><td>Attention</td><td>MHA</td><td>MHA (GPT-3: some sparse layers)</td><td>MHA (small) / GQA (70B, Llama 3)</td><td>GQA, MLA, sliding-window/global hybrids, linear-attention hybrids</td></tr>
+<tr><td>Biases</td><td>yes</td><td>yes</td><td>none</td><td>mostly none (Qwen: QKV bias)</td></tr>
+<tr><td>Context</td><td>512</td><td>1k–2k</td><td>2k → 8k → 128k</td><td>128k–1M</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="s2-8">2.8 Counting parameters</h2>
+<p>With \(d_{kv} := n_{kv}d_h\), one block contains</p>
+\[ \underbrace{d\cdot d}_{W_Q} + \underbrace{2\cdot d\cdot d_{kv}}_{W_K,W_V} + \underbrace{d\cdot d}_{W_O} + \underbrace{3\cdot d\cdot d_{ff}}_{W_1,W_2,W_3} + \underbrace{2d}_{\text{norms}} \]
+<p>parameters, and the whole model has</p>
+<div class="box formula">
+\[ N = L\big(2d^2 + 2dd_{kv} + 3dd_{ff} + 2d\big) + |V|d\,(1 + [\text{untied}]) + d . \]
+<p class="small">Rule of thumb for MHA with a 4d ReLU/GELU FFN: \(N\approx 12Ld^2\) (4d² attention + 8d² FFN per layer).</p>
+</div>
+
+<div class="box example">
+<div class="box-title">Worked example — Llama 2 7B (MHA, \(n_{kv}=n_h=32\))</div>
+<p>Attention: \(4d^2 = 4\times4096^2 = 67.11\)M. FFN: \(3\times4096\times11008 = 135.27\)M. Norms: 8,192. Per layer: 202.38M; ×32 layers = 6.476B. Embedding + untied head: \(2\times32000\times4096 = 262.1\)M. <strong>Total ≈ 6.738B</strong>—matching the published "6.74B".</p>
+</div>
+<div class="box example">
+<div class="box-title">Worked example — Llama 3 8B (GQA, \(n_{kv}=8\))</div>
+<p>\(d_{kv} = 8\times128 = 1024\). Attention: \(2\times4096^2 + 2\times4096\times1024 = 33.55\text{M}+8.39\text{M} = 41.94\)M. FFN: \(3\times4096\times14336=176.16\)M. Per layer ≈ 218.11M; ×32 = 6.980B. Embedding + untied head: \(2\times128256\times4096 = 1.051\)B. <strong>Total ≈ 8.03B.</strong> Note that GQA cut attention parameters by 37% versus MHA, and that the big vocabulary makes embeddings 13% of the model.</p>
+</div>
+<div class="box example">
+<div class="box-title">Worked example — Llama 2 70B</div>
+<p>\(d=8192, L=80, n_{kv}=8, d_h=128, d_{ff}=28672\). Attention: \(2\times8192^2+2\times8192\times1024 = 134.2\text{M}+16.8\text{M}=151.0\)M. FFN: \(3\times8192\times28672=704.6\)M. Per layer ≈ 855.6M; ×80 = 68.45B. Embedding + head: 0.52B. <strong>Total ≈ 68.98B.</strong></p>
+</div>
+
+<details class="drill">
+<summary>Drill 2.1 — Mistral 7B</summary>
+<p>Config: \(L=32, d=4096, n_h=32, n_{kv}=8, d_h=128, d_{ff}=14336, |V|=32000\), untied. Count the parameters.</p>
+<p><em>Solution.</em> Per layer: attention 41.94M (same as Llama 3 8B), FFN 176.16M, total 218.11M; ×32 = 6.980B. Embeddings: \(2\times32000\times4096=262\)M. Total ≈ 7.24B—Mistral's published figure is 7.24B. The only difference from Llama 3 8B is the vocabulary.</p>
+</details>
+
+<h2 id="s2-9">2.9 Counting FLOPs</h2>
+<div class="box def">
+<div class="box-title">The fundamental rule</div>
+<p>Multiplying \(A\in\mathbb{R}^{m\times k}\) by \(B\in\mathbb{R}^{k\times n}\) takes \(mn\) dot products of length \(k\): \(mnk\) multiplies and \(mn(k-1)\approx mnk\) adds. We count <strong>\(2mnk\) FLOPs</strong>. (Hardware vendors count a fused multiply-add as 2 FLOPs as well.)</p>
+</div>
+<p>Apply it to a linear layer with weight \(W\in\mathbb{R}^{k\times n}\) processing \(M\) tokens: \(2Mkn\) FLOPs, i.e. <em>2 FLOPs per parameter per token</em>. Summing over all weight matrices:</p>
+<div class="box formula">
+\[ C_{\text{forward}} \approx 2N_{\text{matmul}} + \underbrace{4\,L\,n_h d_h\,t}_{\text{attention scores and }PV}\quad\text{FLOPs per token at context length }t, \]
+<p class="small">where \(N_{\text{matmul}}\) excludes the embedding table (a lookup) but includes the LM head. Kaplan et al. write the same as \(2N + 2n_{\text{layer}}n_{\text{ctx}}d_{\text{attn}}\), averaging over a causal window.</p>
+</div>
+<p><strong>Where the attention term comes from.</strong> For one new query at position \(t\), each head computes \(t\) dot products of length \(d_h\) for \(q\cdot k_j\) (\(2td_h\) FLOPs) and a weighted sum of \(t\) value vectors (\(2td_h\)). Times \(n_h\) heads and \(L\) layers: \(4Ln_hd_ht = 4Ldt\) when \(n_hd_h=d\). Note that GQA does <em>not</em> reduce attention FLOPs—every query head still attends—only the bytes read.</p>
+
+<div class="box thm">
+<div class="box-title">When does attention compute matter?</div>
+<p>For an MHA model with \(N\approx12Ld^2\), the ratio of attention FLOPs to weight FLOPs per token is
+\[ \frac{4Ldt}{2\cdot12Ld^2} = \frac{t}{6d}. \]
+For \(d=4096\) attention compute equals weight compute at \(t\approx 24{,}600\) tokens. Below a few thousand tokens, "\(2N\) FLOPs per token" is accurate to a few percent; at 128k context, attention dominates compute. (Its <em>memory traffic</em> matters much earlier during decode—§2.11.)</p>
+</div>
+
+<h3 id="six-n">Why training costs \(6N\)</h3>
+<p>For \(Y = XW\) with \(X\in\mathbb{R}^{M\times k}\): the forward pass costs \(2Mkn\). Back-propagation needs \(\partial\mathcal{L}/\partial X = (\partial\mathcal{L}/\partial Y)\,W^\top\) (another \(2Mkn\)) and \(\partial\mathcal{L}/\partial W = X^\top(\partial\mathcal{L}/\partial Y)\) (another \(2Mkn\)). Total \(6Mkn\): \(2\) forward \(+\,4\) backward FLOPs per parameter per token, so \(C_{\text{train}}\approx 6ND\). With activation recomputation (gradient checkpointing) it becomes \(\approx8ND\).</p>
+
+<details class="drill">
+<summary>Drill 2.2 — FLOPs for a single request</summary>
+<p>Llama 3 8B, prompt 3,000 tokens, 500 output tokens. Estimate total FLOPs (ignore the attention term, then estimate it).</p>
+<p><em>Solution.</em> \(N_{\text{matmul}}\approx 8.03\text{B}-0.53\text{B (input embedding)} = 7.5\)B. Linear FLOPs ≈ \(2\times7.5\times10^9\times3500 = 5.25\times10^{13}\) (prefill is \(4.5\times10^{13}\) of that, if logits are computed only for the last prompt token it is slightly less). Attention: \(4Ldt\) summed over positions \(\approx 4\times32\times4096\times\sum_t t \approx 5.2\times10^5\times\tfrac{3500^2}{2}\approx 3.2\times10^{12}\), i.e. ~6% extra. Total ≈ \(5.6\times10^{13}\) FLOPs—56 ms of an H100 at full BF16 peak. Yet the request takes seconds: almost all of that time is the 500 memory-bound decode steps.</p>
+</details>
+
+<h2 id="s2-10">2.10 Autoregressive generation: prefill, decode and the KV cache</h2>
+<p>Generation has two phases with completely different performance characteristics.</p>
+<ul>
+<li><strong>Prefill</strong> (a.k.a. prompt processing, context encoding). Run the model on all \(n_{\text{in}}\) prompt tokens at once, like a training forward pass with no backward. This computes and stores \(K\) and \(V\) for every prompt token in every layer, and the logits of the last position, from which the first output token is sampled. It is a sequence of large matrix–matrix products: <strong>compute-bound</strong>.</li>
+<li><strong>Decode</strong> (a.k.a. generation, incremental decoding). Each step feeds only the newest token, computes its \(q,k,v\), appends \(k,v\) to the cache, attends over the cache, and produces the next logits. It is a sequence of matrix–<em>vector</em> (or skinny matrix) products plus cache reads: <strong>memory-bound</strong>.</li>
+</ul>
+
+<figure class="diagram" id="fig-2-6">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Prefill processes all prompt tokens at once; decode processes one token per step">
+<defs><marker id="a26" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="150" y="20" text-anchor="middle" class="t-b">Prefill: one pass, n_in tokens</text>
+<text x="500" y="20" text-anchor="middle" class="t-b">Decode: one pass per output token</text>
+<g>
+<rect x="30" y="40" width="240" height="70" rx="10" class="bx2"/>
+<text x="150" y="68" text-anchor="middle" class="t-sm">model on (B, n_in) tokens</text>
+<text x="150" y="88" text-anchor="middle" class="t-xs">GEMMs with M = B·n_in rows</text>
+<g class="t-xs">
+<rect x="40" y="140" width="22" height="22" class="bx2"/><rect x="64" y="140" width="22" height="22" class="bx2"/><rect x="88" y="140" width="22" height="22" class="bx2"/><rect x="112" y="140" width="22" height="22" class="bx2"/><rect x="136" y="140" width="22" height="22" class="bx2"/><rect x="160" y="140" width="22" height="22" class="bx2"/><rect x="184" y="140" width="22" height="22" class="bx2"/><rect x="208" y="140" width="22" height="22" class="bx2"/>
+</g>
+<line x1="150" y1="138" x2="150" y2="112" class="ln" marker-end="url(#a26)"/>
+<text x="150" y="182" text-anchor="middle" class="t-xs">prompt tokens (all at once)</text>
+<text x="150" y="206" text-anchor="middle" class="t-sm t-s2">compute-bound · sets TTFT</text>
+</g>
+<line x1="290" y1="30" x2="290" y2="220" class="grid"/>
+<g>
+<rect x="320" y="40" width="70" height="70" rx="8" class="bx5"/><text x="355" y="70" text-anchor="middle" class="t-xs">step 1</text><text x="355" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<rect x="400" y="40" width="70" height="70" rx="8" class="bx5"/><text x="435" y="70" text-anchor="middle" class="t-xs">step 2</text><text x="435" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<rect x="480" y="40" width="70" height="70" rx="8" class="bx5"/><text x="515" y="70" text-anchor="middle" class="t-xs">step 3</text><text x="515" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<text x="580" y="80" text-anchor="middle">· · ·</text>
+<rect x="610" y="40" width="80" height="70" rx="8" class="bx5"/><text x="650" y="70" text-anchor="middle" class="t-xs">step n_out</text><text x="650" y="86" text-anchor="middle" class="t-xs">(B, 1)</text>
+<line x1="390" y1="75" x2="398" y2="75" class="ln" marker-end="url(#a26)"/><line x1="470" y1="75" x2="478" y2="75" class="ln" marker-end="url(#a26)"/>
+<rect x="320" y="136" width="370" height="26" rx="5" class="fill-muted"/>
+<rect x="320" y="136" width="210" height="26" rx="5" class="bx2" opacity=".6"/>
+<text x="425" y="153" text-anchor="middle" class="t-xs">prompt K,V (from prefill)</text>
+<rect x="530" y="136" width="20" height="26" class="bx5"/><rect x="550" y="136" width="20" height="26" class="bx5"/><rect x="570" y="136" width="20" height="26" class="bx5"/>
+<text x="640" y="153" text-anchor="middle" class="t-xs">grows by 1/step</text>
+<text x="505" y="182" text-anchor="middle" class="t-xs">KV cache read in full every step, in every layer</text>
+<text x="505" y="206" text-anchor="middle" class="t-sm t-acc">memory-bound · sets TPOT</text>
+</g>
+</svg>
+<figcaption><b>Figure 2.6 — Two phases of generation.</b> Prefill builds the KV cache for the prompt in one compute-heavy pass. Each decode step adds one entry per layer and must re-read all weights and the whole cache.</figcaption>
+</figure>
+
+<h3 id="kv-exact">Why caching is exact</h3>
+<div class="box thm">
+<div class="box-title">Proposition — KV caching changes nothing</div>
+<p>Let \(h^{(\ell)}_j\) be the hidden state of position \(j\) after layer \(\ell\). Claim: \(h^{(\ell)}_j\) depends only on tokens \(x_{1:j}\). <em>Proof</em> by induction on \(\ell\). For \(\ell=0\), \(h^{(0)}_j = E_{x_j}\). Suppose true for \(\ell-1\). In layer \(\ell\), the norm and FFN act position-wise; attention at position \(j\) combines \(q_j\) with \(k_i, v_i\) for \(i\le j\) only (causal mask), each of which is a function of \(h^{(\ell-1)}_i\), hence of \(x_{1:i}\subseteq x_{1:j}\). ∎</p>
+<p>Consequently the keys and values of positions \(1..t\) are the same whether we compute them in one pass over \(x_{1:t}\) or incrementally; appending new tokens never changes them. Storing them is pure memoisation. (Numerically, results can differ in the last bits because floating-point reductions are performed in different orders—relevant to reproducibility, Chapter 3.)</p>
+</div>
+<p>Without a cache, step \(t\) would recompute the whole prefix: \(\sum_{t=1}^{T}2Nt\approx NT^2\) FLOPs for \(T\) tokens instead of \(2NT\)—a factor of \(T/2\) waste.</p>
+
+<h3 id="kv-size">How big is the KV cache?</h3>
+<p>Per token, each layer stores one key and one value vector for each KV head:</p>
+<div class="box formula">
+\[ s_{\text{kv}} = 2\cdot L\cdot n_{kv}\cdot d_h\cdot b \ \ \text{bytes per token},\qquad \text{KV}_{\text{total}} = s_{\text{kv}}\cdot\sum_{\text{sequences}} T_{\text{seq}} . \]
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Model</th><th>Attention</th><th class="num">\(L\)</th><th class="num">\(n_{kv}\times d_h\)</th><th class="num">KV per token (BF16)</th><th class="num">One 32k-token sequence</th></tr></thead>
+<tbody>
+<tr><td>Llama 2 7B</td><td>MHA</td><td class="num">32</td><td class="num">32×128</td><td class="num">512 KiB</td><td class="num">16 GiB</td></tr>
+<tr><td>Llama 3 8B</td><td>GQA (g=4)</td><td class="num">32</td><td class="num">8×128</td><td class="num">128 KiB</td><td class="num">4 GiB</td></tr>
+<tr><td>Llama 2 70B / Llama 3 70B</td><td>GQA (g=8)</td><td class="num">80</td><td class="num">8×128</td><td class="num">320 KiB</td><td class="num">10 GiB</td></tr>
+<tr><td>Llama 3.1 405B</td><td>GQA (g=16)</td><td class="num">126</td><td class="num">8×128</td><td class="num">504 KiB</td><td class="num">15.75 GiB</td></tr>
+<tr><td>DeepSeek-V3 (671B MoE)</td><td>MLA</td><td class="num">61</td><td class="num">latent 512 + RoPE 64</td><td class="num">≈ 68.6 KiB</td><td class="num">≈ 2.1 GiB</td></tr>
+</tbody>
+</table>
+</div>
+<p class="small muted">MLA caches one compressed latent \(c^{KV}\in\mathbb{R}^{512}\) plus one shared RoPE key \(\in\mathbb{R}^{64}\) per token per layer: \(576\times61\times2\) bytes. Chapter 7 explains how this is possible.</p>
+
+<figure class="chart" id="fig-2-7">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"KV cache size versus context length (one sequence, BF16)","height":340,
+ "x":{"label":"Context length (tokens)","min":0,"max":131072,"ticks":[0,16384,32768,65536,98304,131072]},
+ "y":{"label":"KV cache (GiB)","min":0,"max":70,"ticks":[0,10,20,30,40,50,60,70]},
+ "hlines":[{"y":15,"text":"Llama 3 8B weights ≈ 15 GiB"}],
+ "series":[
+  {"name":"Llama 2 7B (MHA)","color":"s2","markers":false,"points":[[0,0],[131072,64]]},
+  {"name":"Llama 3 70B (GQA)","color":"s1","markers":false,"points":[[0,0],[131072,40]]},
+  {"name":"Llama 3 8B (GQA)","color":"s3","markers":false,"points":[[0,0],[131072,16]]},
+  {"name":"DeepSeek-V3 (MLA)","color":"s5","markers":false,"points":[[0,0],[131072,8.58]]}
+ ]}
+</script>
+<figcaption><b>Figure 2.7 — The KV cache grows linearly.</b> A single 128k-token conversation with Llama 3 8B needs as much memory for its cache as for the model's weights. The history of attention variants (MHA → GQA → MLA) can be read off the slopes.</figcaption>
+</figure>
+
+<details class="drill">
+<summary>Drill 2.3 — How many users fit?</summary>
+<p>Llama 3 8B in BF16 on one 80 GB H100. Reserve 4 GB for activations and workspace. Each user has a 6k-token context on average. How many concurrent users fit?</p>
+<p><em>Solution.</em> Weights ≈ 16.1 GB. Free for KV: \(80-16.1-4\approx 59.9\) GB. Per user: \(6144\times131{,}072\) B ≈ 0.805 GB. Max ≈ 74 users. With FP8 KV cache, ≈ 148; with FP8 weights too, a little more. With Llama 2 7B (MHA), only ≈ 18. This is why GQA was adopted and why KV memory, not FLOPs, usually sets batch size.</p>
+</details>
+
+<h2 id="s2-11">2.11 Arithmetic intensity and the first roofline</h2>
+<div class="box def">
+<div class="box-title">Definition — arithmetic intensity and the roofline</div>
+<p>The <strong>arithmetic intensity</strong> of a kernel is \(I = \text{FLOPs} / \text{bytes}\), counting bytes moved to and from main memory. On a machine with peak compute \(P\) (FLOP/s) and bandwidth \(\beta\) (bytes/s), the attainable throughput is bounded by the <strong>roofline</strong><span class="cite"><a href="#r-roofline">[18]</a></span>
+\[ \text{attainable FLOP/s} = \min(P,\ I\cdot\beta), \]
+and the <strong>ridge point</strong> \(I^{*} = P/\beta\) separates memory-bound kernels (\(I&lt;I^{*}\)) from compute-bound ones (\(I&gt;I^{*}\)). For an H100 SXM in dense BF16: \(I^{*}\approx 989\times10^{12}/3.35\times10^{12}\approx 295\) FLOPs/byte.</p>
+</div>
+
+<h3 id="ai-linear">Linear layers</h3>
+<p>A weight \(W\in\mathbb{R}^{k\times n}\) applied to \(M\) token vectors (\(M=B\) during decode, \(M=B\cdot n_{\text{in}}\) during prefill) performs \(2Mkn\) FLOPs and moves \(b(kn + Mk + Mn)\) bytes (weights, inputs, outputs). Hence</p>
+\[ I_{\text{linear}} = \frac{2Mkn}{b(kn+Mk+Mn)} \;\xrightarrow{\;M\ll k,n\;}\; \frac{2M}{b}\quad(=M\text{ FLOPs/byte in BF16}). \]
+<p>So in BF16 <strong>each token that shares a weight read contributes about one FLOP per byte</strong>. Decode at batch 1: \(I\approx1\). Decode at batch 64: \(I\approx64\), still memory-bound on H100. Prefill of a 2,000-token prompt: \(I\) in the thousands (capped by the \(Mk+Mn\) activation terms), comfortably compute-bound. The crossover batch for weight-dominated decode is roughly the ridge point: \(B^{*}\approx I^{*} b/2\approx 295\) in BF16 on H100 (≈150 on A100), which is why decode engines want hundreds of concurrent sequences.</p>
+
+<h3 id="ai-attention">Decode attention: a batch-independent intensity</h3>
+<p>For one sequence at context \(t\), one layer of decode attention reads the cache—\(2\,t\,n_{kv}d_h\,b\) bytes—and performs \(4\,t\,n_hd_h\) FLOPs. Thus</p>
+\[ I_{\text{attn-decode}} = \frac{4tn_hd_h}{2tn_{kv}d_hb} = \frac{2}{b}\cdot\frac{n_h}{n_{kv}} = \frac{2g}{b}. \]
+<p>In BF16, MHA gives 1 FLOP/byte, GQA with \(g=8\) gives 8. Crucially, <strong>this does not improve with batch size</strong>: each sequence has its own cache, so there is nothing to share. Batching amortises weights but not KV. At long contexts the KV read dominates the step—which is the quantitative reason for GQA, MLA, KV quantisation and sparse attention.</p>
+
+<figure class="chart" id="fig-2-8">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Roofline: H100 and A100 (dense BF16)","height":380,
+ "x":{"label":"Arithmetic intensity (FLOPs / byte, log)","log":true,"min":0.5,"max":10000},
+ "y":{"label":"Attainable TFLOP/s (log)","log":true,"min":1,"max":2000},
+ "series":[
+  {"name":"H100 SXM roofline","color":"s1","markers":false,"points":[[0.5,1.675],[295,989],[10000,989]]},
+  {"name":"A100 SXM roofline","color":"s2","markers":false,"dash":true,"points":[[0.5,1.02],[153,312],[10000,312]]},
+  {"name":"Operators on H100","color":"s3","line":false,"labels":true,"points":[
+    [1,3.35,"decode linear, B=1 / MHA attention",{"dx":-10,"dy":-8,"a":"end"}],[8,26.8,"GQA-8 decode attention",{"dx":-10,"dy":-8,"a":"end"}],[64,214,"decode linear, B=64",{"dx":-8,"a":"end"}],[2000,989,"prefill, 2k tokens",{"dx":-8,"dy":16,"a":"end"}]]}
+ ],
+ "vlines":[{"x":295,"text":"H100 ridge ≈ 295"}]}
+</script>
+<figcaption><b>Figure 2.8 — A first roofline.</b> Throughput rises linearly with intensity (slope = bandwidth) until it hits the compute ceiling. Decode lives on the sloped, bandwidth-bound part; prefill lives on the flat, compute-bound part. Chapter 5 extends this to cache levels, FP8/FP4 and real kernels.</figcaption>
+</figure>
+
+<h2 id="s2-12">2.12 A latency model for decode</h2>
+<p>Putting it together, a decode step for a batch of \(B\) sequences with average context \(\bar t\) takes roughly</p>
+<div class="box formula">
+\[ t_{\text{step}}(B) \approx \max\Bigg(\underbrace{\frac{N b + B\,\bar t\, s_{\text{kv}}}{\beta}}_{\text{memory time}},\ \underbrace{\frac{2N_{\text{matmul}}B + 4Ld\bar tB}{P}}_{\text{compute time}}\Bigg) + t_{\text{overhead}}, \]
+<p class="small">throughput \(=B/t_{\text{step}}\) tokens/s; per-user speed \(=1/t_{\text{step}}\). \(t_{\text{overhead}}\) covers kernel launches, sampling and scheduling (reduced by CUDA graphs and overlapped scheduling, Chapters 6 and 11).</p>
+</div>
+
+<figure class="chart" id="fig-2-9">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Llama 3 8B decode step on one H100, context 2,048","height":340,
+ "x":{"label":"Batch size B","min":0,"max":240,"ticks":[0,32,64,96,128,160,192,224]},
+ "y":{"label":"Time per decode step (ms)","min":0,"max":24,"ticks":[0,4,8,12,16,20,24]},
+ "series":[
+  {"name":"Memory time: (weights + KV) / bandwidth","color":"s1","points":[[1,4.87],[8,5.44],[16,6.08],[32,7.36],[64,9.92],[128,15.05],[224,22.74]]},
+  {"name":"Compute time: FLOPs / peak","color":"s2","points":[[1,0.02],[8,0.14],[16,0.28],[32,0.55],[64,1.11],[128,2.22],[224,3.88]]}
+ ],
+ "notes":[{"x":8,"y":21.5,"text":"KV capacity limit: B ≈ 238 (64 GB of KV) — beyond the right edge"}]}
+</script>
+<figcaption><b>Figure 2.9 — Decode is memory-bound at every batch that fits.</b> Idealised model: 16.06 GB of BF16 weights, 128 KiB of KV per token, 3.35 TB/s, 989 TFLOP/s. Weights dominate at small batch; the KV cache dominates by \(B\approx 64\). Memory runs out (~238 sequences of 2k tokens) long before compute becomes the bottleneck—so throughput is bounded by KV capacity and bandwidth, not FLOPs.</figcaption>
+</figure>
+
+<div class="table-wrap">
+<table>
+<caption>Throughput implied by Figure 2.9 (ideal, 100% bandwidth utilisation).</caption>
+<thead><tr><th class="num">Batch</th><th class="num">Step time (ms)</th><th class="num">Per-user tokens/s</th><th class="num">Total tokens/s</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td class="num">4.87</td><td class="num">205</td><td class="num">205</td></tr>
+<tr><td class="num">16</td><td class="num">6.08</td><td class="num">165</td><td class="num">2,633</td></tr>
+<tr><td class="num">64</td><td class="num">9.92</td><td class="num">101</td><td class="num">6,450</td></tr>
+<tr><td class="num">128</td><td class="num">15.05</td><td class="num">66</td><td class="num">8,505</td></tr>
+<tr><td class="num">224</td><td class="num">22.74</td><td class="num">44</td><td class="num">9,850</td></tr>
+</tbody>
+</table>
+</div>
+<p>Read the table as a <strong>latency–throughput Pareto frontier</strong>: from \(B=1\) to \(B=64\) total throughput rises 31× while per-user speed halves. A latency-sensitive tier might run at \(B\approx16\); a batch tier at the memory limit. Every optimisation in this book moves this frontier: FP8 KV halves the slope of the memory line; quantised weights lower its intercept; speculative decoding produces several tokens per step; prefix sharing lets sequences share KV.</p>
+
+<h2 id="s2-13">2.13 From logits to tokens (preview)</h2>
+<p>The last hidden state \(h_T\) yields logits \(z = \operatorname{RMSNorm}(h_T)W_U\in\mathbb{R}^{|V|}\). The next token is drawn from</p>
+\[ p_\tau(i) = \frac{\exp(z_i/\tau)}{\sum_j\exp(z_j/\tau)}, \]
+<p>where the temperature \(\tau\) interpolates between greedy decoding (\(\tau\to0\), argmax) and the model's raw distribution (\(\tau=1\)); a Gibbs distribution at inverse temperature \(1/\tau\). Truncation (top-\(k\), top-\(p\), min-\(p\)), penalties, and grammar-constrained decoding are the subject of Chapter 3. Computationally, softmax is a memory-bound reduction over \(|V|\) per sequence; numerically it is computed as \(\exp(z_i-\max_j z_j)\) to avoid overflow—an idea that becomes the "online softmax" at the heart of FlashAttention.</p>
+
+<h2 id="s2-14">2.14 Code: a KV-cached decoder you can read</h2>
+<p>The following is a complete, runnable Llama-style model with RMSNorm, RoPE, grouped-query attention, SwiGLU and a pre-allocated KV cache—stripped of everything except the inference path. It uses random weights; load real ones by mapping parameter names from a checkpoint. Read it with Figure 2.1 open.</p>
+<pre><code><span class="c-kw">import</span> torch, torch.nn <span class="c-kw">as</span> nn, torch.nn.functional <span class="c-kw">as</span> F
+
+<span class="c-kw">class</span> Cfg:                                   <span class="c-com"># tiny Llama-style hyper-parameters</span>
+    d, L, n_h, n_kv, d_ff, V, max_T, rope_base = 512, 8, 8, 2, 1408, 32000, 2048, 10000.0
+
+<span class="c-kw">def</span> rope_tables(c, device):
+    d_h = c.d // c.n_h
+    inv = c.rope_base ** (-torch.arange(0, d_h, 2, device=device) / d_h)   <span class="c-com"># θ_i, shape (d_h/2,)</span>
+    ang = torch.outer(torch.arange(c.max_T, device=device), inv)           <span class="c-com"># m·θ_i, shape (max_T, d_h/2)</span>
+    <span class="c-kw">return</span> ang.cos(), ang.sin()
+
+<span class="c-kw">def</span> apply_rope(x, cos, sin):                  <span class="c-com"># x: (B, heads, T, d_h); cos/sin: (T, d_h/2)</span>
+    x1, x2 = x[..., 0::2], x[..., 1::2]          <span class="c-com"># coordinate pairs (2i, 2i+1)</span>
+    rot = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+    <span class="c-kw">return</span> rot.flatten(-2)                      <span class="c-com"># re-interleave → (B, heads, T, d_h)</span>
+
+<span class="c-kw">class</span> RMSNorm(nn.Module):
+    <span class="c-kw">def</span> __init__(self, d, eps=1e-6):
+        super().__init__(); self.w = nn.Parameter(torch.ones(d)); self.eps = eps
+    <span class="c-kw">def</span> forward(self, x):
+        <span class="c-kw">return</span> self.w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+<span class="c-kw">class</span> Block(nn.Module):
+    <span class="c-kw">def</span> __init__(self, c):
+        super().__init__(); self.c = c; d_h = c.d // c.n_h
+        self.wq = nn.Linear(c.d, c.n_h * d_h, bias=False)
+        self.wk = nn.Linear(c.d, c.n_kv * d_h, bias=False)
+        self.wv = nn.Linear(c.d, c.n_kv * d_h, bias=False)
+        self.wo = nn.Linear(c.n_h * d_h, c.d, bias=False)
+        self.w1 = nn.Linear(c.d, c.d_ff, bias=False)    <span class="c-com"># gate</span>
+        self.w3 = nn.Linear(c.d, c.d_ff, bias=False)    <span class="c-com"># up</span>
+        self.w2 = nn.Linear(c.d_ff, c.d, bias=False)    <span class="c-com"># down</span>
+        self.n1, self.n2 = RMSNorm(c.d), RMSNorm(c.d)
+
+    <span class="c-kw">def</span> forward(self, x, cache, pos, cos, sin):    <span class="c-com"># x: (B, T, d); new tokens occupy positions pos..pos+T-1</span>
+        B, T, _ = x.shape; c = self.c; d_h = c.d // c.n_h
+        h = self.n1(x)
+        q = self.wq(h).view(B, T, c.n_h,  d_h).transpose(1, 2)    <span class="c-com"># (B, n_h,  T, d_h)</span>
+        k = self.wk(h).view(B, T, c.n_kv, d_h).transpose(1, 2)    <span class="c-com"># (B, n_kv, T, d_h)</span>
+        v = self.wv(h).view(B, T, c.n_kv, d_h).transpose(1, 2)
+        cs, sn = cos[pos:pos + T], sin[pos:pos + T]
+        q, k = apply_rope(q, cs, sn), apply_rope(k, cs, sn)        <span class="c-com"># cache stores ROTATED keys</span>
+        K, Vc = cache                                              <span class="c-com"># pre-allocated (B, n_kv, max_T, d_h)</span>
+        K[:, :, pos:pos + T] = k                                   <span class="c-com"># append: the only write to the cache</span>
+        Vc[:, :, pos:pos + T] = v
+        g = c.n_h // c.n_kv                                        <span class="c-com"># GQA group size</span>
+        k_all = K[:, :, :pos + T].repeat_interleave(g, dim=1)      <span class="c-com"># (B, n_h, pos+T, d_h) — real kernels avoid this copy</span>
+        v_all = Vc[:, :, :pos + T].repeat_interleave(g, dim=1)
+        <span class="c-com"># query i (absolute position pos+i) may see keys j ≤ pos+i</span>
+        mask = torch.ones(T, pos + T, dtype=torch.bool, device=x.device).tril(diagonal=pos)
+        o = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=mask)   <span class="c-com"># (B, n_h, T, d_h)</span>
+        x = x + self.wo(o.transpose(1, 2).reshape(B, T, c.n_h * d_h))
+        h = self.n2(x)
+        <span class="c-kw">return</span> x + self.w2(F.silu(self.w1(h)) * self.w3(h))     <span class="c-com"># SwiGLU FFN</span>
+
+<span class="c-kw">class</span> TinyLlama(nn.Module):
+    <span class="c-kw">def</span> __init__(self, c):
+        super().__init__(); self.c = c
+        self.emb = nn.Embedding(c.V, c.d)
+        self.blocks = nn.ModuleList(Block(c) <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(c.L))
+        self.norm = RMSNorm(c.d)
+        self.head = nn.Linear(c.d, c.V, bias=False)
+
+    <span class="c-kw">def</span> new_cache(self, B, device, dtype):
+        shape = (B, self.c.n_kv, self.c.max_T, self.c.d // self.c.n_h)
+        <span class="c-kw">return</span> [(torch.zeros(shape, device=device, dtype=dtype),
+                 torch.zeros(shape, device=device, dtype=dtype)) <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(self.c.L)]
+
+    <span class="c-kw">def</span> forward(self, ids, cache, pos, cos, sin):
+        x = self.emb(ids)                                          <span class="c-com"># gather, not a matmul</span>
+        <span class="c-kw">for</span> blk, layer_cache <span class="c-kw">in</span> zip(self.blocks, cache):
+            x = blk(x, layer_cache, pos, cos, sin)
+        <span class="c-kw">return</span> self.head(self.norm(x[:, -1:]))                    <span class="c-com"># logits for the LAST position only</span>
+
+@torch.no_grad()
+<span class="c-kw">def</span> generate(model, prompt_ids, n_new, temperature=0.8):
+    B, T0 = prompt_ids.shape; dev = prompt_ids.device
+    cos, sin = rope_tables(model.c, dev)
+    cache = model.new_cache(B, dev, next(model.parameters()).dtype)
+    logits = model(prompt_ids, cache, 0, cos, sin)                 <span class="c-com"># PREFILL: all T0 tokens in one pass</span>
+    out, pos = [], T0
+    <span class="c-kw">for</span> _ <span class="c-kw">in</span> range(n_new):                                        <span class="c-com"># DECODE: one token per step</span>
+        probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+        nxt = torch.multinomial(probs, 1)                          <span class="c-com"># (B, 1)</span>
+        out.append(nxt)
+        logits = model(nxt, cache, pos, cos, sin); pos += 1
+    <span class="c-kw">return</span> torch.cat(out, dim=1)
+
+model = TinyLlama(Cfg()).eval()
+print(generate(model, torch.randint(0, Cfg.V, (2, 16)), n_new=8))   <span class="c-com"># two sequences, 16-token prompts</span></code></pre>
+
+<div class="box bridge">
+<div class="box-title">What a production engine does differently</div>
+<ul>
+<li><strong>No contiguous per-sequence buffers.</strong> The cache is a pool of fixed-size blocks with a per-sequence block table (PagedAttention, Chapter 9), so sequences of different lengths share memory without waste.</li>
+<li><strong>No <code>repeat_interleave</code>.</strong> GQA kernels read each KV head once and apply it to its \(g\) query heads in on-chip memory—that is where the \(g\times\) intensity gain comes from.</li>
+<li><strong>Ragged batches.</strong> Prefill tokens of new requests and decode tokens of running requests are packed into one flat token batch each step (continuous batching with chunked prefill, Chapter 10), with attention kernels such as FlashAttention/FlashInfer handling variable lengths (Chapter 8).</li>
+<li><strong>Fused kernels and CUDA graphs</strong> to remove launch overhead at small batch (Chapter 6); <strong>tensor parallelism</strong> to split each matrix across GPUs (Chapter 16).</li>
+<li>Note: this code pairs coordinates as \((2i,2i+1)\); Hugging Face's Llama pairs \((i, i+d_h/2)\) ("rotate-half"). Both are valid RoPE variants, but weights trained with one are not interchangeable with the other without permuting \(W_Q,W_K\) columns.</li>
+</ul>
+</div>
+
+<h2 id="summary">Chapter summary</h2>
+<ul>
+<li>A Llama-style block: \(x\leftarrow x+\mathrm{Attn}(\mathrm{RMSNorm}(x))\), \(x\leftarrow x+\mathrm{SwiGLU}(\mathrm{RMSNorm}(x))\); RoPE on \(q,k\); GQA.</li>
+<li>\(\sqrt{d_h}\) keeps logit variance \(O(1)\); RoPE makes logits depend on \(m-n\) via \(R_m^\top R_n=R_{n-m}\).</li>
+<li>\(N = L(2d^2+2dd_{kv}+3dd_{ff}+2d)+|V|d(1+[\text{untied}])\); Llama 3 8B ≈ 8.03B.</li>
+<li>Inference ≈ \(2N\) FLOPs/token \(+\,4Ldt\) for attention; training ≈ \(6N\). Attention compute rivals weights at \(t\approx6d\).</li>
+<li>Prefill is compute-bound (sets TTFT); decode is memory-bound (sets TPOT).</li>
+<li>KV per token \(=2Ln_{kv}d_hb\): 512 KiB (Llama 2 7B), 128 KiB (Llama 3 8B), ≈69 KiB (DeepSeek-V3 MLA).</li>
+<li>Linear-layer intensity ≈ tokens sharing the weight read (BF16); decode attention intensity \(=2g/b\), independent of batch.</li>
+<li>Decode step ≈ (weights + batch KV)/bandwidth; batch is limited by KV memory long before compute.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Click an option to answer. "Select all that apply" questions need the Check button.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ch02-mcq-01" data-topic="Shapes">
+<p class="q">In Llama 3 8B (\(d=4096,n_h=32,n_{kv}=8\)), what is the shape of \(W_K\)?</p>
+<ol class="opts"><li>4096 × 4096</li><li data-correct>4096 × 1024</li><li>4096 × 128</li><li>1024 × 1024</li></ol>
+<div class="explain">\(W_K\in\mathbb{R}^{d\times n_{kv}d_h} = 4096\times(8\cdot128)\). \(W_Q\) is \(4096\times4096\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-02" data-topic="Attention">
+<p class="q">If \(q,k\in\mathbb{R}^{d_h}\) have i.i.d. zero-mean unit-variance coordinates, \(\operatorname{Var}(q\cdot k)\) equals:</p>
+<ol class="opts"><li>1</li><li>\(\sqrt{d_h}\)</li><li data-correct>\(d_h\)</li><li>\(d_h^2\)</li></ol>
+<div class="explain">Sum of \(d_h\) independent products each with variance \(\mathbb{E}[q_c^2]\mathbb{E}[k_c^2]=1\). Dividing by \(\sqrt{d_h}\) restores variance 1.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-03" data-topic="Attention">
+<p class="q">What goes wrong if attention logits are not scaled and \(d_h\) is large?</p>
+<ol class="opts"><li>The KV cache doubles</li><li data-correct>Softmax saturates towards one-hot, its Jacobian approaches zero, and gradients vanish</li><li>Attention becomes non-causal</li><li>FLOPs increase quadratically</li></ol>
+<div class="explain">Large-variance logits make softmax extremely peaked; \(\operatorname{diag}(p)-pp^\top\to0\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-04" data-topic="Positional encoding">
+<p class="q">Without any positional information and without a causal mask, self-attention is:</p>
+<ol class="opts"><li>Permutation-invariant in its outputs</li><li data-correct>Permutation-equivariant: permuting inputs permutes outputs the same way</li><li>Translation-invariant only</li><li>Undefined</li></ol>
+<div class="explain">\(O(\Pi X)=\Pi O(X)\). It cannot distinguish word orders, hence positional encodings.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-05" data-topic="RoPE">
+<p class="q">RoPE makes the attention logit between positions \(m\) and \(n\) depend on position only through:</p>
+<ol class="opts"><li>\(m+n\)</li><li data-correct>\(m-n\)</li><li>\(\max(m,n)\)</li><li>\(mn\)</li></ol>
+<div class="explain">\(\langle R_mq,R_nk\rangle = q^\top R_m^\top R_n k = q^\top R_{n-m}k\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-06" data-topic="RoPE">
+<p class="q">In RoPE with frequencies \(\theta_i=\beta^{-2i/d_h}\), increasing the base \(\beta\) (e.g. 10⁴ → 5·10⁵ in Llama 3):</p>
+<ol class="opts"><li>Makes all pairs rotate faster</li><li data-correct>Slows the rotation of the low-frequency pairs, so their angles stay distinguishable over longer contexts</li><li>Removes the relative-position property</li><li>Shrinks the KV cache</li></ol>
+<div class="explain">Larger base → smaller \(\theta_i\) for \(i&gt;0\) → longer wavelengths; useful for long contexts. Rescaling frequencies is the core of context-extension methods.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-07" data-topic="RoPE / caching">
+<p class="q">Inference engines usually store keys in the KV cache:</p>
+<ol class="opts"><li>Before RoPE, applying the rotation at every step</li><li data-correct>After RoPE, so each cached key is tied to its absolute position</li><li>As token ids, recomputing keys each step</li><li>Only for the first layer</li></ol>
+<div class="explain">Rotating once at write time is cheaper. Consequence: reusing or shifting cached keys at different positions requires re-rotation.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-08" data-topic="Normalisation">
+<p class="q">RMSNorm differs from LayerNorm by:</p>
+<ol class="opts"><li>Normalising over the batch dimension</li><li data-correct>Not subtracting the mean and having no bias term—only scaling by the root mean square</li><li>Using learned running statistics</li><li>Being applied only at the output</li></ol>
+<div class="explain">\(\operatorname{RMSNorm}(x)=\gamma\odot x/\sqrt{\operatorname{mean}(x^2)+\epsilon}\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-09" data-topic="Normalisation">
+<p class="q">Why did Pre-LN replace Post-LN in large models?</p>
+<ol class="opts"><li>It uses fewer parameters</li><li>It reduces inference FLOPs</li><li data-correct>It keeps an identity residual path, giving well-behaved gradients at initialisation and stable training without delicate warm-up</li><li>It removes the need for a final norm</li></ol>
+<div class="explain">Xiong et al. (2020). Pre-LN in fact <em>requires</em> a final norm before the LM head because the residual stream is never normalised.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-10" data-topic="FFN">
+<p class="q">A SwiGLU FFN with the same parameter count as a 4d-wide two-matrix FFN has hidden width:</p>
+<ol class="opts"><li>\(4d\)</li><li data-correct>\(\tfrac{8}{3}d\)</li><li>\(2d\)</li><li>\(3d\)</li></ol>
+<div class="explain">\(3dd_{ff}=8d^2\Rightarrow d_{ff}=8d/3\). LLaMA-7B: 11008 ≈ 2.69 × 4096.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-11" data-topic="Parameters">
+<p class="q">For a dense MHA Transformer with a 4d two-matrix FFN, non-embedding parameters are approximately:</p>
+<ol class="opts"><li>\(4Ld^2\)</li><li>\(8Ld^2\)</li><li data-correct>\(12Ld^2\)</li><li>\(24Ld^2\)</li></ol>
+<div class="explain">Attention \(4d^2\) (Q, K, V, O) + FFN \(8d^2\) per layer.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-12" data-topic="Parameters">
+<p class="q">In Llama 3 8B, roughly what fraction of parameters are in the (untied) embedding and LM head together?</p>
+<ol class="opts"><li>~1%</li><li data-correct>~13%</li><li>~35%</li><li>~50%</li></ol>
+<div class="explain">\(2\times128256\times4096\approx1.05\)B of 8.03B ≈ 13%.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-13" data-topic="Parameters">
+<p class="q">Switching a 32-head model from MHA to GQA with 8 KV heads (\(d_h=128\), \(d=4096\)) changes the attention parameter count per layer from 67.1M to about:</p>
+<ol class="opts"><li>16.8M</li><li data-correct>41.9M</li><li>58.7M</li><li>67.1M (unchanged)</li></ol>
+<div class="explain">\(2d^2+2d\cdot1024=33.55+8.39=41.94\)M.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-14" data-topic="FLOPs">
+<p class="q">Multiplying an \(m\times k\) matrix by a \(k\times n\) matrix costs approximately:</p>
+<ol class="opts"><li>\(mkn\) FLOPs</li><li data-correct>\(2mkn\) FLOPs</li><li>\(mk+kn\) FLOPs</li><li>\(m n\) FLOPs</li></ol>
+<div class="explain">One multiply and one add per term of each of the \(mn\) dot products of length \(k\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-15" data-topic="FLOPs">
+<p class="q">The forward pass of a dense LLM costs about how many FLOPs per token (short contexts)?</p>
+<ol class="opts"><li>\(N\)</li><li data-correct>\(2N\)</li><li>\(6N\)</li><li>\(N^2\)</li></ol>
+<div class="explain">2 FLOPs per parameter per token. Training (forward + backward) is \(\approx6N\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-16" data-topic="FLOPs">
+<p class="q">For an MHA model with \(N\approx12Ld^2\), attention-score FLOPs per token equal weight FLOPs at context length about:</p>
+<ol class="opts"><li>\(d\)</li><li data-correct>\(6d\)</li><li>\(12d\)</li><li>\(d^2\)</li></ol>
+<div class="explain">\(4Ldt=24Ld^2\Rightarrow t=6d\) (≈24.6k tokens for \(d=4096\)).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-17" data-topic="FLOPs">
+<p class="q">Grouped-query attention reduces which of the following during decode? (select all that apply)</p>
+<ol class="opts"><li data-correct>KV-cache memory</li><li data-correct>Bytes read from HBM for attention</li><li>Attention FLOPs (QKᵀ and PV)</li><li data-correct>Parameters of W_K and W_V</li></ol>
+<div class="explain">Every query head still attends over all positions, so attention FLOPs are unchanged; KV storage, traffic and K/V projection weights all shrink by \(g\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-18" data-topic="Prefill vs decode">
+<p class="q">Which statement is correct?</p>
+<ol class="opts"><li>Prefill is memory-bound; decode is compute-bound</li><li data-correct>Prefill is typically compute-bound; decode is typically memory-bandwidth-bound</li><li>Both are compute-bound</li><li>Both are latency-bound by the CPU</li></ol>
+<div class="explain">Prefill multiplies weights by thousands of token vectors at once; decode by one per sequence.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-19" data-topic="Prefill vs decode">
+<p class="q">TTFT is dominated by ___, while TPOT is dominated by ___.</p>
+<ol class="opts"><li>decode; prefill</li><li data-correct>queueing + prefill; decode step time</li><li>tokenisation; detokenisation</li><li>sampling; attention</li></ol>
+<div class="explain">The first token comes out of the prefill pass; subsequent tokens each need a decode step.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-20" data-topic="KV cache">
+<p class="q">The KV cache gives exactly the same results as recomputation because:</p>
+<ol class="opts"><li>Keys and values are quantised</li><li data-correct>With causal masking, the hidden state at position j in every layer depends only on tokens 1..j, so earlier K/V never change when tokens are appended</li><li>Attention is linear</li><li>RoPE is applied after caching</li></ol>
+<div class="explain">Induction over layers (§2.10). Without the causal mask (e.g. bidirectional encoders), caching would be invalid.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-21" data-topic="KV cache">
+<p class="q">KV-cache bytes per token for a model with \(L=32\), \(n_{kv}=8\), \(d_h=128\) in BF16:</p>
+<ol class="opts"><li>64 KiB</li><li data-correct>128 KiB</li><li>256 KiB</li><li>512 KiB</li></ol>
+<div class="explain">\(2\times32\times8\times128\times2=131{,}072\) B = 128 KiB.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-22" data-topic="KV cache">
+<p class="q">Llama 2 7B (MHA, 512 KiB/token) serving 16 sequences of 4,096 tokens needs how much KV memory?</p>
+<ol class="opts"><li>2 GiB</li><li>8 GiB</li><li data-correct>32 GiB</li><li>128 GiB</li></ol>
+<div class="explain">\(0.5\text{ MiB}\times4096\times16 = 32{,}768\) MiB = 32 GiB—more than twice the 13.5 GB of weights.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-23" data-topic="KV cache">
+<p class="q">Without a KV cache, generating \(T\) tokens from scratch with a model of \(N\) parameters costs roughly:</p>
+<ol class="opts"><li>\(2NT\)</li><li data-correct>\(NT^2\)</li><li>\(2N\)</li><li>\(NT\log T\)</li></ol>
+<div class="explain">\(\sum_{t=1}^{T}2Nt\approx NT^2\), versus \(2NT\) with caching.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-24" data-topic="Arithmetic intensity">
+<p class="q">The H100's ridge point is ≈295 FLOPs/byte (dense BF16). A kernel with intensity 40 FLOPs/byte will achieve at most about:</p>
+<ol class="opts"><li>989 TFLOP/s</li><li data-correct>134 TFLOP/s</li><li>40 TFLOP/s</li><li>3.35 TFLOP/s</li></ol>
+<div class="explain">\(\min(989,\ 40\times3.35)=134\) TFLOP/s.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-25" data-topic="Arithmetic intensity">
+<p class="q">In BF16, the arithmetic intensity of a linear layer applied to \(M\) tokens (with \(M\) much smaller than the matrix dimensions) is about:</p>
+<ol class="opts"><li>1 regardless of M</li><li data-correct>M FLOPs/byte</li><li>2M² FLOPs/byte</li><li>\(k n\) FLOPs/byte</li></ol>
+<div class="explain">\(2Mkn/(2kn)=M\). Each additional token sharing the weight read adds ~1 FLOP/byte.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-26" data-topic="Arithmetic intensity">
+<p class="q">The arithmetic intensity of decode-time attention for one sequence (BF16, group size \(g=n_h/n_{kv}\)) is approximately:</p>
+<ol class="opts"><li>\(B\), the batch size</li><li data-correct>\(g\), independent of batch size and context length</li><li>\(t\), the context length</li><li>\(d_h\)</li></ol>
+<div class="explain">\(4tn_hd_h/(2tn_{kv}d_h\cdot2)=g\). Each sequence has its own cache, so batching does not amortise it.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-27" data-topic="Arithmetic intensity">
+<p class="q">Roughly at what decode batch size does a BF16 dense model's weight GEMM become compute-bound on an H100 (ignoring KV)?</p>
+<ol class="opts"><li>~8</li><li>~32</li><li data-correct>~300</li><li>~10,000</li></ol>
+<div class="explain">Intensity ≈ B must reach the ridge ≈ 295.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-28" data-topic="Latency model">
+<p class="q">According to the decode latency model, which change most reduces step time at <em>large</em> batch with long contexts?</p>
+<ol class="opts"><li>Doubling peak FLOP/s</li><li data-correct>Halving KV bytes per token (e.g. FP8 KV cache or fewer KV heads)</li><li>Halving the vocabulary</li><li>Using LayerNorm instead of RMSNorm</li></ol>
+<div class="explain">At large B and long t the \(B\bar ts_{\text{kv}}/\beta\) term dominates.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-29" data-topic="Latency model">
+<p class="q">Llama 3 8B on one 80 GB H100 with 2k-token contexts: what usually limits the maximum decode batch?</p>
+<ol class="opts"><li>Compute (TFLOP/s)</li><li data-correct>HBM capacity for KV cache</li><li>PCIe bandwidth</li><li>Number of SMs</li></ol>
+<div class="explain">~64 GB free / 256 MiB per sequence ≈ 238 sequences, while compute time is still a fraction of memory time.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-30" data-topic="Tokenisation">
+<p class="q">Which are consequences of increasing vocabulary size from 32k to 128k? (select all that apply)</p>
+<ol class="opts"><li data-correct>Fewer tokens per document, hence fewer decode steps and smaller KV caches for the same text</li><li data-correct>Larger embedding and LM-head matrices</li><li>Smaller per-token FLOPs in the LM head</li><li data-correct>More expensive softmax/sampling over logits</li></ol>
+<div class="explain">LM-head FLOPs \(2d|V|\) grow with \(|V|\).</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-31" data-topic="Tokenisation">
+<p class="q">Why does byte-level BPE never need an "unknown" token?</p>
+<ol class="opts"><li>It has an infinite vocabulary</li><li data-correct>Its base alphabet is all 256 byte values, so any byte string can be represented</li><li>It lowercases input</li><li>It maps rare words to the nearest neighbour</li></ol>
+<div class="explain">Merges are optional shortcuts; unmerged bytes are always available. Downside: a token may split a UTF-8 character, complicating streaming.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-32" data-topic="Engine detail">
+<p class="q">During prefill of a 4,000-token prompt, a well-implemented engine computes the LM head for:</p>
+<ol class="opts"><li>All 4,000 positions</li><li data-correct>Only the last position (unless prompt log-probs are requested)</li><li>The first position</li><li>No positions</li></ol>
+<div class="explain">Only the last position's logits are needed to sample the first output token; this saves \(2d|V|(T-1)\) FLOPs and a huge \(T\times|V|\) tensor.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-33" data-topic="Training FLOPs">
+<p class="q">For \(Y=XW\), the backward pass computes \(\partial\mathcal{L}/\partial X\) and \(\partial\mathcal{L}/\partial W\). Its cost relative to the forward pass is about:</p>
+<ol class="opts"><li>Equal</li><li data-correct>Twice</li><li>Four times</li><li>Half</li></ol>
+<div class="explain">Two matrix products of the same size as the forward one; total training ≈ 3× forward = \(6N\) per token.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-34" data-topic="MLA">
+<p class="q">DeepSeek-V3 caches about 576 values per token per layer (61 layers). In BF16 this is roughly:</p>
+<ol class="opts"><li>~7 KiB per token</li><li data-correct>~69 KiB per token</li><li>~512 KiB per token</li><li>~4 MiB per token</li></ol>
+<div class="explain">\(576\times61\times2=70{,}272\) B ≈ 68.6 KiB—less than Llama 3 8B's 128 KiB despite a model 80× larger.</div>
+</div>
+
+<div class="mcq" data-id="ch02-mcq-35" data-topic="Code">
+<p class="q">In the chapter's code, why is the mask built with <code>tril(diagonal=pos)</code> rather than using <code>is_causal=True</code>?</p>
+<ol class="opts"><li>It is faster</li><li data-correct>When the new chunk starts at position pos &gt; 0, query i must see keys up to pos+i; the default causal mask aligns to the top-left and would be wrong for a query block shorter than the key block</li><li>Because RoPE requires it</li><li>To disable attention during decode</li></ol>
+<div class="explain">This generalises to chunked prefill. For a single decode token (T=1) the mask is all-true.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+
+<details class="qa" data-id="ch02-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Walk me through one decoder block of a Llama-style model, with tensor shapes.</summary>
+<div class="answer">
+<p>Input \(x\in\mathbb{R}^{B\times T\times d}\). (1) \(h=\operatorname{RMSNorm}(x)\). (2) \(q=hW_Q\to(B,n_h,T,d_h)\), \(k=hW_K, v=hW_V\to(B,n_{kv},T,d_h)\). (3) Apply RoPE to \(q,k\). (4) Write \(k,v\) into the cache; read all cached \(K,V\) for positions \(\le\) current. (5) Per head: \(\operatorname{softmax}(qK^\top/\sqrt{d_h}+M)V\to(B,n_h,T,d_h)\); with GQA each KV head serves \(g\) query heads. (6) Concatenate heads \(\to(B,T,d)\), multiply by \(W_O\), add to \(x\). (7) \(h=\operatorname{RMSNorm}(x)\); FFN \(\big(\operatorname{SiLU}(hW_1)\odot hW_3\big)W_2\) with \(d\to d_{ff}\to d\); add to \(x\). Output shape \((B,T,d)\). Mention: no biases, Pre-norm, final norm + LM head after the last block.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Why do we divide attention scores by \(\sqrt{d_k}\)?</summary>
+<div class="answer">
+<p>If query/key coordinates are roughly independent with unit variance, \(q\cdot k\) has variance \(d_k\). For \(d_k=128\), logits have std ≈ 11, and softmax becomes nearly one-hot; its Jacobian \(\operatorname{diag}(p)-pp^\top\) is then close to zero, so gradients vanish and training is slow or unstable. Scaling by \(1/\sqrt{d_k}\) keeps logits at unit variance, so attention starts out diffuse and learnable. Follow-ups: it is a temperature; QK-norm is a stronger fix used in some newer models; MLA and other variants adjust the scale for their effective head dimension.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-03">
+<summary><span class="lvl core">Core</span> Count the parameters of Llama 3 8B from its config.</summary>
+<div class="answer">
+<p>Config: \(L=32,d=4096,n_h=32,n_{kv}=8,d_h=128,d_{ff}=14336,|V|=128256\), untied embeddings, no biases.</p>
+<ul>
+<li>Attention per layer: \(W_Q,W_O\): \(2\times4096^2=33.55\)M; \(W_K,W_V\): \(2\times4096\times1024=8.39\)M → 41.94M.</li>
+<li>FFN per layer: \(3\times4096\times14336=176.16\)M.</li>
+<li>Norms: \(2\times4096\). Per layer ≈ 218.1M; × 32 = 6.98B.</li>
+<li>Embedding + LM head: \(2\times128256\times4096=1.05\)B; final norm 4096.</li>
+</ul>
+<p>Total ≈ 8.03B. Bonus: BF16 weights ≈ 16.06 GB; FP8 ≈ 8 GB; the embedding table is a gather (no FLOPs), so "\(2N\)" should use ≈ 7.5B matmul parameters.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-04">
+<summary><span class="lvl core">Core</span> Derive the KV-cache size and compute it for Llama 2 70B at 8 concurrent 16k-token requests.</summary>
+<div class="answer">
+<p>Each layer caches a key and a value vector for each KV head: \(2\times n_{kv}\times d_h\) elements per token per layer. Over \(L\) layers at \(b\) bytes: \(s_{kv}=2Ln_{kv}d_hb\). Llama 2 70B: \(2\times80\times8\times128\times2=327{,}680\) B = 320 KiB/token. For 8 × 16,384 tokens: \(131{,}072\times320\) KiB = 40 GiB. Weights are ~138 GB in BF16, so with 2×H100 (160 GB) there is only ~20 GB left—insufficient; you'd need 4×H100 with TP=4, FP8 weights, or FP8 KV (20 GiB). Point out that without GQA (MHA, 64 KV heads) it would be 8× more: 320 GiB.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-05">
+<summary><span class="lvl core">Core</span> Why is decode memory-bound but prefill compute-bound? Use arithmetic intensity.</summary>
+<div class="answer">
+<p>A linear layer with weights \(k\times n\) applied to \(M\) tokens does \(2Mkn\) FLOPs and reads \(\approx bkn\) weight bytes; intensity ≈ \(2M/b\) (= \(M\) in BF16). Prefill has \(M=B\cdot n_{\text{in}}\) (thousands) → intensity far above the ridge (≈295 on H100) → compute-bound. Decode has \(M=B\) (1 to a few hundred) → below the ridge → bandwidth-bound. Decode attention is worse: intensity \(2g/b\) (1 for MHA, 8 for GQA-8) regardless of batch, because each sequence's KV cache is private. Hence prefill time ∝ FLOPs/peak and decode time ∝ bytes/bandwidth.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-06">
+<summary><span class="lvl core">Core</span> What does GQA buy you, and what does it cost?</summary>
+<div class="answer">
+<p><strong>Buys:</strong> KV cache and its bandwidth shrink by \(g=n_h/n_{kv}\) (4× for Llama 3 8B, 8× for 70B); decode attention intensity rises from 1 to \(g\) FLOPs/byte; more concurrent sequences fit; K/V projection parameters shrink; with tensor parallelism, KV heads are naturally partitioned across GPUs (as long as TP ≤ \(n_{kv}\); beyond that KV heads must be replicated). <strong>Costs:</strong> a small quality loss versus MHA at equal size (mostly recovered by training; Ainslie et al. also showed MHA checkpoints can be "uptrained" into GQA with ~5% of pre-training compute); attention FLOPs are unchanged. MQA (\(n_{kv}=1\)) is the extreme with larger quality risk and the TP replication problem; MLA trades extra compute (up/down projections, absorbed into weights at inference) for even smaller caches.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-07">
+<summary><span class="lvl core">Core</span> Explain RoPE and prove its relative-position property.</summary>
+<div class="answer">
+<p>RoPE groups coordinates into \(d_h/2\) pairs, treats each as a complex number, and multiplies pair \(i\) of the query (or key) at position \(m\) by \(e^{\mathrm{i}m\theta_i}\), with \(\theta_i=\beta^{-2i/d_h}\). Then \(\langle\mathrm{RoPE}(q,m),\mathrm{RoPE}(k,n)\rangle=\operatorname{Re}\sum_i\tilde q_i\overline{\tilde k_i}e^{\mathrm{i}(m-n)\theta_i}\), which depends only on \(m-n\). In matrix form, \(R_m\) is block-diagonal of 2×2 rotations and \(R_m^\top R_n=R_{n-m}\). Advantages: no learned parameters, relative-position behaviour inside attention, works with any length (though quality beyond training length requires frequency rescaling such as PI/NTK/YaRN). Inference notes: applied to q and k only (not v); applied before caching; fused into the QKV projection or attention kernel.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-08">
+<summary><span class="lvl core">Core</span> Estimate the decode throughput of Llama 3 8B on one H100 at batch 64 with 2k-token contexts.</summary>
+<div class="answer">
+<p>Bytes per step: weights 16.06 GB + KV \(64\times2048\times128\text{ KiB}=17.2\) GB ≈ 33.3 GB → at 3.35 TB/s ≈ 9.9 ms. Compute: \(2\times7.5\times10^9\times64\approx9.6\times10^{11}\) + attention \(\approx 7\times10^{10}\) FLOPs → ~1.0 ms at peak. Memory-bound: step ≈ 10 ms ideal, say 12–14 ms at 70–80% MBU. Throughput ≈ 64/0.013 ≈ 4,500–5,000 tokens/s; per-user ≈ 75–80 tokens/s. To improve: FP8 KV (~7 ms ideal), FP8 weights, larger batch until memory is full, prefix sharing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-09">
+<summary><span class="lvl core">Core</span> Why does the LM head deserve special attention in inference engines?</summary>
+<div class="answer">
+<p>(1) Size: \(d\times|V|\) is the largest single matrix in many modern models (Llama 3 8B: 525M parameters, 1.05 GB in BF16), and it is read every decode step. (2) Compute: \(2d|V|\) FLOPs/token (~6.5% of Llama 3 8B). (3) Prefill waste: compute logits only for the last position (or positions where log-probs are requested), saving a \(T\times|V|\) activation that could be gigabytes. (4) Sampling: softmax and top-k/top-p over 128k–256k logits per sequence need efficient GPU kernels. (5) Parallelism: with tensor parallelism the head is split along the vocabulary dimension, requiring a gather or a distributed argmax/sampling. (6) Speculative decoding and MTP heads often share it.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Show that attention FLOPs equal weight FLOPs at \(t\approx6d\). What changes for GQA and for long-context serving?</summary>
+<div class="answer">
+<p>Per token at context \(t\): attention scores + weighted sum = \(4Ln_hd_ht=4Ldt\) FLOPs. Weight FLOPs = \(2N\approx24Ld^2\) for an MHA model with a 4d FFN. Equal when \(t=6d\). For GQA, weight FLOPs fall a bit (smaller \(W_K,W_V\)) but attention FLOPs are unchanged, so the crossover moves slightly earlier (for Llama 3 8B's actual parameter count, \(2\times7.5\text{B}/(4\times32\times4096)\approx 28.6\)k tokens because of its wide FFN). For long-context <em>prefill</em>, total attention FLOPs grow as \(\approx2Ldt^2\) and dominate at 128k (hence FlashAttention, context parallelism, sparse attention). For decode, attention's <em>bytes</em> matter far earlier than its FLOPs: KV bytes per step equal weight bytes when \(t\cdot s_{kv}=Nb\), e.g. Llama 3 8B: \(16\text{ GB}/128\text{ KiB}\approx122\)k tokens for one sequence—but with batch 64 the crossover is at under 2k tokens each.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Prove that KV caching is exact. Where can numerical results nevertheless differ?</summary>
+<div class="answer">
+<p>Induction on layers: hidden state \(h^{(\ell)}_j\) depends only on \(x_{1:j}\). Base: embedding of \(x_j\). Step: position-wise operations preserve the property; causal attention at \(j\) uses \(k_i,v_i\) for \(i\le j\), functions of \(h^{(\ell-1)}_i\), which by hypothesis depend only on \(x_{1:i}\). So appending tokens never changes earlier K/V; caching is memoisation. Numerical differences: floating-point addition is not associative, and the kernels used for prefill (big GEMMs, tiled attention over many queries) and for decode (GEMV, split-K attention) reduce in different orders and tile sizes; batch composition can change kernel choice. Results agree to within rounding but not bit-for-bit, which matters for "temperature 0" reproducibility and for comparing speculative-decoding outputs. Truly batch-invariant kernels fix this at some speed cost (Chapter 3).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Derive the decode-attention arithmetic intensity, and explain why batching does not help it but GQA and MLA do.</summary>
+<div class="answer">
+<p>One sequence, one layer, context \(t\): read \(K,V\): \(2tn_{kv}d_hb\) bytes. FLOPs: for each of \(n_h\) query heads, \(2td_h\) (scores) + \(2td_h\) (weighted sum) → \(4tn_hd_h\). Intensity \(=2n_h/(n_{kv}b)=2g/b\). A batch of \(B\) sequences reads \(B\) separate caches and does \(B\) times the FLOPs: the ratio is unchanged, unlike weights, which are shared. GQA raises it to \(g\) (BF16) by reusing each loaded KV head for \(g\) query heads in on-chip memory. MLA (with weight absorption) makes all \(n_h=128\) heads attend over the same 576-dim latent, so per byte of cache read it performs \(\sim 2n_h\cdot\frac{(512+64)+512}{576\cdot b}\) FLOPs—hundreds of FLOPs/byte, close to compute-bound on H100, which is why DeepSeek wrote dedicated kernels (FlashMLA). Prefix sharing (many sequences attending to the same cached prefix, e.g. a shared system prompt or parallel sampling) also raises it, enabling "cascade"/shared-prefix attention kernels.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-13">
+<summary><span class="lvl core">Core</span> Why must engines compute only last-position logits in prefill, and how does that interact with returning prompt log-probs?</summary>
+<div class="answer">
+<p>Logits are \(T\times|V|\): for a 32k-token prompt and 128k vocabulary that is 4.2B elements (8.4 GB in BF16) and \(2d|V|T\) FLOPs (~34 TFLOPs for Llama 3 8B)—wasted unless needed. Engines gather the hidden state of each sequence's last token before the LM head. If the API requests prompt log-probs (common in evaluation), the engine must compute logits for all prompt positions, usually in chunks to bound memory, and may bypass optimisations such as prefix caching (vLLM documents that requests with prompt logprobs recompute the full prefill).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-14">
+<summary><span class="lvl core">Core</span> Implement single-step decode attention for one head, given cached K and V. What is its complexity?</summary>
+<div class="answer">
+<pre><code>def decode_attn(q, K, V):            # q: (d_h,), K, V: (t, d_h)
+    s = K @ q / math.sqrt(q.shape[0]) # (t,)  scores; no mask needed: all t are in the past
+    s = s - s.max()                   # numerical stability
+    p = torch.exp(s); p = p / p.sum() # softmax
+    return p @ V                      # (d_h,)</code></pre>
+<p>Time \(O(td_h)\) FLOPs (\(4td_h\)), memory traffic \(O(td_h)\) bytes; it is bandwidth-bound. Follow-ups: batch over heads/sequences; GQA (one K/V for \(g\) queries); for long \(t\), split the sequence into chunks processed by different thread blocks and combine partial softmaxes with the log-sum-exp trick (FlashDecoding, Chapter 8); paged K/V via a block table (Chapter 9).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> Why did the field move from ReLU FFNs to SwiGLU, and what are the inference implications?</summary>
+<div class="answer">
+<p>Shazeer (2020) found gated variants (GEGLU, SwiGLU) give lower perplexity at equal parameters and compute; LLaMA/PaLM adopted SwiGLU. A gate multiplies two linear projections, providing multiplicative interactions and smoother activations. Inference: (1) three matrices instead of two—\(W_1\) and \(W_3\) are typically fused into one \(d\times2d_{ff}\) GEMM, followed by a fused SiLU-and-multiply kernel; (2) with \(d_{ff}=\tfrac83 d\) parameter count matches the old FFN so FLOPs/token are unchanged; (3) activation sparsity is lower than with ReLU, weakening "sparse activation" speed-ups (Deja Vu, PowerInfer) unless models are "ReLU-fied"; (4) the FFN dominates weight bytes, so it is where weight quantisation and MoE give the largest gains.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-16">
+<summary><span class="lvl design">Design</span> You must serve a 7B-class model with 32k contexts to as many concurrent users as possible on one 80 GB GPU. Which architectural and serving choices matter most?</summary>
+<div class="answer">
+<p>Start from memory: weights ~14–16 GB (BF16). KV per user at 32k: MHA 7B = 16 GiB (only ~4 users!), GQA-8 (Llama 3 8B-like) = 4 GiB (~15 users). Levers, in order: (1) choose a model with GQA/MLA or sliding-window layers (e.g. interleaved local/global attention cuts most layers' cache to the window); (2) FP8 KV cache (2×) or INT4 KV with careful calibration; (3) FP8/INT4 weights to free ~8–12 GB; (4) PagedAttention to avoid reserving 32k per user when most use far less (Little's law on actual lengths); (5) prefix caching if users share system prompts/documents; (6) KV offload to CPU memory for idle conversations; (7) admission control/preemption policy. Then check bandwidth: at 32k, KV reads per step dominate; expect TPOT to grow with total live tokens, so set an SLO-aware cap on concurrent live tokens rather than users.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-17">
+<summary><span class="lvl warm">Warm-up</span> What is the difference between the residual stream and the hidden size, and why does it matter for tensor parallelism?</summary>
+<div class="answer">
+<p>The residual stream is the \(d\)-dimensional vector per token that flows through all blocks and accumulates sub-layer outputs (\(x\leftarrow x+f(\mathrm{Norm}(x))\)); "hidden size" is its width \(d\). Sub-layers temporarily expand into other spaces (\(n_hd_h\) for attention, \(d_{ff}\) for the FFN) and project back to \(d\). Tensor parallelism (Megatron) splits those expanded spaces across GPUs—column-parallel first matrix, row-parallel second—so each GPU holds a slice of heads or FFN columns, and an all-reduce over the \(d\)-dimensional output re-forms the residual stream after each sub-layer: two all-reduces of \(B\times T\times d\) per block (Chapter 16).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ch02-qa-18">
+<summary><span class="lvl design">Design</span> An interviewer gives you a new model config and an accelerator spec sheet. Outline, step by step, how you'd predict TTFT and TPOT.</summary>
+<div class="answer">
+<ol>
+<li>From the config: compute \(N\) (and active \(N\) for MoE), weight bytes at the serving precision, KV bytes per token \(2Ln_{kv}d_hb\) (or the MLA/sliding-window variant).</li>
+<li>From the spec sheet: dense peak FLOP/s at the precision used (not the sparse number), HBM bandwidth, capacity; interconnect if multi-GPU. Ridge point \(P/\beta\).</li>
+<li>Fit: weights + KV(batch × context) + workspace ≤ capacity → decide TP degree / max batch.</li>
+<li>TTFT ≈ queueing + prefill FLOPs \((2N_{\text{mm}}n_{\text{in}}+2Ldn_{\text{in}}^2)\) / (P × MFU≈0.4–0.6) (+ TP communication).</li>
+<li>TPOT ≈ max((weight bytes/TP + per-GPU KV bytes)/(β × MBU≈0.7–0.85), compute time) + per-step overhead (~0.5–2 ms without CUDA graphs) + TP all-reduce latency × 2L.</li>
+<li>Sanity-check against known benchmarks; state assumptions; discuss which lever (quantisation, speculative decoding, batching, disaggregation) moves which term.</li>
+</ol>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-vaswani">A. Vaswani et al. Attention Is All You Need. <em>NeurIPS</em>, 2017. <a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762</a>.</li>
+<li id="r-llama">H. Touvron et al. LLaMA: Open and Efficient Foundation Language Models. <a href="https://arxiv.org/abs/2302.13971">arXiv:2302.13971</a>, 2023; Llama 2: <a href="https://arxiv.org/abs/2307.09288">arXiv:2307.09288</a>; Llama 3: <a href="https://arxiv.org/abs/2407.21783">arXiv:2407.21783</a>.</li>
+<li id="r-bpe">R. Sennrich, B. Haddow, A. Birch. Neural Machine Translation of Rare Words with Subword Units. <em>ACL</em>, 2016. <a href="https://arxiv.org/abs/1508.07909">arXiv:1508.07909</a>.</li>
+<li id="r-unigram">T. Kudo. Subword Regularization: Improving Neural Network Translation Models with Multiple Subword Candidates. <em>ACL</em>, 2018. <a href="https://arxiv.org/abs/1804.10959">arXiv:1804.10959</a>.</li>
+<li id="r-sp">T. Kudo and J. Richardson. SentencePiece: A simple and language independent subword tokenizer and detokenizer. <em>EMNLP</em>, 2018. <a href="https://arxiv.org/abs/1808.06226">arXiv:1808.06226</a>.</li>
+<li id="r-tie">O. Press and L. Wolf. Using the Output Embedding to Improve Language Models. <em>EACL</em>, 2017. <a href="https://arxiv.org/abs/1608.05859">arXiv:1608.05859</a>.</li>
+<li id="r-circuits">N. Elhage et al. A Mathematical Framework for Transformer Circuits. Anthropic, 2021. <a href="https://transformer-circuits.pub/2021/framework/index.html">transformer-circuits.pub</a>.</li>
+<li id="r-mqa">N. Shazeer. Fast Transformer Decoding: One Write-Head is All You Need. <a href="https://arxiv.org/abs/1911.02150">arXiv:1911.02150</a>, 2019.</li>
+<li id="r-gqa">J. Ainslie et al. GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints. <em>EMNLP</em>, 2023. <a href="https://arxiv.org/abs/2305.13245">arXiv:2305.13245</a>.</li>
+<li id="r-dsv2">DeepSeek-AI. DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model. <a href="https://arxiv.org/abs/2405.04434">arXiv:2405.04434</a>, 2024; DeepSeek-V3 Technical Report, <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>.</li>
+<li id="r-alibi">O. Press, N. A. Smith, M. Lewis. Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation. <em>ICLR</em>, 2022. <a href="https://arxiv.org/abs/2108.12409">arXiv:2108.12409</a>.</li>
+<li id="r-rope">J. Su et al. RoFormer: Enhanced Transformer with Rotary Position Embedding. <a href="https://arxiv.org/abs/2104.09864">arXiv:2104.09864</a>, 2021.</li>
+<li id="r-ln">J. L. Ba, J. R. Kiros, G. E. Hinton. Layer Normalization. <a href="https://arxiv.org/abs/1607.06450">arXiv:1607.06450</a>, 2016.</li>
+<li id="r-rms">B. Zhang and R. Sennrich. Root Mean Square Layer Normalization. <em>NeurIPS</em>, 2019. <a href="https://arxiv.org/abs/1910.07467">arXiv:1910.07467</a>.</li>
+<li id="r-preln">R. Xiong et al. On Layer Normalization in the Transformer Architecture. <em>ICML</em>, 2020. <a href="https://arxiv.org/abs/2002.04745">arXiv:2002.04745</a>.</li>
+<li id="r-gelu">D. Hendrycks and K. Gimpel. Gaussian Error Linear Units (GELUs). <a href="https://arxiv.org/abs/1606.08415">arXiv:1606.08415</a>, 2016.</li>
+<li id="r-glu">N. Shazeer. GLU Variants Improve Transformer. <a href="https://arxiv.org/abs/2002.05202">arXiv:2002.05202</a>, 2020.</li>
+<li id="r-roofline">S. Williams, A. Waterman, D. Patterson. Roofline: An Insightful Visual Performance Model for Multicore Architectures. <em>Communications of the ACM</em>, 52(4), 2009.</li>
+<li>J. Kaplan et al. Scaling Laws for Neural Language Models. <a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a>, 2020 (FLOP accounting, §2.1).</li>
+<li>R. Pope et al. Efficiently Scaling Transformer Inference. <em>MLSys</em>, 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a>.</li>
+<li>W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+<li>A. Q. Jiang et al. Mistral 7B. <a href="https://arxiv.org/abs/2310.06825">arXiv:2310.06825</a>, 2023.</li>
+<li>NVIDIA. H100 Tensor Core GPU Architecture (whitepaper), 2022.</li>
+<li>Further reading: J. Austin et al., <em>How to Scale Your Model</em>, chapters "All About Transformers" and "Transformer Inference" (Google DeepMind, 2025), <a href="https://jax-ml.github.io/scaling-book/">jax-ml.github.io/scaling-book</a>; kipply, "Transformer Inference Arithmetic" (2022), <a href="https://kipp.ly/transformer-inference-arithmetic/">kipp.ly</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>
