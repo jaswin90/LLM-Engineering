@@ -156,6 +156,13 @@
 <tr><td>\(\Delta_t\)</td><td>SSM discretisation step (Ch. 21 only; unrelated to the quantisation step of Ch. 14)</td></tr>
 <tr><td>\(d_s\)</td><td>SSM state size per channel (Mamba's \(N\))</td></tr>
 </tbody></table></div>
+<h2>Reasoning and test-time compute (Ch. 22)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_s\)</td><td>number of independent samples drawn for one problem (pass@\(n_s\), voting, best-of-\(n_s\))</td></tr>
+<tr><td>\(p_s\)</td><td>probability that a single sample solves the problem</td></tr>
+<tr><td>\(n_{\text{think}}\)</td><td>reasoning ("thinking") tokens generated before the answer</td></tr>
+<tr><td>\(\mathcal R_i\), \(\hat A_i\)</td><td>reward of rollout \(i\); its group-relative advantage (GRPO)</td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

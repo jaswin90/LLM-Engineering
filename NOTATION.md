@@ -151,6 +151,14 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(\Delta_t\) | SSM discretisation step (Ch. 21 only; unrelated to the quantisation step of Ch. 14) |
 | \(d_s\) | SSM state size per channel (Mamba's \(N\)) |
 
+## Reasoning and test-time compute (Ch. 22)
+| Symbol | Meaning |
+|---|---|
+| \(n_s\) | number of independent samples drawn for one problem (pass@\(n_s\), voting, best-of-\(n_s\)) |
+| \(p_s\) | probability that a single sample solves the problem |
+| \(n_{\text{think}}\) | reasoning ("thinking") tokens generated before the answer |
+| \(\mathcal R_i\), \(\hat A_i\) | reward of rollout \(i\); its group-relative advantage (GRPO) |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.
