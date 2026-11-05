@@ -159,6 +159,16 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(n_{\text{think}}\) | reasoning ("thinking") tokens generated before the answer |
 | \(\mathcal R_i\), \(\hat A_i\) | reward of rollout \(i\); its group-relative advantage (GRPO) |
 
+## Serving at scale (Ch. 23)
+| Symbol | Meaning |
+|---|---|
+| \(n_r\) | number of replicas behind a router |
+| \(u\) | utilisation: offered load divided by capacity |
+| \(n_c\) | replicas sampled per routing decision (power of \(n_c\) choices) |
+| \(W_{\downarrow}, W_{\uparrow}\), \(r_a\) | LoRA down- and up-projections and adapter rank; \(\Delta W=W_{\downarrow}W_{\uparrow}\) |
+| \(c_{\text{gpu}}\) | price of one GPU-hour, in dollars |
+| \(\Phi\), \(n_g\) | tokens per second produced by a replica at its operating point; GPUs per replica |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.

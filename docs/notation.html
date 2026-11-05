@@ -163,6 +163,15 @@
 <tr><td>\(n_{\text{think}}\)</td><td>reasoning ("thinking") tokens generated before the answer</td></tr>
 <tr><td>\(\mathcal R_i\), \(\hat A_i\)</td><td>reward of rollout \(i\); its group-relative advantage (GRPO)</td></tr>
 </tbody></table></div>
+<h2>Serving at scale (Ch. 23)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_r\)</td><td>number of replicas behind a router</td></tr>
+<tr><td>\(u\)</td><td>utilisation: offered load divided by capacity</td></tr>
+<tr><td>\(n_c\)</td><td>replicas sampled per routing decision (power of \(n_c\) choices)</td></tr>
+<tr><td>\(W_{\downarrow}, W_{\uparrow}\), \(r_a\)</td><td>LoRA down- and up-projections and adapter rank; \(\Delta W=W_{\downarrow}W_{\uparrow}\)</td></tr>
+<tr><td>\(c_{\text{gpu}}\)</td><td>price of one GPU-hour, in dollars</td></tr>
+<tr><td>\(\Phi\), \(n_g\)</td><td>tokens per second produced by a replica at its operating point; GPUs per replica</td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

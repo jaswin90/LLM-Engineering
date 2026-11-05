@@ -158,7 +158,7 @@ The book follows one causal chain. Each part answers the question the previous p
 ## Part VIII — Production
 
 ### Chapter 22 — Reasoning Models and Test-Time Compute ✅ *(v2)*
-### Chapter 23 — Serving at Scale: Routing, Autoscaling, Multi-LoRA and Cost
+### Chapter 23 — Serving at Scale: Routing, Autoscaling, Multi-LoRA and Cost ✅ *(v2)*
 ### Chapter 24 — Benchmarking, Observability and Evaluation
 ### Chapter 25 — On-Device and Edge Inference
 ### Chapter 26 — The ML-Systems Design Interview: Worked Case Studies
@@ -194,4 +194,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 20 | Long-Context Inference | ✅ v2 |
 | 21 | Beyond Attention: SSMs and Hybrids | ✅ v2 |
 | 22 | Reasoning Models and Test-Time Compute | ✅ v2 |
-| 23–26 | — | ⏳ planned |
+| 23 | Serving at Scale | ✅ v2 |
+| 24–26 | — | ⏳ planned |
