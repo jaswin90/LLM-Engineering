@@ -46,7 +46,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Hands off to Chapter 4:** "The model gives logits. How do we turn them into text?"
 **Key references.** Pope 2022; Williams 2009; Kaplan 2020; He 2022 (*Go Brrrr*); kipply 2022; Austin 2025; Kwon 2023.
 
-### Chapter 4 — Decoding: From Logits to Text
+### Chapter 4 — Decoding: From Logits to Text ✅ *(v2)*
 **Motivating question.** The model outputs a distribution. Which token should we emit, and how do we do that fast, controllably and reproducibly?
 **Arc.** Search vs sampling (greedy, beam, why beam search fails in open-ended generation) → temperature as a Gibbs distribution → truncation (top-k, top-p, min-p, typical) → penalties and logit processors → structured outputs (grammars → automata; XGrammar; jump-forward) → GPU sampling kernels → determinism and batch invariance → stopping, streaming and incremental detokenisation.
 **Refs.** Holtzman 2019; Meister 2023; Nguyen 2024 (min-p); Willard & Louf 2023; Dong 2024 (XGrammar); He & Thinking Machines 2025 (nondeterminism).
@@ -175,4 +175,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 1 | From Shannon to Serving | ✅ v2 (rewritten after Review 1) |
 | 2 | The Transformer, Dissected | ✅ v2 (rewritten, split) |
 | 3 | Running the Model: Prefill, Decode and the KV Cache | ✅ v2 (new) |
-| 4–26 | — | ⏳ planned |
+| 4 | Decoding: From Logits to Text | ✅ v2 |
+| 5–26 | — | ⏳ planned |

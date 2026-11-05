@@ -50,6 +50,11 @@
 <tr><td>\(W_1,W_3,W_2\)</td><td>SwiGLU gate, up and down projections</td></tr>
 <tr><td>\(W_E\in\mathbb R^{\lvert\mathcal V\rvert\times d}\), \(W_U\)</td><td>embedding table; unembedding (LM head)</td></tr>
 <tr><td>\(z\), \(\tau\)</td><td>logits; sampling temperature</td></tr>
+<tr><td>\(v\in\mathcal V\), \(p(v)\)</td><td>a vocabulary token; its next-token probability (Ch. 4)</td></tr>
+<tr><td>\(\kappa=1/\tau\)</td><td>inverse temperature (Ch. 4)</td></tr>
+<tr><td>\(n_{\text{top}}, p_{\text{top}}, p_{\min}\)</td><td>top-\(k\) count; top-\(p\) mass; min-\(p\) ratio (Ch. 4)</td></tr>
+<tr><td>\(n_{\text{beam}}\)</td><td>beam width (Ch. 4)</td></tr>
+<tr><td>\(\rho\), \(\xi_v\)</td><td>repetition-penalty factor; Gumbel noise for token \(v\) (Ch. 4)</td></tr>
 <tr><td>\(h_t\); \(h^{(\ell)}_j\)</td><td>recurrent hidden state (RNNs, Ch. 1); residual-stream vector of position \(j\) after layer \(\ell\) (Ch. 3 proofs)</td></tr>
 </tbody></table></div>
 <h2>Training and information</h2>

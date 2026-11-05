@@ -35,6 +35,11 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(W_1,W_3,W_2\) | SwiGLU gate, up and down projections |
 | \(W_E\in\mathbb R^{\lvert\mathcal V\rvert\times d}\), \(W_U\) | embedding table; unembedding (LM head) |
 | \(z\), \(\tau\) | logits; sampling temperature |
+| \(v\in\mathcal V\), \(p(v)\) | a vocabulary token; its next-token probability (Ch. 4) |
+| \(\kappa=1/\tau\) | inverse temperature (Ch. 4) |
+| \(n_{\text{top}}, p_{\text{top}}, p_{\min}\) | top-\(k\) count; top-\(p\) mass; min-\(p\) ratio (Ch. 4) |
+| \(n_{\text{beam}}\) | beam width (Ch. 4) |
+| \(\rho\), \(\xi_v\) | repetition-penalty factor; Gumbel noise for token \(v\) (Ch. 4) |
 | \(h_t\); \(h^{(\ell)}_j\) | recurrent hidden state (RNNs, Ch. 1); residual-stream vector of position \(j\) after layer \(\ell\) (Ch. 3 proofs) |
 
 ## Training and information
