@@ -104,6 +104,13 @@
 <tr><td>\(u_j\), \(\alpha_s\)</td><td>SmoothQuant per-channel scales and migration strength</td></tr>
 <tr><td>\(R\)</td><td>orthogonal rotation (QuaRot, SpinQuant); \(\mathcal H_d\) a \(d\times d\) Hadamard matrix</td></tr>
 </tbody></table></div>
+<h2>Pruning and distillation (Ch. 15)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\eta\)</td><td>sparsity: fraction of weights (or activations) that are zero</td></tr>
+<tr><td>\(p_a\)</td><td>probability that an FFN neuron is active for a given token (contextual sparsity)</td></tr>
+<tr><td>\(p_{\text{te}}\), \(p_{\text{st}}\)</td><td>teacher and student next-token distributions (distillation)</td></tr>
+<tr><td>\(\mathrm{KL}(p\,\Vert\,q)\)</td><td>Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\)</td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

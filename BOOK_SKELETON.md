@@ -117,7 +117,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Number formats (FP8, INT4, MXFP4, NVFP4) → quantisation as lattice rounding, error analysis, outliers → LLM.int8, SmoothQuant → GPTQ, AWQ → rotations (QuaRot, SpinQuant) → FP8/FP4 in practice → what actually speeds up.
 **Refs.** Dettmers 2022; Xiao 2022; Frantar 2022; Lin 2023; Ashkboos 2024; Kurtic 2024; OCP MX 2023.
 
-### Chapter 15 — Pruning, Sparsity and Distillation
+### Chapter 15 — Pruning, Sparsity and Distillation ✅ *(v2)*
 **Refs.** Frantar & Alistarh 2023; Sun 2023; Muralidharan 2024; Hinton 2015; Agarwal 2024; Liu 2023.
 
 ---
@@ -186,4 +186,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 12 | Inside an Inference Engine | ✅ v2 |
 | 13 | Disaggregated Serving | ✅ v2 |
 | 14 | Quantisation | ✅ v2 |
-| 15–26 | — | ⏳ planned |
+| 15 | Pruning, Sparsity and Distillation | ✅ v2 |
+| 16–26 | — | ⏳ planned |

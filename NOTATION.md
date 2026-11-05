@@ -93,6 +93,14 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(u_j\), \(\alpha_s\) | SmoothQuant per-channel scales and migration strength |
 | \(R\) | orthogonal rotation (QuaRot, SpinQuant); \(\mathcal H_d\) a \(d\times d\) Hadamard matrix |
 
+## Pruning and distillation (Ch. 15)
+| Symbol | Meaning |
+|---|---|
+| \(\eta\) | sparsity: fraction of weights (or activations) that are zero |
+| \(p_a\) | probability that an FFN neuron is active for a given token (contextual sparsity) |
+| \(p_{\text{te}}\), \(p_{\text{st}}\) | teacher and student next-token distributions (distillation) |
+| \(\mathrm{KL}(p\,\Vert\,q)\) | Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\) |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.
