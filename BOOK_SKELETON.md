@@ -160,7 +160,7 @@ The book follows one causal chain. Each part answers the question the previous p
 ### Chapter 22 — Reasoning Models and Test-Time Compute ✅ *(v2)*
 ### Chapter 23 — Serving at Scale: Routing, Autoscaling, Multi-LoRA and Cost ✅ *(v2)*
 ### Chapter 24 — Benchmarking, Observability and Evaluation ✅ *(v2)*
-### Chapter 25 — On-Device and Edge Inference
+### Chapter 25 — On-Device and Edge Inference ✅ *(v2)*
 ### Chapter 26 — The ML-Systems Design Interview: Worked Case Studies
 (These chapters keep the content listed in v1 of this skeleton; their detailed arcs will be written when Part VI is complete.)
 
@@ -196,4 +196,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 22 | Reasoning Models and Test-Time Compute | ✅ v2 |
 | 23 | Serving at Scale | ✅ v2 |
 | 24 | Benchmarking, Observability and Evaluation | ✅ v2 |
-| 25–26 | — | ⏳ planned |
+| 25 | On-Device and Edge Inference | ✅ v2 |
+| 26 | — | ⏳ planned |
