@@ -74,7 +74,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ## Part III — Attention and Memory
 
-### Chapter 8 — The KV Cache: Shrinking It
+### Chapter 8 — The KV Cache: Shrinking It ✅ *(v2)*
 **Motivating question.** The cache limits batch size and dominates decode traffic. How small can we make it without hurting quality?
 **Arc.** MQA → GQA → MLA (derivation and weight absorption) → sliding-window and local/global hybrids → cross-layer sharing → KV quantisation → eviction (attention sinks, H2O, SnapKV) and why reasoning models break it.
 **Refs.** Shazeer 2019; Ainslie 2023; DeepSeek-V2 2024; Xiao 2023; Zhang 2023; Liu 2024 (KIVI); Brandon 2024.
@@ -179,4 +179,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 5 | GPU Architecture from First Principles | ✅ v2 |
 | 6 | The Roofline Model and Performance Analysis | ✅ v2 |
 | 7 | GPU Programming for Mathematicians | ✅ v2 |
-| 8–26 | — | ⏳ planned |
+| 8 | The KV Cache: Shrinking It | ✅ v2 |
+| 9–26 | — | ⏳ planned |

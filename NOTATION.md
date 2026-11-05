@@ -33,6 +33,9 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(S, P, O\) | attention scores, attention probabilities, attention output |
 | \(M\) | causal mask (\(0\) or \(-\infty\)) |
 | \(W_1,W_3,W_2\) | SwiGLU gate, up and down projections |
+| \(d_c\), \(d_h^R\), \(c_t\) | MLA latent dimension (512), decoupled RoPE dimension (64), cached latent of token \(t\) (Ch. 8) |
+| \(W_{DKV}, W_{UK}, W_{UV}\) | MLA down-projection and key/value up-projections (Ch. 8) |
+| \(w\), \(\phi\) | attention window size; fraction of global (full-attention) layers (Ch. 8) |
 | \(W_E\in\mathbb R^{\lvert\mathcal V\rvert\times d}\), \(W_U\) | embedding table; unembedding (LM head) |
 | \(z\), \(\tau\) | logits; sampling temperature |
 | \(v\in\mathcal V\), \(p(v)\) | a vocabulary token; its next-token probability (Ch. 4) |

@@ -48,6 +48,9 @@
 <tr><td>\(S, P, O\)</td><td>attention scores, attention probabilities, attention output</td></tr>
 <tr><td>\(M\)</td><td>causal mask (\(0\) or \(-\infty\))</td></tr>
 <tr><td>\(W_1,W_3,W_2\)</td><td>SwiGLU gate, up and down projections</td></tr>
+<tr><td>\(d_c\), \(d_h^R\), \(c_t\)</td><td>MLA latent dimension (512), decoupled RoPE dimension (64), cached latent of token \(t\) (Ch. 8)</td></tr>
+<tr><td>\(W_{DKV}, W_{UK}, W_{UV}\)</td><td>MLA down-projection and key/value up-projections (Ch. 8)</td></tr>
+<tr><td>\(w\), \(\phi\)</td><td>attention window size; fraction of global (full-attention) layers (Ch. 8)</td></tr>
 <tr><td>\(W_E\in\mathbb R^{\lvert\mathcal V\rvert\times d}\), \(W_U\)</td><td>embedding table; unembedding (LM head)</td></tr>
 <tr><td>\(z\), \(\tau\)</td><td>logits; sampling temperature</td></tr>
 <tr><td>\(v\in\mathcal V\), \(p(v)\)</td><td>a vocabulary token; its next-token probability (Ch. 4)</td></tr>

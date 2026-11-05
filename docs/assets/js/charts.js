@@ -31,6 +31,7 @@
     if (a >= 1e9) return +(v / 1e9).toPrecision(3) + 'B';
     if (a >= 1e6) return +(v / 1e6).toPrecision(3) + 'M';
     if (a >= 1e4) return +(v / 1e3).toPrecision(3) + 'k';
+    if (a >= 1000) return String(Math.round(v));
     if (a > 0 && a < 0.01) return v.toExponential(0);
     return String(+v.toPrecision(3));
   }
