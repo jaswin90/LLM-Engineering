@@ -112,7 +112,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ## Part V — Making Models Smaller
 
-### Chapter 14 — Quantisation
+### Chapter 14 — Quantisation ✅ *(v2)*
 **Motivating question.** Decode time is proportional to bytes read. How few bits per weight and per cache entry can we use?
 **Arc.** Number formats (FP8, INT4, MXFP4, NVFP4) → quantisation as lattice rounding, error analysis, outliers → LLM.int8, SmoothQuant → GPTQ, AWQ → rotations (QuaRot, SpinQuant) → FP8/FP4 in practice → what actually speeds up.
 **Refs.** Dettmers 2022; Xiao 2022; Frantar 2022; Lin 2023; Ashkboos 2024; Kurtic 2024; OCP MX 2023.
@@ -185,4 +185,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 11 | Batching and Scheduling | ✅ v2 |
 | 12 | Inside an Inference Engine | ✅ v2 |
 | 13 | Disaggregated Serving | ✅ v2 |
-| 14–26 | — | ⏳ planned |
+| 14 | Quantisation | ✅ v2 |
+| 15–26 | — | ⏳ planned |

@@ -81,6 +81,18 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(\chi\) | KV-transfer ratio: time to send a prompt's KV cache divided by the time to prefill it (Ch. 13) |
 | \(n_P\), \(n_D\) | numbers of prefill and decode GPUs in a disaggregated deployment (Ch. 13) |
 
+## Quantisation (Ch. 14)
+| Symbol | Meaning |
+|---|---|
+| \(n_b\) | bits per quantised element |
+| \(n_g\) | group (block) size: number of elements sharing one scale |
+| \(\Delta\), \(\zeta\) | quantisation step (scale) and zero point; \(\hat x=\Delta\,(q-\zeta)\) |
+| \(\hat W\), \(\hat x\) | quantised (dequantised) weight matrix or value |
+| \(r_c\) | crest factor \(\max_j\lvert x_j\rvert/\operatorname{rms}(x)\) of a block |
+| \(\Sigma=XX^\top\) | second-moment (Gram) matrix of a layer's calibration inputs (GPTQ) |
+| \(u_j\), \(\alpha_s\) | SmoothQuant per-channel scales and migration strength |
+| \(R\) | orthogonal rotation (QuaRot, SpinQuant); \(\mathcal H_d\) a \(d\times d\) Hadamard matrix |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.
