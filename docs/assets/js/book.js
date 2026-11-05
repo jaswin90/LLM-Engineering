@@ -18,7 +18,7 @@
     { id: 'ch07', n: 7, part: 'II', title: 'GPU Programming for Mathematicians', sub: 'CUDA, Triton, tiling, online softmax, fusion, CUDA graphs', file: 'chapters/ch07.html', ready: true },
     { id: 'ch08', n: 8, part: 'III', title: 'The KV Cache: Shrinking It', sub: 'MQA, GQA, MLA, sliding windows, KV quantisation, eviction', file: 'chapters/ch08.html', ready: true },
     { id: 'ch09', n: 9, part: 'III', title: 'IO-Aware Attention: FlashAttention 1 → 4', sub: 'Tiling, online softmax, FlashDecoding, FlashInfer, FlashMLA', file: 'chapters/ch09.html', ready: true },
-    { id: 'ch10', n: 10, part: 'III', title: 'Memory Management: PagedAttention and Prefix Caching', sub: 'Block tables, copy-on-write, radix trees, KV hierarchies', ready: false },
+    { id: 'ch10', n: 10, part: 'III', title: 'Memory Management: PagedAttention and Prefix Caching', sub: 'Block tables, copy-on-write, radix trees, KV hierarchies', file: 'chapters/ch10.html', ready: true },
     { id: 'ch11', n: 11, part: 'IV', title: 'Batching and Scheduling', sub: 'Continuous batching, chunked prefill, preemption, SLO-aware scheduling', ready: false },
     { id: 'ch12', n: 12, part: 'IV', title: 'Inside an Inference Engine', sub: 'vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp', ready: false },
     { id: 'ch13', n: 13, part: 'IV', title: 'Disaggregated Serving', sub: 'Splitwise, DistServe, Mooncake, Dynamo, KV transfer', ready: false },

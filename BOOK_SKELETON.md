@@ -84,7 +84,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** IO complexity → online softmax derivation → FA1 tiling → FA2 → FA3 (Hopper asynchrony, FP8) → FA4 (Blackwell) → decode kernels (FlashDecoding, FlashInfer) → MLA and sparse kernels.
 **Refs.** Dao 2022/2023; Shah 2024; FA4 2026; Rabe & Staats 2021; Ye 2025.
 
-### Chapter 10 — Memory Management: PagedAttention and Prefix Caching
+### Chapter 10 — Memory Management: PagedAttention and Prefix Caching ✅ *(v2)*
 **Motivating question.** Sequences grow unpredictably. How do we allocate KV memory without wasting most of it, and reuse work across requests?
 **Arc.** Fragmentation → paging and block tables → copy-on-write → prefix caching (hash chains vs radix trees) → eviction policy → hierarchical KV storage (CPU, SSD, remote: LMCache, Mooncake Store) → vAttention.
 **Refs.** Kwon 2023; Zheng 2024; Prabhu 2024; Qin 2025.
@@ -181,4 +181,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 7 | GPU Programming for Mathematicians | ✅ v2 |
 | 8 | The KV Cache: Shrinking It | ✅ v2 |
 | 9 | IO-Aware Attention: FlashAttention 1 → 4 | ✅ v2 |
-| 10–26 | — | ⏳ planned |
+| 10 | Memory Management: PagedAttention and Prefix Caching | ✅ v2 |
+| 11–26 | — | ⏳ planned |
