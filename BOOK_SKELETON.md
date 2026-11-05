@@ -141,7 +141,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ## Part VII — Faster Decoding and Longer Contexts
 
-### Chapter 19 — Speculative Decoding
+### Chapter 19 — Speculative Decoding ✅ *(v2)*
 **Arc.** Exactness via rejection sampling (proof) → expected speed-up → drafts (small models, n-grams, Medusa, EAGLE 1–3, MTP) → tree verification → speculation under batching.
 **Refs.** Leviathan 2023; Chen 2023; Cai 2024; Li 2024/2025.
 
@@ -190,4 +190,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 16 | Distributed Computing Fundamentals | ✅ v2 |
 | 17 | Parallelism Strategies for Inference | ✅ v2 |
 | 18 | Mixture of Experts at Inference | ✅ v2 |
-| 19–26 | — | ⏳ planned |
+| 19 | Speculative Decoding | ✅ v2 |
+| 20–26 | — | ⏳ planned |

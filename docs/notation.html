@@ -131,6 +131,14 @@
 <tr><td>\(f_i\), \(\bar p_i\)</td><td>fraction of tokens routed to expert \(i\); mean router probability of expert \(i\)</td><td></td></tr>
 <tr><td>\(\omega_i\)</td><td>routing bias of expert \(i\) (auxiliary-loss-free balancing)</td><td></td></tr>
 </tbody></table></div>
+<h2>Speculative decoding (Ch. 19)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(q(v)\)</td><td>draft model's next-token distribution (the target's is \(p(v)\))</td></tr>
+<tr><td>\(\gamma\)</td><td>number of draft tokens proposed per verification step</td></tr>
+<tr><td>\(a\)</td><td>per-token acceptance probability, \(a=\sum_v\min(p(v),q(v))=1-\mathrm{TV}(p,q)\)</td></tr>
+<tr><td>\(n_{\text{acc}}\)</td><td>tokens produced per verification step (accepted drafts plus one)</td></tr>
+<tr><td>\(c_d\)</td><td>cost of one draft step relative to one target decode step</td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

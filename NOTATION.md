@@ -123,6 +123,15 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(f_i\), \(\bar p_i\) | fraction of tokens routed to expert \(i\); mean router probability of expert \(i\) | |
 | \(\omega_i\) | routing bias of expert \(i\) (auxiliary-loss-free balancing) | |
 
+## Speculative decoding (Ch. 19)
+| Symbol | Meaning |
+|---|---|
+| \(q(v)\) | draft model's next-token distribution (the target's is \(p(v)\)) |
+| \(\gamma\) | number of draft tokens proposed per verification step |
+| \(a\) | per-token acceptance probability, \(a=\sum_v\min(p(v),q(v))=1-\mathrm{TV}(p,q)\) |
+| \(n_{\text{acc}}\) | tokens produced per verification step (accepted drafts plus one) |
+| \(c_d\) | cost of one draft step relative to one target decode step |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.
