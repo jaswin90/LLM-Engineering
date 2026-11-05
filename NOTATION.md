@@ -132,6 +132,15 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(n_{\text{acc}}\) | tokens produced per verification step (accepted drafts plus one) |
 | \(c_d\) | cost of one draft step relative to one target decode step |
 
+## Long context (Ch. 20)
+| Symbol | Meaning |
+|---|---|
+| \(T_{\text{train}}\) | longest context seen in (pre-)training |
+| \(\mu\) | context-extension factor, target length \(/\,T_{\text{train}}\) |
+| \(\Lambda_r=2\pi/\theta_r\) | wavelength (in tokens) of RoPE frequency pair \(r\) |
+| \(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\) | rotations pair \(r\) completes over the training length; \(c_{\text{lo}},c_{\text{hi}}\) YaRN ramp thresholds |
+| \(k_s\) | tokens (or blocks) selected per query by sparse attention |
+
 ## Units
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.

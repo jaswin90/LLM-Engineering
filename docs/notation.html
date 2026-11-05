@@ -139,6 +139,14 @@
 <tr><td>\(n_{\text{acc}}\)</td><td>tokens produced per verification step (accepted drafts plus one)</td></tr>
 <tr><td>\(c_d\)</td><td>cost of one draft step relative to one target decode step</td></tr>
 </tbody></table></div>
+<h2>Long context (Ch. 20)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(T_{\text{train}}\)</td><td>longest context seen in (pre-)training</td></tr>
+<tr><td>\(\mu\)</td><td>context-extension factor, target length \(/\,T_{\text{train}}\)</td></tr>
+<tr><td>\(\Lambda_r=2\pi/\theta_r\)</td><td>wavelength (in tokens) of RoPE frequency pair \(r\)</td></tr>
+<tr><td>\(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\)</td><td>rotations pair \(r\) completes over the training length; \(c_{\text{lo}},c_{\text{hi}}\) YaRN ramp thresholds</td></tr>
+<tr><td>\(k_s\)</td><td>tokens (or blocks) selected per query by sparse attention</td></tr>
+</tbody></table></div>
 <h2>Units</h2>
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>

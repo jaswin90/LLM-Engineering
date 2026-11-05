@@ -145,7 +145,7 @@ The book follows one causal chain. Each part answers the question the previous p
 **Arc.** Exactness via rejection sampling (proof) → expected speed-up → drafts (small models, n-grams, Medusa, EAGLE 1–3, MTP) → tree verification → speculation under batching.
 **Refs.** Leviathan 2023; Chen 2023; Cai 2024; Li 2024/2025.
 
-### Chapter 20 — Long-Context Inference
+### Chapter 20 — Long-Context Inference ✅ *(v2)*
 **Arc.** Position extrapolation (PI, NTK, YaRN) → sparse attention (NSA, DSA) → context parallelism and offload → retrieval vs long context.
 **Refs.** Chen 2023; Peng 2023; Yuan 2025.
 
@@ -191,4 +191,5 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 17 | Parallelism Strategies for Inference | ✅ v2 |
 | 18 | Mixture of Experts at Inference | ✅ v2 |
 | 19 | Speculative Decoding | ✅ v2 |
-| 20–26 | — | ⏳ planned |
+| 20 | Long-Context Inference | ✅ v2 |
+| 21–26 | — | ⏳ planned |
