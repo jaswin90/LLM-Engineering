@@ -26,6 +26,7 @@ const MESSAGES = {
   'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.',
   'auth/network-request-failed': 'Network error. Check your connection and try again.',
   'auth/operation-not-allowed': 'This sign-in method is not enabled for the book yet.',
+  'auth/configuration-not-found': 'Accounts are still being set up for this book. Please try again later; your progress is saved in this browser meanwhile.',
   'auth/popup-closed-by-user': 'The Google window was closed before signing in.'
 };
 const msgOf = e => MESSAGES[e && e.code] || ('Something went wrong (' + ((e && (e.code || e.message)) || 'unknown') + ').');
