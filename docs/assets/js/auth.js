@@ -41,7 +41,8 @@ async function main() {
   ]);
   const app = initializeApp(firebaseConfig);
   const auth = A.getAuth(app);
-  const db = F.getFirestore(app);
+  // ignoreUndefinedProperties: records with a missing field (e.g. no title) must not make the whole write fail.
+  const db = F.initializeFirestore(app, { ignoreUndefinedProperties: true });
   const provider = new A.GoogleAuthProvider();
   const returnUrl = () => location.origin + location.pathname;
   BookAuth.configured = true;
@@ -206,15 +207,21 @@ async function main() {
     const patch = pending; pending = {};
     if (!Object.keys(patch).length) return;
     try { await F.setDoc(F.doc(db, 'users', u.uid), Object.assign(patch, { updatedAt: F.serverTimestamp() }), { merge: true }); }
-    catch (e) { console.error('sync failed', e); Book.toast('Could not sync progress (offline?) — will retry on next change.'); }
+    catch (e) { console.error('sync failed', e); Object.assign(pending, patch); Book.toast(syncMsg(e)); }
   }
   async function pushAll() {
     const u = BookAuth.user; if (!u || !ready) return;
     const d = Book.store.data;
     try { await F.setDoc(F.doc(db, 'users', u.uid), { items: d.items, chapters: d.chapters, updatedAt: F.serverTimestamp(), profile: { name: u.displayName || '', email: u.email || '' } }); }
-    catch (e) { console.error(e); }
+    catch (e) { console.error(e); throw e; }
   }
   Book.store.onChange(queue);
+  function syncMsg(e) {
+    const c = (e && e.code) || '';
+    if (/permission-denied/.test(c)) return 'Sync refused (permission-denied): confirm your email, then sign out and in again. Progress is safe in this browser.';
+    if (/unavailable|network/.test(c)) return 'Offline: progress is saved in this browser and will sync on your next change.';
+    return 'Sync failed (' + (c || (e && e.message) || 'unknown') + '). Progress is saved in this browser.';
+  }
 
   function markPending(user) {
     const chip = document.querySelector('#auth-slot .user-chip'); if (!chip || chip.querySelector('.confirm-btn')) return;
@@ -228,6 +235,8 @@ async function main() {
     BookAuth.user = user; ready = false;
     Book.renderAuth(user, false);
     try {
+      // A token issued before the email was confirmed lacks email_verified, and the security rules refuse it.
+      if (isPasswordUser(user)) await user.getIdToken(true);
       const snap = await F.getDoc(F.doc(db, 'users', user.uid));
       if (snap.exists()) Book.store.merge(snap.data());
       ready = true;
@@ -235,7 +244,7 @@ async function main() {
       Book.renderAuth(user, true);
       const note = document.getElementById('sync-note'); if (note) note.textContent = 'Synced to your account';
       Book.toast('Progress synced with your account');
-    } catch (e) { console.error(e); Book.toast('Signed in, but sync failed: ' + (e.code || e.message)); }
+    } catch (e) { console.error(e); Book.toast(syncMsg(e)); }
   }
 
   A.onAuthStateChanged(auth, user => {
