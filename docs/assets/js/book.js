@@ -24,19 +24,23 @@
     { id: 'ch13', n: 13, part: 'IV', title: 'Disaggregated Serving', sub: 'Splitwise, DistServe, Mooncake, Dynamo, KV transfer', file: 'chapters/ch13.html', ready: true },
     { id: 'ch14', n: 14, part: 'V', title: 'Quantisation', sub: 'FP8, INT4, MXFP4/NVFP4, GPTQ, AWQ, SmoothQuant, rotations', file: 'chapters/ch14.html', ready: true },
     { id: 'ch15', n: 15, part: 'V', title: 'Pruning, Sparsity and Distillation', sub: 'SparseGPT, Wanda, 2:4, Minitron, distillation', file: 'chapters/ch15.html', ready: true },
-    { id: 'ch16', n: 16, part: 'VI', title: 'Distributed Computing Fundamentals', sub: 'Collectives, the α–β model, ring all-reduce, NVLink, InfiniBand, NCCL', file: 'chapters/ch16.html', ready: true },
-    { id: 'ch17', n: 17, part: 'VI', title: 'Parallelism Strategies for Inference', sub: 'Tensor, pipeline, sequence and context parallelism', file: 'chapters/ch17.html', ready: true },
-    { id: 'ch18', n: 18, part: 'VI', title: 'Mixture of Experts at Inference', sub: 'Routing, expert parallelism, all-to-all, the DeepSeek-V3 deployment', file: 'chapters/ch18.html', ready: true },
-    { id: 'ch19', n: 19, part: 'VII', title: 'Speculative Decoding', sub: 'Exactness proof, Medusa, EAGLE 1–3, MTP, tree verification', file: 'chapters/ch19.html', ready: true },
-    { id: 'ch20', n: 20, part: 'VII', title: 'Long-Context Inference', sub: 'RoPE scaling, sparse attention, context parallelism', file: 'chapters/ch20.html', ready: true },
-    { id: 'ch21', n: 21, part: 'VII', title: 'Beyond Attention: SSMs and Hybrids', sub: 'Linear attention, Mamba, RWKV, hybrid models', file: 'chapters/ch21.html', ready: true },
-    { id: 'ch22', n: 22, part: 'VIII', title: 'Reasoning Models and Test-Time Compute', sub: 'o1/R1, inference scaling, long-output serving', file: 'chapters/ch22.html', ready: true },
-    { id: 'ch23', n: 23, part: 'VIII', title: 'Serving at Scale', sub: 'Routing, autoscaling, multi-LoRA, cost modelling', file: 'chapters/ch23.html', ready: true },
-    { id: 'ch24', n: 24, part: 'VIII', title: 'Benchmarking and Observability', sub: 'Methodology, MLPerf, tracing, quality regressions', file: 'chapters/ch24.html', ready: true },
-    { id: 'ch25', n: 25, part: 'VIII', title: 'On-Device and Edge Inference', sub: 'llama.cpp, GGUF, MLX, NPUs', file: 'chapters/ch25.html', ready: true },
-    { id: 'ch26', n: 26, part: 'VIII', title: 'The ML-Systems Design Interview', sub: 'Worked case studies and rubrics', file: 'chapters/ch26.html', ready: true }
+    { id: 'ch27', n: 16, part: 'V', title: 'Fine-Tuning and Parameter-Efficient Adaptation', sub: 'Full fine-tuning, LoRA, QLoRA, DoRA, adapters', file: 'chapters/ch27.html', ready: false },
+    { id: 'ch16', n: 17, part: 'VI', title: 'Distributed Computing Fundamentals', sub: 'Collectives, the α–β model, ring all-reduce, NVLink, InfiniBand, NCCL', file: 'chapters/ch16.html', ready: true },
+    { id: 'ch17', n: 18, part: 'VI', title: 'Parallelism Strategies for Inference', sub: 'Tensor, pipeline, sequence and context parallelism', file: 'chapters/ch17.html', ready: true },
+    { id: 'ch18', n: 19, part: 'VI', title: 'Mixture of Experts at Inference', sub: 'Routing, expert parallelism, all-to-all, the DeepSeek-V3 deployment', file: 'chapters/ch18.html', ready: true },
+    { id: 'ch19', n: 20, part: 'VII', title: 'Speculative Decoding', sub: 'Exactness proof, Medusa, EAGLE 1–3, MTP, tree verification', file: 'chapters/ch19.html', ready: true },
+    { id: 'ch20', n: 21, part: 'VII', title: 'Long-Context Inference', sub: 'RoPE scaling, sparse attention, context parallelism', file: 'chapters/ch20.html', ready: true },
+    { id: 'ch21', n: 22, part: 'VII', title: 'Beyond Attention: SSMs and Hybrids', sub: 'Linear attention, Mamba, RWKV, hybrid models', file: 'chapters/ch21.html', ready: true },
+    { id: 'ch28', n: 23, part: 'VIII', title: 'Reinforcement Learning for Language Models', sub: 'Policy gradients, advantages, KL control, PPO', file: 'chapters/ch28.html', ready: false },
+    { id: 'ch29', n: 24, part: 'VIII', title: 'Learning from Human Preferences', sub: 'Reward models, RLHF, DPO and its variants', file: 'chapters/ch29.html', ready: false },
+    { id: 'ch30', n: 25, part: 'VIII', title: 'Reinforcement Learning with Verifiable Rewards', sub: 'GRPO, DAPO, process rewards, rollout systems', file: 'chapters/ch30.html', ready: false },
+    { id: 'ch22', n: 26, part: 'VIII', title: 'Reasoning Models and Test-Time Compute', sub: 'o1/R1, inference scaling, long-output serving', file: 'chapters/ch22.html', ready: true },
+    { id: 'ch23', n: 27, part: 'IX', title: 'Serving at Scale', sub: 'Routing, autoscaling, multi-LoRA, cost modelling', file: 'chapters/ch23.html', ready: true },
+    { id: 'ch24', n: 28, part: 'IX', title: 'Benchmarking and Observability', sub: 'Methodology, MLPerf, tracing, quality regressions', file: 'chapters/ch24.html', ready: true },
+    { id: 'ch25', n: 29, part: 'IX', title: 'On-Device and Edge Inference', sub: 'llama.cpp, GGUF, MLX, NPUs', file: 'chapters/ch25.html', ready: true },
+    { id: 'ch26', n: 30, part: 'IX', title: 'The ML-Systems Design Interview', sub: 'Worked case studies and rubrics', file: 'chapters/ch26.html', ready: true }
   ];
-  const PARTS = { I: 'Foundations: What We Run and Why It Is Expensive', II: 'The Machine: Hardware for Mathematicians', III: 'Attention and Memory', IV: 'Serving Systems', V: 'Making Models Smaller', VI: 'Distributed Inference', VII: 'Faster Decoding and Longer Contexts', VIII: 'Production' };
+  const PARTS = { I: 'Foundations: What We Run and Why It Is Expensive', II: 'The Machine: Hardware for Mathematicians', III: 'Attention and Memory', IV: 'Serving Systems', V: 'Making Models Smaller and Adapting Them', VI: 'Distributed Inference', VII: 'Faster Decoding and Longer Contexts', VIII: 'Post-Training: Reinforcement Learning, Alignment and Reasoning', IX: 'Production' };
 
   /* ------------------------------------------------------------------ store */
   const KEY = 'llmeng-progress-v1';

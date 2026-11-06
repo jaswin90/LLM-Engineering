@@ -110,7 +110,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ---
 
-## Part V — Making Models Smaller
+## Part V — Making Models Smaller and Adapting Them
 
 ### Chapter 14 — Quantisation ✅ *(v2)*
 **Motivating question.** Decode time is proportional to bytes read. How few bits per weight and per cache entry can we use?
@@ -122,18 +122,21 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ---
 
+### Chapter 16 — Fine-Tuning and Parameter-Efficient Adaptation ⏳ *(v3, new)*
+- Why adapt; the memory bill of full fine-tuning (weights, gradients, Adam, activations); the low-rank hypothesis and intrinsic dimension; LoRA derivation, initialisation, \(\alpha/r\) scaling, merging; which matrices and which rank; QLoRA (NF4, double quantisation, paged optimisers); DoRA, rsLoRA, LoRA+; adapters, prefix and prompt tuning, IA³; choosing a method; bridge to multi-LoRA serving (Ch 27).
+
 ## Part VI — Distributed Inference
 
-### Chapter 16 — Distributed Computing Fundamentals ✅ *(v2)*
+### Chapter 17 — Distributed Computing Fundamentals ✅ *(v2)*
 **Motivating question.** The model or its cache does not fit on one GPU. What does it cost to move data between GPUs?
 **Arc.** Collectives as linear-algebra operations → the α–β cost model → ring and tree all-reduce (proof of bandwidth optimality) → NVLink, InfiniBand, RoCE, topologies → NCCL, NVSHMEM, overlap.
 **Refs.** Thakur 2005; Patarasuk & Yuan 2009; NCCL docs.
 
-### Chapter 17 — Parallelism Strategies for Inference ✅ *(v2)*
+### Chapter 18 — Parallelism Strategies for Inference ✅ *(v2)*
 **Arc.** Data parallelism → tensor parallelism (Megatron) → pipeline parallelism → sequence and context parallelism (Ring, Ulysses) → choosing a configuration.
 **Refs.** Shoeybi 2019; Narayanan 2021; Pope 2022; Liu 2023; Jacobs 2023.
 
-### Chapter 18 — Mixture of Experts at Inference ✅ *(v2)*
+### Chapter 19 — Mixture of Experts at Inference ✅ *(v2)*
 **Arc.** From Shazeer 2017 to DeepSeek-V3 and Kimi K2 → routing and balancing → expert parallelism (all-to-all, DeepEP, EPLB) → MoE arithmetic intensity → the DeepSeek-V3 deployment case study.
 **Refs.** Shazeer 2017; Fedus 2021; Jiang 2024; DeepSeek-AI 2024/2025.
 
@@ -141,27 +144,40 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ## Part VII — Faster Decoding and Longer Contexts
 
-### Chapter 19 — Speculative Decoding ✅ *(v2)*
+### Chapter 20 — Speculative Decoding ✅ *(v2)*
 **Arc.** Exactness via rejection sampling (proof) → expected speed-up → drafts (small models, n-grams, Medusa, EAGLE 1–3, MTP) → tree verification → speculation under batching.
 **Refs.** Leviathan 2023; Chen 2023; Cai 2024; Li 2024/2025.
 
-### Chapter 20 — Long-Context Inference ✅ *(v2)*
+### Chapter 21 — Long-Context Inference ✅ *(v2)*
 **Arc.** Position extrapolation (PI, NTK, YaRN) → sparse attention (NSA, DSA) → context parallelism and offload → retrieval vs long context.
 **Refs.** Chen 2023; Peng 2023; Yuan 2025.
 
-### Chapter 21 — Beyond Attention: SSMs, Linear Attention and Hybrids ✅ *(v2)*
+### Chapter 22 — Beyond Attention: SSMs, Linear Attention and Hybrids ✅ *(v2)*
 **Arc.** Linear attention as an RNN → S4 → Mamba → Mamba-2 → RWKV, Gated DeltaNet → hybrids and their serving implications.
 **Refs.** Katharopoulos 2020; Gu & Dao 2023; Dao & Gu 2024; Lieber 2024.
 
 ---
 
-## Part VIII — Production
+## Part VIII — Post-Training: Reinforcement Learning, Alignment and Reasoning
 
-### Chapter 22 — Reasoning Models and Test-Time Compute ✅ *(v2)*
-### Chapter 23 — Serving at Scale: Routing, Autoscaling, Multi-LoRA and Cost ✅ *(v2)*
-### Chapter 24 — Benchmarking, Observability and Evaluation ✅ *(v2)*
-### Chapter 25 — On-Device and Edge Inference ✅ *(v2)*
-### Chapter 26 — The ML-Systems Design Interview: Worked Case Studies ✅ *(v2)*
+### Chapter 23 — Reinforcement Learning for Language Models ⏳ *(v3, new)*
+- Generation as a token-level MDP; returns and the sequence-level reward; the policy-gradient theorem and REINFORCE; variance, baselines and advantages; value functions and GAE; the KL-regularised objective and its closed-form optimum; trust regions to PPO's clipped surrogate; the four models of PPO for LLMs and what they cost.
+
+### Chapter 24 — Learning from Human Preferences ⏳ *(v3, new)*
+- SFT → reward model → RL (InstructGPT, 2022); Bradley–Terry reward models; reward hacking and over-optimisation; DPO from the closed-form optimum; IPO, KTO, ORPO, SimPO; online versus offline preference learning; Constitutional AI and RLAIF.
+
+### Chapter 25 — Reinforcement Learning with Verifiable Rewards ⏳ *(v3, new)*
+- Verifiable rewards (math, code, tests); GRPO derived; RLOO and REINFORCE++; Dr. GRPO and DAPO fixes; outcome versus process rewards; entropy collapse and exploration; rollout systems: synchronous vs asynchronous, weight sync, off-policy correction; bridge to reasoning models (Ch 26).
+
+
+### Chapter 26 — Reasoning Models and Test-Time Compute ✅ *(v2)*
+
+## Part IX — Production
+
+### Chapter 27 — Serving at Scale: Routing, Autoscaling, Multi-LoRA and Cost ✅ *(v2)*
+### Chapter 28 — Benchmarking, Observability and Evaluation ✅ *(v2)*
+### Chapter 29 — On-Device and Edge Inference ✅ *(v2)*
+### Chapter 30 — The ML-Systems Design Interview: Worked Case Studies ✅ *(v2)*
 (These chapters keep the content listed in v1 of this skeleton; their detailed arcs will be written when Part VI is complete.)
 
 ## Appendices
@@ -187,14 +203,18 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 13 | Disaggregated Serving | ✅ v2 |
 | 14 | Quantisation | ✅ v2 |
 | 15 | Pruning, Sparsity and Distillation | ✅ v2 |
-| 16 | Distributed Computing Fundamentals | ✅ v2 |
-| 17 | Parallelism Strategies for Inference | ✅ v2 |
-| 18 | Mixture of Experts at Inference | ✅ v2 |
-| 19 | Speculative Decoding | ✅ v2 |
-| 20 | Long-Context Inference | ✅ v2 |
-| 21 | Beyond Attention: SSMs and Hybrids | ✅ v2 |
-| 22 | Reasoning Models and Test-Time Compute | ✅ v2 |
-| 23 | Serving at Scale | ✅ v2 |
-| 24 | Benchmarking, Observability and Evaluation | ✅ v2 |
-| 25 | On-Device and Edge Inference | ✅ v2 |
-| 26 | The ML-Systems Design Interview | ✅ v2 |
+| 16 | Fine-Tuning and Parameter-Efficient Adaptation | ⏳ v3 (new) |
+| 17 | Distributed Computing Fundamentals | ✅ v2 |
+| 18 | Parallelism Strategies for Inference | ✅ v2 |
+| 19 | Mixture of Experts at Inference | ✅ v2 |
+| 20 | Speculative Decoding | ✅ v2 |
+| 21 | Long-Context Inference | ✅ v2 |
+| 22 | Beyond Attention: SSMs and Hybrids | ✅ v2 |
+| 23 | Reinforcement Learning for Language Models | ⏳ v3 (new) |
+| 24 | Learning from Human Preferences | ⏳ v3 (new) |
+| 25 | Reinforcement Learning with Verifiable Rewards | ⏳ v3 (new) |
+| 26 | Reasoning Models and Test-Time Compute | ✅ v2 |
+| 27 | Serving at Scale | ✅ v2 |
+| 28 | Benchmarking, Observability and Evaluation | ✅ v2 |
+| 29 | On-Device and Edge Inference | ✅ v2 |
+| 30 | The ML-Systems Design Interview | ✅ v2 |

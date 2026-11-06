@@ -111,17 +111,17 @@
 <tr><td>\(p_{\text{te}}\), \(p_{\text{st}}\)</td><td>teacher and student next-token distributions (distillation)</td></tr>
 <tr><td>\(\mathrm{KL}(p\,\Vert\,q)\)</td><td>Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\)</td></tr>
 </tbody></table></div>
-<h2>Communication (Ch. 16 onwards)</h2>
+<h2>Communication (Ch. 17 onwards)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
 <tr><td>\(n_p\)</td><td>number of GPUs (ranks) taking part in a collective</td></tr>
 <tr><td>\(\nu\)</td><td>bytes in each rank's buffer for a collective (the message size)</td></tr>
 <tr><td>\(\alpha\)</td><td>per-step (per-message) latency of a communication step, seconds</td></tr>
 <tr><td>\(\beta_{\text{link}}\)</td><td>per-GPU, per-direction link bandwidth, bytes/s (NVLink on H100: 450 GB/s)</td></tr>
-<tr><td>\(n_{\text{TP}}, n_{\text{PP}}, n_{\text{DP}}, n_{\text{CP}}, n_{\text{EP}}\)</td><td>degrees of tensor, pipeline, data, context and expert parallelism (Ch. 17–18)</td></tr>
-<tr><td>\(n_\mu\)</td><td>number of micro-batches in flight in a pipeline (Ch. 17)</td></tr>
-<tr><td>\(T_c\)</td><td>tokens of a sequence held by one device under context parallelism (Ch. 17)</td></tr>
+<tr><td>\(n_{\text{TP}}, n_{\text{PP}}, n_{\text{DP}}, n_{\text{CP}}, n_{\text{EP}}\)</td><td>degrees of tensor, pipeline, data, context and expert parallelism (Ch. 18–18)</td></tr>
+<tr><td>\(n_\mu\)</td><td>number of micro-batches in flight in a pipeline (Ch. 18)</td></tr>
+<tr><td>\(T_c\)</td><td>tokens of a sequence held by one device under context parallelism (Ch. 18)</td></tr>
 </tbody></table></div>
-<h2>Mixture of experts (Ch. 18)</h2>
+<h2>Mixture of experts (Ch. 19)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th><th>DeepSeek-V3</th></tr></thead><tbody>
 <tr><td>\(n_{\text{exp}}\)</td><td>routed experts per MoE layer</td><td>256</td></tr>
 <tr><td>\(k_r\)</td><td>experts selected per token (top-\(k_r\))</td><td>8</td></tr>
@@ -131,7 +131,7 @@
 <tr><td>\(f_i\), \(\bar p_i\)</td><td>fraction of tokens routed to expert \(i\); mean router probability of expert \(i\)</td><td></td></tr>
 <tr><td>\(\omega_i\)</td><td>routing bias of expert \(i\) (auxiliary-loss-free balancing)</td><td></td></tr>
 </tbody></table></div>
-<h2>Speculative decoding (Ch. 19)</h2>
+<h2>Speculative decoding (Ch. 20)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
 <tr><td>\(q(v)\)</td><td>draft model's next-token distribution (the target's is \(p(v)\))</td></tr>
 <tr><td>\(\gamma\)</td><td>number of draft tokens proposed per verification step</td></tr>
@@ -139,7 +139,7 @@
 <tr><td>\(n_{\text{acc}}\)</td><td>tokens produced per verification step (accepted drafts plus one)</td></tr>
 <tr><td>\(c_d\)</td><td>cost of one draft step relative to one target decode step</td></tr>
 </tbody></table></div>
-<h2>Long context (Ch. 20)</h2>
+<h2>Long context (Ch. 21)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
 <tr><td>\(T_{\text{train}}\)</td><td>longest context seen in (pre-)training</td></tr>
 <tr><td>\(\mu\)</td><td>context-extension factor, target length \(/\,T_{\text{train}}\)</td></tr>
@@ -147,23 +147,23 @@
 <tr><td>\(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\)</td><td>rotations pair \(r\) completes over the training length; \(c_{\text{lo}},c_{\text{hi}}\) YaRN ramp thresholds</td></tr>
 <tr><td>\(k_s\)</td><td>tokens (or blocks) selected per query by sparse attention</td></tr>
 </tbody></table></div>
-<h2>Recurrent and state-space layers (Ch. 21)</h2>
+<h2>Recurrent and state-space layers (Ch. 22)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
 <tr><td>\(\mathcal S_t\)</td><td>matrix-valued recurrent state of a linear-attention head after token \(t\) (\(d_v\times d_k\))</td></tr>
 <tr><td>\(\psi(\cdot)\)</td><td>feature map of linear attention, \(\psi(q)^\top\psi(k)\approx\) similarity</td></tr>
 <tr><td>\(f_t\), \(\eta_t\)</td><td>forget (decay) gate in \((0,1]\) and write rate of a gated / delta-rule state update</td></tr>
 <tr><td>\(\mathbf A\), \(\mathbf b_t\), \(\mathbf c_t\)</td><td>SSM state matrix (diagonal) and input-dependent input/output vectors (Mamba's \(A,B,C\))</td></tr>
-<tr><td>\(\Delta_t\)</td><td>SSM discretisation step (Ch. 21 only; unrelated to the quantisation step of Ch. 14)</td></tr>
+<tr><td>\(\Delta_t\)</td><td>SSM discretisation step (Ch. 22 only; unrelated to the quantisation step of Ch. 14)</td></tr>
 <tr><td>\(d_s\)</td><td>SSM state size per channel (Mamba's \(N\))</td></tr>
 </tbody></table></div>
-<h2>Reasoning and test-time compute (Ch. 22)</h2>
+<h2>Reasoning and test-time compute (Ch. 26)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
 <tr><td>\(n_s\)</td><td>number of independent samples drawn for one problem (pass@\(n_s\), voting, best-of-\(n_s\))</td></tr>
 <tr><td>\(p_s\)</td><td>probability that a single sample solves the problem</td></tr>
 <tr><td>\(n_{\text{think}}\)</td><td>reasoning ("thinking") tokens generated before the answer</td></tr>
 <tr><td>\(\mathcal R_i\), \(\hat A_i\)</td><td>reward of rollout \(i\); its group-relative advantage (GRPO)</td></tr>
 </tbody></table></div>
-<h2>Serving at scale (Ch. 23)</h2>
+<h2>Serving at scale (Ch. 27)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
 <tr><td>\(n_r\)</td><td>number of replicas behind a router</td></tr>
 <tr><td>\(u\)</td><td>utilisation: offered load divided by capacity</td></tr>

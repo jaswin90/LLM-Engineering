@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ch 23 · Serving at Scale — Introduction to LLM Engineering</title>
-<meta name="description" content="Chapter 23 of Introduction to LLM Engineering: the architecture of a serving fleet, routing with the power of two choices and cache affinity, autoscaling with cold starts, multi-LoRA serving (Punica, S-LoRA), tenancy and rate limits, cascades and model routers, the cost of a million tokens, and reliability.">
+<title>Ch 27 · Serving at Scale — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 27 of Introduction to LLM Engineering: the architecture of a serving fleet, routing with the power of two choices and cache affinity, autoscaling with cold starts, multi-LoRA serving (Punica, S-LoRA), tenancy and rate limits, cascades and model routers, the cost of a million tokens, and reliability.">
 <script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -22,7 +22,7 @@
 <aside class="sidebar" aria-label="Chapter contents"></aside>
 <main>
 <article>
-<div class="chapter-kicker">Part VIII · Production — Chapter 23</div>
+<div class="chapter-kicker">Part IX · Production — Chapter 27</div>
 <h1 id="top">Serving at Scale: Routing, Autoscaling, Multi-LoRA and Cost</h1>
 <p class="lede">A production LLM service is not one engine but a fleet: many replicas of several models behind a gateway, scaled with demand, shared by many tenants and many fine-tuned variants, and accountable for what each token costs. This chapter develops the fleet-level questions an inference engineer must answer: how to route requests, how to scale capacity when starting a replica takes minutes, how to serve thousands of LoRA adapters on shared GPUs, how to isolate tenants, and how to compute and reduce the cost of a million tokens.</p>
 
@@ -40,11 +40,11 @@
 <li>Implement multi-tenant isolation with rate limits, priorities and fair scheduling, and model cascades and routers across models.</li>
 <li>Compute the cost per million tokens of a deployment and identify the levers that reduce it; design for reliability.</li>
 </ol>
-<p class="small muted">Uses: Chapters 3, 6, 10, 11, 12, 13, 14 and 17. Symbols: <a href="../notation.html">notation page</a>.</p>
+<p class="small muted">Uses: Chapters 3, 6, 10, 11, 12, 13, 14 and 18. Symbols: <a href="../notation.html">notation page</a>.</p>
 </div>
 
-<h2 id="s23-1">23.1 From one engine to a fleet</h2>
-<p>Figure 23.1 shows the components of a typical serving fleet. Requests arrive at an <strong>API gateway</strong>, which authenticates the caller, enforces rate limits and quotas, records usage for billing, and attaches metadata such as the tenant, the requested model or adapter, and the priority. A <strong>router</strong> chooses a replica for each request, using load, cache affinity and the replica's capabilities. <strong>Replicas</strong> are the engines of Chapter 12, each on one GPU or a parallel group, possibly organised into disaggregated prefill and decode pools (Chapter 13). An <strong>autoscaler</strong> adds and removes replicas as demand changes, drawing weights from a <strong>model registry</strong> that stores model and adapter versions. And an <strong>observability</strong> layer collects the metrics, traces and logs from every component (§12.8, Chapter 24) that drive the router, the autoscaler and the people operating the system.</p>
+<h2 id="s23-1">27.1 From one engine to a fleet</h2>
+<p>Figure 27.1 shows the components of a typical serving fleet. Requests arrive at an <strong>API gateway</strong>, which authenticates the caller, enforces rate limits and quotas, records usage for billing, and attaches metadata such as the tenant, the requested model or adapter, and the priority. A <strong>router</strong> chooses a replica for each request, using load, cache affinity and the replica's capabilities. <strong>Replicas</strong> are the engines of Chapter 12, each on one GPU or a parallel group, possibly organised into disaggregated prefill and decode pools (Chapter 13). An <strong>autoscaler</strong> adds and removes replicas as demand changes, drawing weights from a <strong>model registry</strong> that stores model and adapter versions. And an <strong>observability</strong> layer collects the metrics, traces and logs from every component (§12.8, Chapter 28) that drive the router, the autoscaler and the people operating the system.</p>
 
 <figure class="diagram" id="fig-23-1">
 <svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Architecture of an LLM serving fleet">
@@ -66,11 +66,11 @@
 <line x1="583" y1="66" x2="552" y2="66" class="ln dash" marker-end="url(#a231)"/><line x1="583" y1="135" x2="552" y2="135" class="ln dash" marker-end="url(#a231)"/>
 <text x="360" y="250" text-anchor="middle" class="t-xs">replicas report load, queue depth, KV usage and cached prefixes to the router and autoscaler</text>
 </svg>
-<figcaption><b>Figure 23.1 — A serving fleet.</b> A gateway enforces tenancy and metering, a router places requests on replicas of several models and adapter pools, an autoscaler matches capacity to demand using weights from a registry, and observability feeds all of them.</figcaption></figure>
+<figcaption><b>Figure 27.1 — A serving fleet.</b> A gateway enforces tenancy and metering, a router places requests on replicas of several models and adapter pools, an autoscaler matches capacity to demand using weights from a registry, and observability feeds all of them.</figcaption></figure>
 
 <p>Two properties of LLM traffic shape every component. Requests are <em>heterogeneous</em>: one may be a 100-token chat turn and the next a 100,000-token document or a 20,000-token reasoning chain, so request counts are a poor measure of load, and tokens, separately for prefill and decode, are the right unit. And requests are <em>long-lived</em>: a streaming response holds resources on its replica for seconds to minutes, so placement decisions cannot be revised cheaply once made. With those in mind, the first decision is where to send each request.</p>
 
-<h2 id="s23-2">23.2 Routing and load balancing</h2>
+<h2 id="s23-2">27.2 Routing and load balancing</h2>
 <p>The simplest routers send each request to a random replica, or to replicas in turn (round-robin). Both ignore the replicas' state, and with heterogeneous requests they regularly send work to replicas that are already busy. At the other extreme, <em>join the shortest queue</em> (JSQ) sends each request to the least-loaded replica, which balances best but requires up-to-date load information from every replica for every decision, a coordination cost that grows with the fleet. Between them lies a celebrated result. Mitzenmacher (1996) showed that sampling just two replicas at random and choosing the less loaded of the two, the <strong>power of two choices</strong>, captures most of the benefit of JSQ. In the classical "supermarket" queueing model with \(n_r\) servers at utilisation \(u\), the fraction of servers with at least \(i\) queued jobs decays as \(u^i\) under random assignment but as</p>
 \[ u^{(n_c^{\,i}-1)/(n_c-1)} \]
 <p>when the router samples \(n_c\ge2\) servers: doubly exponentially in \(i\). Long queues become vanishingly rare with only two samples per decision.</p>
@@ -88,9 +88,9 @@
   {"name":"Join shortest queue","color":"s3","points":[[0.5,4.64],[0.7,4.93],[0.8,5.4],[0.9,6.6],[0.95,8.88]]}
  ]}
 </script>
-<figcaption><b>Figure 23.2 — Two choices are nearly as good as all of them.</b> Sixteen FIFO replicas with exponential service times and Poisson arrivals. At 90% utilisation, the P99 response time is 94 mean service times with random routing, 24 with round-robin, 10 with the power of two choices and 6.6 with join-the-shortest-queue.</figcaption></figure>
+<figcaption><b>Figure 27.2 — Two choices are nearly as good as all of them.</b> Sixteen FIFO replicas with exponential service times and Poisson arrivals. At 90% utilisation, the P99 response time is 94 mean service times with random routing, 24 with round-robin, 10 with the power of two choices and 6.6 with join-the-shortest-queue.</figcaption></figure>
 
-<p>Figure 23.2 confirms the theory with a small simulation of sixteen replicas. At moderate utilisation the policies differ by a factor of two in tail latency; at 90% utilisation, random routing's 99th percentile is fourteen times JSQ's, round-robin's three and a half times, and the power of two choices only one and a half. For LLM serving the lesson carries over with two adjustments. First, the load measure must be in tokens, not requests: outstanding prefill tokens, active decode sequences and KV-cache usage are far better predictors of a replica's delay than its queue length. Second, load is not the only consideration, because a request whose prefix is cached on one replica is much cheaper there (§10.6, §13.8). The routers of production systems therefore combine the two: among a small set of candidate replicas, chosen by cache affinity or at random, pick the one with the best score of cached prefix against load, as in the KV-aware routing of §13.8.</p>
+<p>Figure 27.2 confirms the theory with a small simulation of sixteen replicas. At moderate utilisation the policies differ by a factor of two in tail latency; at 90% utilisation, random routing's 99th percentile is fourteen times JSQ's, round-robin's three and a half times, and the power of two choices only one and a half. For LLM serving the lesson carries over with two adjustments. First, the load measure must be in tokens, not requests: outstanding prefill tokens, active decode sequences and KV-cache usage are far better predictors of a replica's delay than its queue length. Second, load is not the only consideration, because a request whose prefix is cached on one replica is much cheaper there (§10.6, §13.8). The routers of production systems therefore combine the two: among a small set of candidate replicas, chosen by cache affinity or at random, pick the one with the best score of cached prefix against load, as in the KV-aware routing of §13.8.</p>
 <p>A related technique is <strong>consistent hashing</strong>, which maps each session or prefix to a replica by hashing, so that requests sharing a conversation or document land on the same replica and hit its cache, while adding or removing a replica moves only a small fraction of keys. Plain consistent hashing can overload a replica that happens to own popular keys; the "bounded loads" variant caps each replica at a small multiple of the average and spills the excess to the next replica on the ring, trading a little cache affinity for balance. Session affinity, prefix-hash routing and load-aware selection are the three ingredients of almost every LLM router, weighted differently by product: chat with long system prompts favours affinity, bursty batch jobs favour balance.</p>
 
 <div class="box example">
@@ -101,7 +101,7 @@
 <p><strong>The cost.</strong> Affinity fights load balancing: a popular conversation or tenant pins its load to one replica, and a replica that fails or is drained loses its cache. Production routers therefore combine the two: prefer the replica with the longest cached prefix unless its queue is more than some threshold longer than the least-loaded one. That trade-off between cache hits and queueing is the routing analogue of the batching–latency trade-off of Chapter 11.</p>
 </div>
 
-<h2 id="s23-3">23.3 Autoscaling</h2>
+<h2 id="s23-3">27.3 Autoscaling</h2>
 <p>Demand for an interactive LLM service follows human schedules: a daily cycle with a peak several times the trough, weekly patterns, launches and incidents that bring sudden spikes. Provisioning for the peak at all hours wastes most of the fleet most of the time; scaling with demand saves money, provided capacity arrives before it is needed. The difficulty is that a new replica of a large model is slow to start. It must be scheduled onto a free GPU, possibly pulling a container image of many gigabytes; it must load its weights, 16 GB for an 8B model and 141 GB for a 70B one in BF16, from local disk at several GB/s or from network storage at one or two; it must initialise the engine, allocate the KV pool, and capture CUDA graphs or compile kernels. End to end, a cold start ranges from tens of seconds for a small model with weights on local NVMe to several minutes for a large one fetched over the network.</p>
 
 <figure class="diagram" id="fig-23-3">
@@ -117,16 +117,16 @@
 <line x1="520" y1="166" x2="545" y2="166" class="ln" stroke-width="2"/><text x="550" y="170" class="t-xs">reactive (lags by cold start)</text>
 <line x1="520" y1="182" x2="545" y2="182" class="ln-acc" stroke-width="2" stroke-dasharray="6 4"/><text x="550" y="186" class="t-xs">predictive + headroom</text>
 </svg>
-<figcaption><b>Figure 23.3 — Capacity must lead demand by the cold-start time.</b> A purely reactive autoscaler adds replicas only after load rises, and they arrive one cold start later, leaving a deficit during ramps. Scaling on a forecast, with headroom, keeps capacity above demand.</figcaption></figure>
+<figcaption><b>Figure 27.3 — Capacity must lead demand by the cold-start time.</b> A purely reactive autoscaler adds replicas only after load rises, and they arrive one cold start later, leaving a deficit during ramps. Scaling on a forecast, with headroom, keeps capacity above demand.</figcaption></figure>
 
-<p>Figure 23.3 shows the consequence. A reactive autoscaler that adds a replica when load crosses a threshold delivers it one cold start later; during a steep ramp, demand exceeds capacity for that interval, queues grow, and TTFT targets are missed. The requirement is simple to state: capacity at time \(t\) must cover the demand at time \(t+\tau\), where \(\tau\) is the cold-start time. Three practices follow. <strong>Scale on the right signals.</strong> GPU utilisation, as reported by <code>nvidia-smi</code>, is a poor signal (§12.8); queue length, outstanding tokens, KV-cache usage and TTFT or TPOT against targets are good ones, because they measure the quantities users experience. <strong>Keep headroom.</strong> Run at a target utilisation below the knee of the queueing curve (§11.8), so that a replica's worth of growth can be absorbed while new capacity starts; Figure 23.2 shows how quickly tails grow above 80–90%. <strong>Predict.</strong> Daily patterns are regular enough to forecast, and scaling ahead of the forecast, with reactive scaling as a backstop for surprises, removes most deficits.</p>
-<p>The other lever is to shrink \(\tau\). Weights can be pre-staged on local disks of idle machines, loaded with parallel reads, or streamed directly into GPU memory; engines can snapshot an initialised process, including compiled kernels and captured CUDA graphs, and restore it; a pool of "warm" replicas, started but idle, can absorb spikes in seconds at the cost of their GPUs. For many small models or adapters, a single replica can host several and swap between them (§23.4). Scale to zero, popular in serverless platforms, is attractive for rarely used models but pays a full cold start on the first request after idling, which is acceptable for batch work and rarely for interactive use.</p>
+<p>Figure 27.3 shows the consequence. A reactive autoscaler that adds a replica when load crosses a threshold delivers it one cold start later; during a steep ramp, demand exceeds capacity for that interval, queues grow, and TTFT targets are missed. The requirement is simple to state: capacity at time \(t\) must cover the demand at time \(t+\tau\), where \(\tau\) is the cold-start time. Three practices follow. <strong>Scale on the right signals.</strong> GPU utilisation, as reported by <code>nvidia-smi</code>, is a poor signal (§12.8); queue length, outstanding tokens, KV-cache usage and TTFT or TPOT against targets are good ones, because they measure the quantities users experience. <strong>Keep headroom.</strong> Run at a target utilisation below the knee of the queueing curve (§11.8), so that a replica's worth of growth can be absorbed while new capacity starts; Figure 27.2 shows how quickly tails grow above 80–90%. <strong>Predict.</strong> Daily patterns are regular enough to forecast, and scaling ahead of the forecast, with reactive scaling as a backstop for surprises, removes most deficits.</p>
+<p>The other lever is to shrink \(\tau\). Weights can be pre-staged on local disks of idle machines, loaded with parallel reads, or streamed directly into GPU memory; engines can snapshot an initialised process, including compiled kernels and captured CUDA graphs, and restore it; a pool of "warm" replicas, started but idle, can absorb spikes in seconds at the cost of their GPUs. For many small models or adapters, a single replica can host several and swap between them (§27.4). Scale to zero, popular in serverless platforms, is attractive for rarely used models but pays a full cold start on the first request after idling, which is acceptable for batch work and rarely for interactive use.</p>
 <div class="box example">
 <div class="box-title">Worked example — headroom for a morning ramp</div>
 <p>A chat service on Llama 3 70B (TP = 8 replicas, each handling about 15,000 output tokens/s at its target latency) sees demand rise from 300,000 to 900,000 output tokens/s over two hours each morning, roughly linearly, so 5,000 tokens/s per minute. A cold start takes 4 minutes. During those 4 minutes demand rises by 20,000 tokens/s, more than one replica's capacity. A reactive policy that waits until replicas are 90% loaded will therefore fall behind throughout the ramp. Either keep two replicas (30,000 tokens/s) of spare capacity at every point of the ramp, or start replicas from a forecast at least 4 minutes ahead of need, or cut the cold start to under a minute with local weights and snapshots, in which case one replica of headroom suffices. At the peak, 60 replicas (480 GPUs) are needed; at the overnight trough, 20.</p>
 </div>
 
-<h2 id="s23-4">23.4 Serving many fine-tunes: multi-LoRA</h2>
+<h2 id="s23-4">27.4 Serving many fine-tunes: multi-LoRA</h2>
 <p>Many products are built on fine-tuned variants of a few base models, one per customer, task or language, and most fine-tunes are made with <strong>low-rank adaptation</strong> (LoRA; Hu et al., 2021)<span class="cite"><a href="#r-lora">[1]</a></span>. LoRA freezes the base weights and learns, for selected weight matrices \(W\in\mathbb R^{d_{\text{in}}\times d_{\text{out}}}\), a low-rank update \(\Delta W=W_{\downarrow}W_{\uparrow}\) with \(W_{\downarrow}\in\mathbb R^{d_{\text{in}}\times r_a}\) and \(W_{\uparrow}\in\mathbb R^{r_a\times d_{\text{out}}}\), for a small rank \(r_a\) (8 to 64 is typical). The adapted layer computes \(xW+(xW_{\downarrow})W_{\uparrow}\). An adapter is tiny: for Llama 3 8B with rank 16 on all attention and MLP projections of all 32 layers, it has \(r_a\sum(d_{\text{in}}+d_{\text{out}})\approx42\) million parameters, about 84 MB in BF16, half a per cent of the base model.</p>
 <p>Serving each adapter on its own replica would waste almost all of the GPU: the base weights, identical for every adapter, would be duplicated thousands of times. The alternative is to load the base model once and serve requests for many adapters <em>in the same batch</em>, each request using its own adapter. Two systems of 2023 made this efficient. <strong>Punica</strong> (Chen et al.)<span class="cite"><a href="#r-punica">[2]</a></span> introduced a batched kernel, SGMV (segmented gather matrix–vector multiplication), that computes \((xW_{\downarrow}^{(i)})W_{\uparrow}^{(i)}\) for a batch in which consecutive segments of rows use different adapters \(i\), so that one kernel launch serves all adapters in the batch while the base GEMM runs once for everyone. <strong>S-LoRA</strong> (Sheng et al.)<span class="cite"><a href="#r-slora">[3]</a></span> added memory management: adapters live in CPU memory and are paged into GPU memory on demand, in a <em>unified paging</em> pool shared with the KV cache, since both consist of many small tensors of varying lifetimes; it served thousands of adapters on a single GPU with throughput close to serving the base model alone.</p>
 
@@ -148,27 +148,27 @@
 <rect x="525" y="104" width="25" height="18" class="fill-muted"/><rect x="552" y="104" width="25" height="18" class="fill-muted"/><rect x="579" y="104" width="25" height="18" class="fill-muted"/><rect x="606" y="104" width="25" height="18" class="fill-muted"/><text x="640" y="117" class="t-xs">KV blocks</text>
 <text x="605" y="146" text-anchor="middle" class="t-xs">cold adapters stay in CPU memory</text><text x="605" y="162" text-anchor="middle" class="t-xs">and are paged in on demand</text>
 </svg>
-<figcaption><b>Figure 23.4 — Many adapters, one base model.</b> The base GEMM runs once for the whole batch; a segmented kernel applies each request's low-rank update; adapters and KV blocks share one paged memory pool, with inactive adapters in CPU memory.</figcaption></figure>
+<figcaption><b>Figure 27.4 — Many adapters, one base model.</b> The base GEMM runs once for the whole batch; a segmented kernel applies each request's low-rank update; adapters and KV blocks share one paged memory pool, with inactive adapters in CPU memory.</figcaption></figure>
 
-<p>Figure 23.4 shows the computation. The arithmetic of its overheads is straightforward. In FLOPs, an adapter adds \(2r_a(d_{\text{in}}+d_{\text{out}})\) per token per adapted matrix, about 84 MFLOPs per token for the rank-16 example, half a per cent of the base model's 16 GFLOPs. In bytes, which matter more in memory-bound decode, each <em>distinct</em> adapter in the batch must be read once per step: with \(k\) distinct adapters, \(k\times84\) MB on top of the base model's 16 GB. A batch spanning 32 adapters reads 2.7 GB of adapters per step, adding about 17% to the bytes and hence to TPOT; a batch of requests for the same adapter adds 0.5%. Routers therefore group requests by adapter where load allows, a form of affinity, and very popular fine-tunes may be merged into their own copy of the weights (\(W+\Delta W\)) and served as separate models, which removes the overhead entirely for them.</p>
+<p>Figure 27.4 shows the computation. The arithmetic of its overheads is straightforward. In FLOPs, an adapter adds \(2r_a(d_{\text{in}}+d_{\text{out}})\) per token per adapted matrix, about 84 MFLOPs per token for the rank-16 example, half a per cent of the base model's 16 GFLOPs. In bytes, which matter more in memory-bound decode, each <em>distinct</em> adapter in the batch must be read once per step: with \(k\) distinct adapters, \(k\times84\) MB on top of the base model's 16 GB. A batch spanning 32 adapters reads 2.7 GB of adapters per step, adding about 17% to the bytes and hence to TPOT; a batch of requests for the same adapter adds 0.5%. Routers therefore group requests by adapter where load allows, a form of affinity, and very popular fine-tunes may be merged into their own copy of the weights (\(W+\Delta W\)) and served as separate models, which removes the overhead entirely for them.</p>
 <div class="box example">
 <div class="box-title">Worked example — memory for a thousand adapters</div>
 <p>A platform hosts 1,000 rank-16 adapters of Llama 3 8B (84 MB each, 84 GB in total) on H100s. They cannot all live in GPU memory beside a useful KV pool, so most stay in host memory, and the GPU keeps a working set. If at any moment about 50 adapters have active requests on a replica, they need 4.2 GB of GPU memory, leaving about 50 GB for KV cache. Loading an adapter that is not resident takes about \(84\,\text{MB}/25\,\text{GB/s}\approx3\) ms over PCIe, far less than a prefill, so on-demand paging adds little latency if it is overlapped with the request's own prefill. The economics: one replica serves all 1,000 customers at nearly the cost of serving the base model, instead of 1,000 replicas.</p>
 </div>
 
-<h2 id="s23-5">23.5 Tenants, priorities and fairness</h2>
+<h2 id="s23-5">27.5 Tenants, priorities and fairness</h2>
 <p>A shared fleet must protect its users from one another. Without controls, one tenant's burst of long-context requests can fill every replica's KV pool and starve everyone else's latency, the "noisy neighbour" problem. Three mechanisms provide isolation, at different timescales.</p>
 <p><strong>Rate limits</strong> at the gateway bound how much each tenant can submit. The standard mechanism is the <em>token bucket</em>: a bucket of capacity \(b\) fills at rate \(r\) and each request removes as many tokens as it will consume (input tokens, or an estimate of total tokens); a request that finds the bucket too empty is rejected or delayed. Over any interval of length \(T\), a tenant can consume at most \(b+rT\), so the bucket permits bursts up to \(b\) while enforcing a long-run rate \(r\). LLM providers typically limit both requests per minute and tokens per minute, with separate limits for input and output, because the two consume different resources.</p>
-<p><strong>Priorities and tiers</strong> decide who waits when capacity is short. Interactive traffic usually takes precedence over batch jobs, which can be queued for minutes or hours and run in troughs at a discount; paid tiers may take precedence over free ones. Within an engine, priority affects admission order and preemption choice (§11.7): a high-priority request can preempt a low-priority one's KV blocks. Across the fleet, priority affects routing, with dedicated or reserved capacity for the highest tiers. Batch APIs, which accept a file of requests and promise completion within a day at half price, exist precisely to move flexible work into the troughs of Figure 23.3.</p>
+<p><strong>Priorities and tiers</strong> decide who waits when capacity is short. Interactive traffic usually takes precedence over batch jobs, which can be queued for minutes or hours and run in troughs at a discount; paid tiers may take precedence over free ones. Within an engine, priority affects admission order and preemption choice (§11.7): a high-priority request can preempt a low-priority one's KV blocks. Across the fleet, priority affects routing, with dedicated or reserved capacity for the highest tiers. Batch APIs, which accept a file of requests and promise completion within a day at half price, exist precisely to move flexible work into the troughs of Figure 27.3.</p>
 <p><strong>Fair scheduling</strong> divides capacity among tenants who are all within their limits but together exceed it. The Virtual Token Counter of Sheng et al. (§11.7) adapts fair queueing to LLMs by charging each tenant for the tokens it has been served, weighted for input and output, and serving the tenant with the smallest counter next, which guarantees each backlogged tenant a fair share of throughput regardless of request sizes. Fairness at the fleet level additionally requires that routing does not concentrate one tenant's traffic on a few replicas, which interacts with cache affinity: a tenant with a long shared system prompt benefits from concentration, a tenant with a burst harms others by it.</p>
 
 <details class="drill">
-<summary>Drill 23.1 — Sizing a token bucket</summary>
+<summary>Drill 27.1 — Sizing a token bucket</summary>
 <p>A tenant's contract allows 2 million tokens per minute with bursts of up to 30 seconds' worth. What bucket rate and capacity implement it? A request arrives needing 600,000 tokens when the bucket holds 400,000; how long must it wait?</p>
 <p><em>Solution.</em> Rate \(r=2\times10^{6}/60\approx33{,}300\) tokens/s. Capacity \(b=30r=10^{6}\) tokens. The request needs 200,000 more tokens than the bucket holds; at 33,300 per second that takes about 6 s, after which it is admitted and the bucket is emptied. Requests larger than \(b\) can never be admitted, so the limit also caps the largest single request; providers either size \(b\) above the maximum context or count only input tokens against the bucket at admission and output tokens as they are generated.</p>
 </details>
 
-<h2 id="s23-6">23.6 Choosing among models: cascades and routers</h2>
+<h2 id="s23-6">27.6 Choosing among models: cascades and routers</h2>
 <p>A fleet usually serves several models of different sizes and prices, and not every request needs the largest. A <strong>cascade</strong> sends each request first to a small, cheap model and escalates to a larger one only when the small model's answer is judged inadequate, by its own confidence, by a verifier, or by a learned scorer. FrugalGPT (Chen, Zaharia and Zou, 2023)<span class="cite"><a href="#r-frugal">[4]</a></span> showed that cascades over commercial APIs could match the best single model's accuracy at a fraction of the cost. A <strong>router</strong> makes the choice up front: a classifier predicts, from the query alone, which model is the cheapest that will answer well. RouteLLM (Ong et al., 2024)<span class="cite"><a href="#r-routellm">[5]</a></span> trained such routers on human preference data and reported cost reductions of more than half at a small loss in quality relative to always using the strongest model.</p>
 
 <figure class="diagram" id="fig-23-5">
@@ -191,11 +191,11 @@
 <line x1="460" y1="90" x2="488" y2="90" class="ln" marker-end="url(#a235)"/><line x1="580" y1="84" x2="608" y2="60" class="ln" marker-end="url(#a235)"/><line x1="580" y1="96" x2="608" y2="120" class="ln" marker-end="url(#a235)"/>
 <text x="540" y="180" text-anchor="middle" class="t-xs">one model per query; quality depends on the classifier</text>
 </svg>
-<figcaption><b>Figure 23.5 — Spending large-model compute only where it is needed.</b> A cascade escalates when the cheap model's answer fails a check; a router predicts the right model from the query. Both exploit the fact that most traffic is easy.</figcaption></figure>
+<figcaption><b>Figure 27.5 — Spending large-model compute only where it is needed.</b> A cascade escalates when the cheap model's answer fails a check; a router predicts the right model from the query. Both exploit the fact that most traffic is easy.</figcaption></figure>
 
-<p>Figure 23.5 contrasts the two. A cascade's expected cost per query is the small model's cost plus the escalation rate times the large model's cost, and its latency rises for escalated queries, which pay for both. A router pays only for the model it chooses, but a wrong prediction either wastes money (sending an easy query to the large model) or quality (sending a hard one to the small model). For reasoning models (Chapter 22), the same logic chooses among reasoning efforts rather than models. The inference-engineering consequence is that a fleet's traffic mix across models is a design variable, and the capacity plan, autoscaling and cost model must be computed per model.</p>
+<p>Figure 27.5 contrasts the two. A cascade's expected cost per query is the small model's cost plus the escalation rate times the large model's cost, and its latency rises for escalated queries, which pay for both. A router pays only for the model it chooses, but a wrong prediction either wastes money (sending an easy query to the large model) or quality (sending a hard one to the small model). For reasoning models (Chapter 26), the same logic chooses among reasoning efforts rather than models. The inference-engineering consequence is that a fleet's traffic mix across models is a design variable, and the capacity plan, autoscaling and cost model must be computed per model.</p>
 
-<h2 id="s23-7">23.7 What a million tokens costs</h2>
+<h2 id="s23-7">27.7 What a million tokens costs</h2>
 <p>The cost of serving a token is the cost of the GPU time it consumes. For a replica of \(n_g\) GPUs priced at \(c_{\text{gpu}}\) dollars per GPU-hour, producing \(\Phi\) tokens per second at its operating point, the cost per million tokens is</p>
 \[ \text{cost per }10^6\text{ tokens}\;=\;\frac{n_g\,c_{\text{gpu}}}{3600\,\Phi}\times10^{6}\;\Big/\;u, \]
 <p>where \(u\) is the average utilisation of the replica: a replica that is busy half the time costs twice as much per token as one that is always busy. Every lever of this book appears in the formula: \(\Phi\) is set by the roofline, the batch size, quantisation, attention variant and speculative decoding; \(n_g\) by parallelism; \(u\) by routing, autoscaling and traffic shape; and \(c_{\text{gpu}}\) by the hardware generation and the purchasing arrangement.</p>
@@ -211,41 +211,41 @@
   {"name":"Half utilised (u = 0.5)","color":"s2","points":[[1,6.64],[4,1.77],[16,0.52],[64,0.216],[128,0.164],[256,0.138]]}
  ]}
 </script>
-<figcaption><b>Figure 23.6 — Batching sets the price; utilisation multiplies it.</b> Roofline throughput at \(c_{\text{gpu}}=\)$2.50 per hour (an illustrative price), BF16 weights and cache at 2k context (batch 256 exceeds one H100's memory in BF16 and is shown for the trend). From batch 1 to batch 64 the cost falls thirty-fold; an idle half of the time doubles it at every batch size.</figcaption></figure>
+<figcaption><b>Figure 27.6 — Batching sets the price; utilisation multiplies it.</b> Roofline throughput at \(c_{\text{gpu}}=\)$2.50 per hour (an illustrative price), BF16 weights and cache at 2k context (batch 256 exceeds one H100's memory in BF16 and is shown for the trend). From batch 1 to batch 64 the cost falls thirty-fold; an idle half of the time doubles it at every batch size.</figcaption></figure>
 
-<p>Figure 23.6 evaluates the formula for Llama 3 8B on one H100. At batch 1 a million output tokens cost about $3.30; at batch 64, about 11 cents; beyond that the cache term flattens the curve. A deployment that is idle half the time pays twice as much at every point. This is why the economics of LLM serving are dominated by batch size and utilisation, and why the techniques that raise them, continuous batching, paged caches, quantisation, routing and autoscaling, matter more to cost than any single kernel. Input tokens cost far less than output tokens, because prefill processes thousands of tokens per weight read; with prefix caching, repeated input tokens cost less still, which is why providers discount cached input.</p>
+<p>Figure 27.6 evaluates the formula for Llama 3 8B on one H100. At batch 1 a million output tokens cost about $3.30; at batch 64, about 11 cents; beyond that the cache term flattens the curve. A deployment that is idle half the time pays twice as much at every point. This is why the economics of LLM serving are dominated by batch size and utilisation, and why the techniques that raise them, continuous batching, paged caches, quantisation, routing and autoscaling, matter more to cost than any single kernel. Input tokens cost far less than output tokens, because prefill processes thousands of tokens per weight read; with prefix caching, repeated input tokens cost less still, which is why providers discount cached input.</p>
 <div class="box example">
 <div class="box-title">Worked example — self-host or use an API?</div>
-<p>A team needs 2 billion output tokens and 8 billion input tokens per month from a 70B-class model, and can buy H100 time at $2.50 per GPU-hour. <strong>Self-hosting:</strong> a TP = 8 FP8 replica at 15 ms TPOT delivers about 35,000 output tokens/s (Figure 17.3 and §17.5, option C), plus prefill. Two billion output tokens per month is about 770 tokens/s on average, a small fraction of one replica, but traffic peaks at perhaps four times the average and the team needs redundancy, so it runs two replicas, 16 GPUs, around the clock: about \(16\times2.5\times730\approx\)$29,000 per month, or about $14.60 per million output tokens at this volume, because utilisation is under 10%. <strong>API:</strong> at illustrative prices of $0.60 per million input and $2.00 per million output tokens, the bill is about $4,800 + $4,000 = $8,800. The API wins by a factor of three at this volume. Self-hosting breaks even only when traffic fills the replicas: with the same 16 GPUs fully used, about 180 billion output tokens per month, the cost would fall to about 16 cents per million. Utilisation decides.</p>
+<p>A team needs 2 billion output tokens and 8 billion input tokens per month from a 70B-class model, and can buy H100 time at $2.50 per GPU-hour. <strong>Self-hosting:</strong> a TP = 8 FP8 replica at 15 ms TPOT delivers about 35,000 output tokens/s (Figure 18.3 and §18.5, option C), plus prefill. Two billion output tokens per month is about 770 tokens/s on average, a small fraction of one replica, but traffic peaks at perhaps four times the average and the team needs redundancy, so it runs two replicas, 16 GPUs, around the clock: about \(16\times2.5\times730\approx\)$29,000 per month, or about $14.60 per million output tokens at this volume, because utilisation is under 10%. <strong>API:</strong> at illustrative prices of $0.60 per million input and $2.00 per million output tokens, the bill is about $4,800 + $4,000 = $8,800. The API wins by a factor of three at this volume. Self-hosting breaks even only when traffic fills the replicas: with the same 16 GPUs fully used, about 180 billion output tokens per month, the cost would fall to about 16 cents per million. Utilisation decides.</p>
 </div>
 
-<h2 id="s23-8">23.8 Reliability</h2>
+<h2 id="s23-8">27.8 Reliability</h2>
 <p>A fleet of thousands of GPUs fails continuously: GPUs develop memory errors, NVLink or network links flap, hosts crash, engine processes run out of memory on unexpected inputs, and new software versions have bugs. Reliability engineering for LLM serving applies the standard practices of distributed systems, with a few LLM-specific twists. <strong>Health checks</strong> must test the whole path, a short generation with known output rather than a TCP ping, because a replica can accept connections while producing garbage. <strong>Failure domains</strong> matter: a tensor-parallel replica of eight GPUs fails if any one of them does, so large replicas are less available than small ones, and a deployment should spread replicas across hosts, racks and zones.</p>
 <p>When a replica fails mid-stream, its in-flight requests lose their KV caches. The gateway can retry them elsewhere, but a retry repeats the prefill and, unless the partial output is kept and appended to the prompt, the user sees the response restart; good systems resume from the tokens already streamed. <strong>Timeouts and hedging</strong> handle slow rather than failed replicas: sending a duplicate of a request that has not started streaming within a deadline to a second replica cuts tail latency at the cost of some duplicated work, a classical technique that is cheap for short prefills and expensive for long ones. <strong>Graceful degradation</strong> keeps the service up under overload: shedding low-priority traffic first, lowering reasoning effort or maximum output length, routing to smaller models, and rejecting early with a clear error rather than queueing until timeouts (the early rejection of Mooncake, §13.7).</p>
-<p>Software changes are the most common cause of incidents, so <strong>rollouts</strong> are gradual: a new engine version or model is deployed to a small fraction of replicas (a canary), compared on latency, error rates and output quality against the old version (Chapter 24), and expanded only if healthy, with automatic rollback otherwise. Draining a replica before upgrading it, by stopping new admissions and letting in-flight requests finish, avoids interrupting streams; for long reasoning requests that may take minutes, the drain must be correspondingly patient. These practices are unglamorous, but in production they determine what users experience at least as much as the kernels of Part II.</p>
+<p>Software changes are the most common cause of incidents, so <strong>rollouts</strong> are gradual: a new engine version or model is deployed to a small fraction of replicas (a canary), compared on latency, error rates and output quality against the old version (Chapter 28), and expanded only if healthy, with automatic rollback otherwise. Draining a replica before upgrading it, by stopping new admissions and letting in-flight requests finish, avoids interrupting streams; for long reasoning requests that may take minutes, the drain must be correspondingly patient. These practices are unglamorous, but in production they determine what users experience at least as much as the kernels of Part II.</p>
 
 <details class="drill">
-<summary>Drill 23.2 — The availability of a tensor-parallel replica</summary>
+<summary>Drill 27.2 — The availability of a tensor-parallel replica</summary>
 <p>Each GPU in a fleet is unavailable 0.5% of the time, independently. What is the availability of a TP = 1 replica, a TP = 8 replica, and a service that needs at least 9 of 10 TP = 8 replicas to meet its load?</p>
 <p><em>Solution.</em> TP = 1: 99.5%. TP = 8: all eight GPUs must be up, \(0.995^8\approx96.1\%\). For the service: each replica is up with \(p=0.961\); the probability that at least 9 of 10 are up is \(p^{10}+10p^9(1-p)\approx0.672+0.273=0.945\). Even with a spare replica the service meets its capacity only 94.5% of the time, so it needs more spares, smaller replicas, or faster replacement of failed GPUs. Large parallel groups multiply the failure rate of their members.</p>
 </details>
 
-<h2 id="s23-9">23.9 Putting it together: a capacity plan</h2>
-<p>The pieces of this chapter combine into a procedure that every large deployment follows in some form, and it is worth carrying through once. Start from the <em>demand model</em>: requests per second over the day and week, and for each class of request (chat, document question answering, reasoning, batch) its distributions of input tokens, output tokens and prefix reuse. Convert demand into <em>work</em>: prefill tokens per second after cache hits, and decode tokens per second, per model. Choose a <em>replica configuration</em> for each model from the frontiers of Chapter 17, including precision, parallelism and whether to disaggregate, and measure (do not assume) each replica's sustainable throughput at the latency targets, for prefill and decode separately. Divide work by per-replica throughput at a target utilisation chosen from the latency-versus-load curve, add spares for failures and the headroom that one cold start requires, and the result is the replica count over time.</p>
+<h2 id="s23-9">27.9 Putting it together: a capacity plan</h2>
+<p>The pieces of this chapter combine into a procedure that every large deployment follows in some form, and it is worth carrying through once. Start from the <em>demand model</em>: requests per second over the day and week, and for each class of request (chat, document question answering, reasoning, batch) its distributions of input tokens, output tokens and prefix reuse. Convert demand into <em>work</em>: prefill tokens per second after cache hits, and decode tokens per second, per model. Choose a <em>replica configuration</em> for each model from the frontiers of Chapter 18, including precision, parallelism and whether to disaggregate, and measure (do not assume) each replica's sustainable throughput at the latency targets, for prefill and decode separately. Divide work by per-replica throughput at a target utilisation chosen from the latency-versus-load curve, add spares for failures and the headroom that one cold start requires, and the result is the replica count over time.</p>
 <p>The second half of the plan is the set of policies that make the arithmetic true in operation. The router must keep replicas evenly loaded and caches warm, or the effective utilisation will be lower and the cache-hit rate assumed in the work estimate will not materialise. The autoscaler must follow the demand model with enough lead time. Rate limits must keep any one tenant within the assumptions. And the cost model closes the loop: GPU-hours per day times price, divided by tokens served, gives cost per million tokens by model and tenant, which can be compared with prices and with alternatives such as a smaller model, a cascade or an API.</p>
 <div class="box example">
 <div class="box-title">Worked example — a capacity plan for a chat product</div>
-<p><strong>Demand:</strong> peak 2,000 requests/s, trough 600; each request averages 1,500 input tokens (1,000 of them a cached system prompt and history) and 350 output tokens. <strong>Work at peak:</strong> prefill of \(2000\times500=10^{6}\) uncached tokens/s and decode of \(7\times10^{5}\) tokens/s. <strong>Replica:</strong> Llama 3 8B in FP8 on one H100, measured at about 9,000 decode tokens/s at batch 128 within a 25 ms TPOT target, with chunked prefill absorbing about 15,000 prefill tokens/s on the same GPU. Prefill needs about 67 replica-equivalents and decode about 78, so decode binds: \(7\times10^{5}/9000\approx78\) replicas at full use. <strong>Target utilisation</strong> 75% at peak: 104 replicas. <strong>Spares and headroom:</strong> cold start 60 s, during which demand can rise by about 2%, plus one rack of 8 GPUs as failure spare: about 115 GPUs at peak, about 40 at the trough. <strong>Cost:</strong> averaging about 75 GPUs over the day at $2.50/hour is about $4,500 per day for about \(1300\times350\times86{,}400\approx3.9\times10^{10}\) output tokens (at an average of 1,300 requests/s), about 12 cents per million output tokens. The plan is only as good as its measured inputs; Chapter 24 is about obtaining them.</p>
+<p><strong>Demand:</strong> peak 2,000 requests/s, trough 600; each request averages 1,500 input tokens (1,000 of them a cached system prompt and history) and 350 output tokens. <strong>Work at peak:</strong> prefill of \(2000\times500=10^{6}\) uncached tokens/s and decode of \(7\times10^{5}\) tokens/s. <strong>Replica:</strong> Llama 3 8B in FP8 on one H100, measured at about 9,000 decode tokens/s at batch 128 within a 25 ms TPOT target, with chunked prefill absorbing about 15,000 prefill tokens/s on the same GPU. Prefill needs about 67 replica-equivalents and decode about 78, so decode binds: \(7\times10^{5}/9000\approx78\) replicas at full use. <strong>Target utilisation</strong> 75% at peak: 104 replicas. <strong>Spares and headroom:</strong> cold start 60 s, during which demand can rise by about 2%, plus one rack of 8 GPUs as failure spare: about 115 GPUs at peak, about 40 at the trough. <strong>Cost:</strong> averaging about 75 GPUs over the day at $2.50/hour is about $4,500 per day for about \(1300\times350\times86{,}400\approx3.9\times10^{10}\) output tokens (at an average of 1,300 requests/s), about 12 cents per million output tokens. The plan is only as good as its measured inputs; Chapter 28 is about obtaining them.</p>
 </div>
 
 <details class="drill">
-<summary>Drill 23.3 — What if the cache-hit rate falls?</summary>
+<summary>Drill 27.3 — What if the cache-hit rate falls?</summary>
 <p>In the worked example, a product change puts a timestamp at the top of the system prompt, so the 1,000 cached tokens per request are no longer reused. How do the prefill work, the binding resource and the number of peak replicas change?</p>
 <p><em>Solution.</em> Uncached prefill rises from 500 to 1,500 tokens per request, so prefill work triples to \(3\times10^{6}\) tokens/s at peak. At about 15,000 prefill tokens/s per replica (while also decoding), prefill now needs about 200 replica-equivalents against decode's 78: prefill binds. At 75% target utilisation that is about 267 replicas instead of 104, two and a half times the fleet, for a one-line change to a prompt template. Alternatively the team could disaggregate prefill onto a dedicated pool, but the cheaper fix is to move the timestamp to the end of the prompt. Prefix-cache hit rate belongs in every capacity plan and on every dashboard.</p>
 </details>
 
 <h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
-<p>Every decision in this chapter, which router, how much headroom, whether to merge an adapter, when to self-host, depends on measurements: throughput at a latency target, tail latency under load, cost per token, quality relative to a reference. Measuring these quantities correctly is harder than it looks; benchmarks are easy to run and easy to run wrongly, and production systems drift in ways that only good observability reveals. Chapter 24 takes up benchmarking, observability and evaluation: load-generation methodology and its pitfalls, standard benchmarks such as MLPerf Inference, tracing and metrics for live systems, and how to detect quality regressions when the model, the engine or the hardware changes.</p>
+<p>Every decision in this chapter, which router, how much headroom, whether to merge an adapter, when to self-host, depends on measurements: throughput at a latency target, tail latency under load, cost per token, quality relative to a reference. Measuring these quantities correctly is harder than it looks; benchmarks are easy to run and easy to run wrongly, and production systems drift in ways that only good observability reveals. Chapter 28 takes up benchmarking, observability and evaluation: load-generation methodology and its pitfalls, standard benchmarks such as MLPerf Inference, tracing and metrics for live systems, and how to detect quality regressions when the model, the engine or the hardware changes.</p>
 
 <h2 id="summary">Chapter summary</h2>
 <ul>
@@ -263,193 +263,193 @@
 <h2 id="mcq">Multiple-choice questions</h2>
 <p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
 <div class="quiz-section">
-<div class="mcq" data-id="ch23-mcq-01" data-topic="§23.1 Fleet">
+<div class="mcq" data-id="ch23-mcq-01" data-topic="§27.1 Fleet">
 <p class="q">Why are request counts a poor measure of load for an LLM replica?</p>
 <ol class="opts"><li>Requests are encrypted</li><li data-correct>Requests vary enormously in prefill and decode tokens, so tokens are the right unit</li><li>Replicas cannot count</li><li>Requests are identical</li></ol>
 <div class="explain">Measure outstanding prefill tokens, active decodes and KV usage.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-02" data-topic="§23.1 Fleet">
+<div class="mcq" data-id="ch23-mcq-02" data-topic="§27.1 Fleet">
 <p class="q">Which component enforces rate limits and records usage for billing?</p>
 <ol class="opts"><li>Router</li><li data-correct>API gateway</li><li>Autoscaler</li><li>Model registry</li></ol>
 <div class="explain">It also attaches tenant and priority metadata.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-03" data-topic="§23.2 Routing">
+<div class="mcq" data-id="ch23-mcq-03" data-topic="§27.2 Routing">
 <p class="q">The power of two choices routes each request to:</p>
 <ol class="opts"><li>A random replica</li><li data-correct>The less loaded of two randomly sampled replicas</li><li>The globally least loaded replica</li><li>The newest replica</li></ol>
 <div class="explain">Nearly as good as join-the-shortest-queue.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-04" data-topic="§23.2 Routing">
+<div class="mcq" data-id="ch23-mcq-04" data-topic="§27.2 Routing">
 <p class="q">In the supermarket model with two choices, the fraction of queues with at least \(i\) jobs decays as:</p>
 <ol class="opts"><li>\(u^i\)</li><li data-correct>\(u^{2^i-1}\)</li><li>\(1/i\)</li><li>\(e^{-i}\)</li></ol>
 <div class="explain">Doubly exponential, versus \(u^i\) for random routing.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-05" data-topic="§23.2 Routing">
-<p class="q">At 90% utilisation in Figure 23.2, P99 response time with random routing is about how many times that of JSQ?</p>
+<div class="mcq" data-id="ch23-mcq-05" data-topic="§27.2 Routing">
+<p class="q">At 90% utilisation in Figure 27.2, P99 response time with random routing is about how many times that of JSQ?</p>
 <ol class="opts"><li>1.1×</li><li>3×</li><li data-correct>14×</li><li>100×</li></ol>
 <div class="explain">94 versus 6.6 mean service times.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-06" data-topic="§23.2 Routing">
+<div class="mcq" data-id="ch23-mcq-06" data-topic="§27.2 Routing">
 <p class="q">LLM routers typically combine load with:</p>
 <ol class="opts"><li>CPU temperature</li><li data-correct>Prefix-cache and session affinity</li><li>Alphabetical order</li><li>Model size</li></ol>
 <div class="explain">A cached prefix makes a replica much cheaper for that request.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-07" data-topic="§23.2 Hashing">
+<div class="mcq" data-id="ch23-mcq-07" data-topic="§27.2 Hashing">
 <p class="q">Consistent hashing with bounded loads:</p>
 <ol class="opts"><li>Never moves keys</li><li data-correct>Maps sessions to replicas for cache affinity while capping each replica's load and spilling excess</li><li>Is random routing</li><li>Requires JSQ</li></ol>
 <div class="explain">Adding or removing replicas moves few keys.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-08" data-topic="§23.3 Autoscaling">
+<div class="mcq" data-id="ch23-mcq-08" data-topic="§27.3 Autoscaling">
 <p class="q">Why is reactive autoscaling problematic for large LLMs?</p>
 <ol class="opts"><li>It is too expensive</li><li data-correct>Cold starts take tens of seconds to minutes, so new capacity arrives after demand has risen</li><li>It cannot add replicas</li><li>GPUs cannot be shared</li></ol>
 <div class="explain">Capacity must lead demand by the cold-start time.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-09" data-topic="§23.3 Autoscaling">
+<div class="mcq" data-id="ch23-mcq-09" data-topic="§27.3 Autoscaling">
 <p class="q">Which are good autoscaling signals for LLM serving? (select all that apply)</p>
 <ol class="opts"><li data-correct>Queue depth and outstanding tokens</li><li data-correct>KV-cache usage</li><li data-correct>TTFT/TPOT against targets</li><li>nvidia-smi GPU utilisation alone</li></ol>
 <div class="explain">GPU utilisation measures idleness, not headroom.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-10" data-topic="§23.3 Autoscaling">
+<div class="mcq" data-id="ch23-mcq-10" data-topic="§27.3 Autoscaling">
 <p class="q">Components of a cold start include: (select all that apply)</p>
 <ol class="opts"><li data-correct>Pulling the container image</li><li data-correct>Loading weights from disk or network</li><li data-correct>Engine initialisation and CUDA-graph capture</li><li>Training the model</li></ol>
 <div class="explain">Snapshots and local weights shorten it.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-11" data-topic="§23.3 Autoscaling">
+<div class="mcq" data-id="ch23-mcq-11" data-topic="§27.3 Autoscaling">
 <p class="q">In the ramp example, demand rises by 20,000 tokens/s during a 4-minute cold start with replicas of 15,000 tokens/s. A purely reactive policy at 90% load will:</p>
 <ol class="opts"><li>Keep up</li><li data-correct>Fall behind during the ramp</li><li>Overprovision</li><li>Scale to zero</li></ol>
 <div class="explain">Keep two replicas of headroom or scale on a forecast.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-12" data-topic="§23.4 LoRA">
+<div class="mcq" data-id="ch23-mcq-12" data-topic="§27.4 LoRA">
 <p class="q">A LoRA update for weight \(W\) is:</p>
 <ol class="opts"><li>A full-rank copy</li><li data-correct>\(\Delta W=W_{\downarrow}W_{\uparrow}\) with small rank \(r_a\)</li><li>A sparse mask</li><li>A quantised copy</li></ol>
 <div class="explain">Base weights stay frozen.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-13" data-topic="§23.4 LoRA">
+<div class="mcq" data-id="ch23-mcq-13" data-topic="§27.4 LoRA">
 <p class="q">A rank-16 adapter on all projections of Llama 3 8B is about:</p>
 <ol class="opts"><li>8.4 MB</li><li data-correct>84 MB</li><li>840 MB</li><li>8.4 GB</li></ol>
 <div class="explain">About 42M parameters in BF16.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-14" data-topic="§23.4 Punica">
+<div class="mcq" data-id="ch23-mcq-14" data-topic="§27.4 Punica">
 <p class="q">Punica's SGMV kernel:</p>
 <ol class="opts"><li>Merges adapters into the base</li><li data-correct>Computes per-segment low-rank updates for a batch mixing adapters in one launch</li><li>Quantises adapters</li><li>Trains adapters</li></ol>
 <div class="explain">The base GEMM runs once for the whole batch.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-15" data-topic="§23.4 S-LoRA">
+<div class="mcq" data-id="ch23-mcq-15" data-topic="§27.4 S-LoRA">
 <p class="q">S-LoRA's unified paging stores which in one GPU pool?</p>
 <ol class="opts"><li>Weights and gradients</li><li data-correct>Adapter weights and KV-cache blocks</li><li>Tokens and logits</li><li>Images</li></ol>
 <div class="explain">Cold adapters are paged in from CPU memory.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-16" data-topic="§23.4 Overhead">
+<div class="mcq" data-id="ch23-mcq-16" data-topic="§27.4 Overhead">
 <p class="q">In memory-bound decode, multi-LoRA overhead grows mainly with:</p>
 <ol class="opts"><li>The rank only</li><li data-correct>The number of distinct adapters in the batch, each read once per step</li><li>The vocabulary</li><li>The prompt length</li></ol>
 <div class="explain">Group requests by adapter where possible.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-17" data-topic="§23.4 Practice">
+<div class="mcq" data-id="ch23-mcq-17" data-topic="§27.4 Practice">
 <p class="q">When should a popular fine-tune be merged into its own copy of the weights?</p>
 <ol class="opts"><li>Never</li><li data-correct>When its traffic is large enough to justify dedicated replicas, removing adapter overhead</li><li>Only for rank 1</li><li>When it is unpopular</li></ol>
 <div class="explain">\(W+\Delta W\) served as a separate model.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-18" data-topic="§23.5 Rate limits">
+<div class="mcq" data-id="ch23-mcq-18" data-topic="§27.5 Rate limits">
 <p class="q">A token bucket with rate \(r\) and capacity \(b\) admits over any interval of length \(T\) at most:</p>
 <ol class="opts"><li>\(rT\)</li><li data-correct>\(b+rT\)</li><li>\(b\)</li><li>\(brT\)</li></ol>
 <div class="explain">Bursts up to \(b\), long-run rate \(r\).</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-19" data-topic="§23.5 Tenancy">
+<div class="mcq" data-id="ch23-mcq-19" data-topic="§27.5 Tenancy">
 <p class="q">The 'noisy neighbour' problem in LLM serving is:</p>
 <ol class="opts"><li>Fan noise</li><li data-correct>One tenant's burst filling KV pools and queues, degrading others' latency</li><li>Network jitter only</li><li>Model hallucination</li></ol>
 <div class="explain">Rate limits, priorities and fair scheduling address it.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-20" data-topic="§23.5 Tenancy">
+<div class="mcq" data-id="ch23-mcq-20" data-topic="§27.5 Tenancy">
 <p class="q">Why do providers offer discounted batch APIs?</p>
 <ol class="opts"><li>Batch jobs are easier to compute</li><li data-correct>They move flexible work into demand troughs, raising utilisation</li><li>They use smaller models</li><li>They skip the KV cache</li></ol>
 <div class="explain">Completion within hours instead of seconds.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-21" data-topic="§23.5 Fairness">
+<div class="mcq" data-id="ch23-mcq-21" data-topic="§27.5 Fairness">
 <p class="q">VTC (virtual token counter) fairness charges tenants by:</p>
 <ol class="opts"><li>Requests</li><li data-correct>Tokens served, weighted for input and output</li><li>Wall-clock time</li><li>Adapters</li></ol>
 <div class="explain">Serves the tenant with the smallest counter next.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-22" data-topic="§23.6 Cascades">
+<div class="mcq" data-id="ch23-mcq-22" data-topic="§27.6 Cascades">
 <p class="q">A cascade's expected cost per query is:</p>
 <ol class="opts"><li>The large model's cost</li><li data-correct>Small model cost plus escalation rate × large model cost</li><li>Average of both</li><li>Zero</li></ol>
 <div class="explain">Escalated queries also pay more latency.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-23" data-topic="§23.6 Routers">
+<div class="mcq" data-id="ch23-mcq-23" data-topic="§27.6 Routers">
 <p class="q">RouteLLM-style routers:</p>
 <ol class="opts"><li>Route by user ID</li><li data-correct>Predict from the query which model is the cheapest that will answer well</li><li>Always pick the largest</li><li>Use random choice</li></ol>
 <div class="explain">Trained on preference data.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-24" data-topic="§23.7 Cost">
+<div class="mcq" data-id="ch23-mcq-24" data-topic="§27.7 Cost">
 <p class="q">Cost per million tokens for a replica is:</p>
 <ol class="opts"><li>\(c_{\text{gpu}}\times10^6\)</li><li data-correct>\(n_gc_{\text{gpu}}\times10^6/(3600\,\Phi\,u)\)</li><li>\(\Phi/c_{\text{gpu}}\)</li><li>Constant</li></ol>
 <div class="explain">Utilisation \(u\) divides throughput.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-25" data-topic="§23.7 Cost">
-<p class="q">From batch 1 to batch 64 in Figure 23.6, cost per million output tokens falls by about:</p>
+<div class="mcq" data-id="ch23-mcq-25" data-topic="§27.7 Cost">
+<p class="q">From batch 1 to batch 64 in Figure 27.6, cost per million output tokens falls by about:</p>
 <ol class="opts"><li>2×</li><li>5×</li><li data-correct>30×</li><li>1,000×</li></ol>
 <div class="explain">≈ $3.30 to ≈ 11 cents at $2.50/GPU-hour.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-26" data-topic="§23.7 Cost">
+<div class="mcq" data-id="ch23-mcq-26" data-topic="§27.7 Cost">
 <p class="q">Halving average utilisation changes cost per token by:</p>
 <ol class="opts"><li>No change</li><li data-correct>Doubling it</li><li>Halving it</li><li>Squaring it</li></ol>
 <div class="explain">Idle GPUs are still paid for.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-27" data-topic="§23.7 Cost">
+<div class="mcq" data-id="ch23-mcq-27" data-topic="§27.7 Cost">
 <p class="q">Why are input tokens cheaper than output tokens?</p>
 <ol class="opts"><li>They are shorter</li><li data-correct>Prefill processes thousands of tokens per weight read (compute-bound), while each output token needs a memory-bound decode step</li><li>They are cached always</li><li>They use FP4</li></ol>
 <div class="explain">Prefix caching cheapens repeated input further.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-28" data-topic="§23.7 Self-host">
+<div class="mcq" data-id="ch23-mcq-28" data-topic="§27.7 Self-host">
 <p class="q">In the self-hosting example, why did the API win at 2B output tokens/month?</p>
 <ol class="opts"><li>APIs use better GPUs</li><li data-correct>The self-hosted replicas were under 10% utilised</li><li>Self-hosting cannot use FP8</li><li>APIs have no cost</li></ol>
 <div class="explain">Break-even requires filling the replicas.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-29" data-topic="§23.8 Reliability">
+<div class="mcq" data-id="ch23-mcq-29" data-topic="§27.8 Reliability">
 <p class="q">Why should health checks perform a short generation rather than a TCP ping?</p>
 <ol class="opts"><li>Pings are slow</li><li data-correct>A replica can accept connections while producing wrong output or hanging</li><li>Generations are free</li><li>TCP is insecure</li></ol>
 <div class="explain">Test the whole path.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-30" data-topic="§23.8 Reliability">
+<div class="mcq" data-id="ch23-mcq-30" data-topic="§27.8 Reliability">
 <p class="q">Availability of a TP = 8 replica with each GPU 99.5% available is about:</p>
 <ol class="opts"><li>99.5%</li><li data-correct>96%</li><li>90%</li><li>60%</li></ol>
 <div class="explain">\(0.995^8\).</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-31" data-topic="§23.8 Reliability">
+<div class="mcq" data-id="ch23-mcq-31" data-topic="§27.8 Reliability">
 <p class="q">Request hedging means:</p>
 <ol class="opts"><li>Retrying after failure only</li><li data-correct>Sending a duplicate to another replica if the first has not started streaming by a deadline</li><li>Caching responses</li><li>Throttling</li></ol>
 <div class="explain">Cuts tail latency at the cost of duplicated work.</div>
 </div>
 
-<div class="mcq" data-id="ch23-mcq-32" data-topic="§23.8 Reliability">
+<div class="mcq" data-id="ch23-mcq-32" data-topic="§27.8 Reliability">
 <p class="q">Before upgrading a replica serving long reasoning requests, operators should:</p>
 <ol class="opts"><li>Kill it immediately</li><li data-correct>Drain it: stop admissions and let in-flight requests finish</li><li>Double its batch</li><li>Disable logging</li></ol>
 <div class="explain">Drains must be patient for minute-long requests.</div>

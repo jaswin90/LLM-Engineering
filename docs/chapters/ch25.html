@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ch 25 · On-Device and Edge Inference — Introduction to LLM Engineering</title>
-<meta name="description" content="Chapter 25 of Introduction to LLM Engineering: the arithmetic of batch-1 inference, phones, unified-memory laptops and discrete GPUs, llama.cpp, GGUF and k-quants, MLX and other runtimes, memory budgets, running models larger than memory from flash, power and thermal limits, and speculation and hybrid inference on devices.">
+<title>Ch 29 · On-Device and Edge Inference — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 29 of Introduction to LLM Engineering: the arithmetic of batch-1 inference, phones, unified-memory laptops and discrete GPUs, llama.cpp, GGUF and k-quants, MLX and other runtimes, memory budgets, running models larger than memory from flash, power and thermal limits, and speculation and hybrid inference on devices.">
 <script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -22,7 +22,7 @@
 <aside class="sidebar" aria-label="Chapter contents"></aside>
 <main>
 <article>
-<div class="chapter-kicker">Part VIII · Production — Chapter 25</div>
+<div class="chapter-kicker">Part IX · Production — Chapter 29</div>
 <h1 id="top">On-Device and Edge Inference</h1>
 <p class="lede">Not all inference happens in data centres. Laptops, phones, cars and embedded systems run language models for privacy, latency, offline use and cost, with one user, a few gigabytes of memory and a power budget measured in watts. This chapter applies the book's arithmetic to that regime: what bandwidth allows a single user, how llama.cpp, GGUF and MLX squeeze models onto consumer hardware, how quantisation, flash offloading and sparsity stretch the memory, and what power and heat do to sustained performance.</p>
 
@@ -40,10 +40,10 @@
 <li>Plan a model, precision and context to fit a device's memory budget, including KV cache.</li>
 <li>Explain flash offloading, activation sparsity and expert offloading for models larger than memory, and analyse power, thermal and battery limits.</li>
 </ol>
-<p class="small muted">Uses: Chapters 3, 5, 6, 8, 14, 15, 18 and 19. Symbols: <a href="../notation.html">notation page</a>.</p>
+<p class="small muted">Uses: Chapters 3, 5, 6, 8, 14, 15, 19 and 20. Symbols: <a href="../notation.html">notation page</a>.</p>
 </div>
 
-<h2 id="s25-1">25.1 The arithmetic of a single user</h2>
+<h2 id="s25-1">29.1 The arithmetic of a single user</h2>
 <p>On a personal device, decode almost always runs at batch 1. The arithmetic intensity of a batch-1 decode step is about \(2/b_w\) FLOPs per weight byte (§6.3): 1 FLOP per byte in BF16, 4 at 4-bit. Every consumer device, from a phone to a gaming GPU, has a ridge point of tens to hundreds of FLOPs per byte, so batch-1 decode is deeply memory-bound everywhere, and its speed is set by memory bandwidth alone:</p>
 \[ \text{tokens per second}\;\le\;\frac{\beta}{N\,b_w+t\,s_{kv}}, \]
 <p>the ratio of bandwidth to the bytes read per token, weights plus cache. For short contexts the cache term is small and the ceiling is simply \(\beta/(Nb_w)\). An 8B model in 4-bit quantisation (about 4.5 bits per weight with scales) occupies about 4.5 GB; on a laptop with 120 GB/s of memory bandwidth its ceiling is about 27 tokens per second, on a high-end laptop with 546 GB/s about 120, and on a phone with 60 GB/s about 13.</p>
@@ -62,16 +62,16 @@
   {"name":"Flagship phone (≈ 60 GB/s)","color":"s2","points":[[1,107],[3,35.6],[8,13.3]]}
  ]}
 </script>
-<figcaption><b>Figure 25.1 — Bandwidth sets the speed of a single user.</b> Ceiling \(\beta/(Nb_w)\) for 4.5-bit weights, short contexts, plotted only where the model fits the device's memory. Real implementations reach 60–80% of these ceilings. Comfortable interactive use needs roughly 10 tokens per second or more.</figcaption></figure>
+<figcaption><b>Figure 29.1 — Bandwidth sets the speed of a single user.</b> Ceiling \(\beta/(Nb_w)\) for 4.5-bit weights, short contexts, plotted only where the model fits the device's memory. Real implementations reach 60–80% of these ceilings. Comfortable interactive use needs roughly 10 tokens per second or more.</figcaption></figure>
 
-<p>Figure 25.1 plots the ceiling for four classes of device, showing only models that fit each device's memory. Two regularities stand out. Speed scales inversely with model size, so every doubling of parameters halves tokens per second, whatever the device; and memory capacity, not compute, decides which models are possible at all. A phone runs 1–3B models comfortably and an 8B model at the edge of usability; a base laptop runs up to about 14B; a laptop with 128 GB of fast unified memory runs a 70B model at about reading speed; a 24 GB gaming GPU runs a 32B model quickly but cannot hold a 70B one. The comparison with the data centre is instructive: an H100 reads 3.35 TB/s, so its batch-1 ceiling for the same 8B model is about 740 tokens per second, but it earns its keep by serving hundreds of users at once, which a personal device never needs to do.</p>
+<p>Figure 29.1 plots the ceiling for four classes of device, showing only models that fit each device's memory. Two regularities stand out. Speed scales inversely with model size, so every doubling of parameters halves tokens per second, whatever the device; and memory capacity, not compute, decides which models are possible at all. A phone runs 1–3B models comfortably and an 8B model at the edge of usability; a base laptop runs up to about 14B; a laptop with 128 GB of fast unified memory runs a 70B model at about reading speed; a 24 GB gaming GPU runs a 32B model quickly but cannot hold a 70B one. The comparison with the data centre is instructive: an H100 reads 3.35 TB/s, so its batch-1 ceiling for the same 8B model is about 740 tokens per second, but it earns its keep by serving hundreds of users at once, which a personal device never needs to do.</p>
 <p><strong>Prefill</strong> is the exception to memory-boundedness. A prompt of hundreds or thousands of tokens is a large matrix product, compute-bound, and its speed is the device's achieved FLOP/s divided by \(2N\). Consumer GPUs and laptop GPUs deliver tens of TFLOP/s in 16-bit arithmetic and phones a few, so a 3B model on a phone at an effective 2 TFLOP/s prefills about 310 tokens per second: a 2,000-token prompt, such as a long email thread, takes six or seven seconds before the first token. On devices, TTFT for long prompts is often the more noticeable delay, which is why mobile runtimes put so much effort into running prefill on the NPU or GPU and why prompt caching (§10.6) matters as much on a phone as in a data centre.</p>
 <div class="box example">
 <div class="box-title">Worked example — an 8B assistant on a laptop</div>
 <p>Llama 3 8B at 4.5 bits per weight (4.5 GB) on a laptop with 120 GB/s unified memory and a GPU delivering about 10 TFLOP/s in FP16. <strong>Decode ceiling:</strong> \(120/4.5\approx27\) tokens/s; at 70% efficiency about 19, comfortably above reading speed. <strong>Cache:</strong> 128 KiB per token in FP16, so a 4k context adds 0.5 GB and reduces the ceiling by about 10%; an 8-bit cache halves that. <strong>Prefill:</strong> \(2\times8\times10^{9}\) FLOPs per token at 10 TFLOP/s is about 625 tokens/s, so a 1,500-token prompt takes about 2.4 s. <strong>Memory:</strong> 4.5 GB of weights plus 0.5 GB of cache plus runtime overhead, about 6 GB, which fits beside other applications on a 16 GB machine.</p>
 </div>
 
-<h2 id="s25-2">25.2 The hardware</h2>
+<h2 id="s25-2">29.2 The hardware</h2>
 <p>Consumer devices fall into three architectural families, which differ mainly in their memory. <strong>Phones</strong> have a system-on-chip in which CPU cores, a GPU and a neural processing unit (NPU) share LPDDR memory, typically 8–16 GB in 2025 flagships with 50–80 GB/s of bandwidth; the operating system reserves much of it and limits how much any app may use. <strong>Laptops with unified memory</strong>, most prominently Apple's M-series, share one pool of LPDDR between CPU and GPU with far more bandwidth: about 100–120 GB/s in base chips, up to about 546 GB/s in the M4 Max and about 819 GB/s in the M3 Ultra, with capacities up to 128 GB in laptops and 512 GB in desktops. <strong>PCs with discrete GPUs</strong> separate a fast but small GPU memory (24 GB at about 1 TB/s on an RTX 4090, 32 GB at about 1.8 TB/s on an RTX 5090) from a larger, slower system memory connected over PCIe.</p>
 
 <figure class="diagram" id="fig-25-2">
@@ -106,12 +106,12 @@
 <text x="360" y="194" text-anchor="middle" class="t-xs">capacity decides which models fit; bandwidth decides how fast they decode;</text>
 <text x="360" y="210" text-anchor="middle" class="t-xs">a discrete GPU is fast only for what fits in its own memory</text>
 </svg>
-<figcaption><b>Figure 25.2 — Three memory architectures.</b> Phones share modest LPDDR among all processors; unified-memory laptops share a large, fast pool; discrete GPUs have small, very fast memory and reach system memory only over PCIe.</figcaption></figure>
+<figcaption><b>Figure 29.2 — Three memory architectures.</b> Phones share modest LPDDR among all processors; unified-memory laptops share a large, fast pool; discrete GPUs have small, very fast memory and reach system memory only over PCIe.</figcaption></figure>
 
-<p>Figure 25.2 sets the three side by side. Unified memory explains Apple Silicon's popularity for local LLMs: a 128 GB laptop can hold a 70B model in 4 bits and read it at over 500 GB/s, which no discrete consumer GPU can match in capacity. A discrete GPU is faster when the model fits in its memory, but a model that spills into system memory must cross PCIe at a few tens of GB/s and slows dramatically, so on PCs the choice of model is dictated by the GPU's memory size.</p>
+<p>Figure 29.2 sets the three side by side. Unified memory explains Apple Silicon's popularity for local LLMs: a 128 GB laptop can hold a 70B model in 4 bits and read it at over 500 GB/s, which no discrete consumer GPU can match in capacity. A discrete GPU is faster when the model fits in its memory, but a model that spills into system memory must cross PCIe at a few tens of GB/s and slows dramatically, so on PCs the choice of model is dictated by the GPU's memory size.</p>
 <p><strong>NPUs</strong> deserve a careful word. Phone and laptop vendors advertise NPU throughput in TOPS, trillions of low-precision operations per second, typically 35–50 TOPS in INT8 for 2024–25 flagship chips. These numbers matter for prefill and for vision models, which are compute-bound, but they do not raise the decode ceiling, which is set by the memory the NPU shares with everything else. NPUs also impose constraints that GPUs do not: they favour static shapes and particular quantisation formats, their compilers support a limited set of operators, and dynamic workloads such as variable-length attention with a growing cache map onto them awkwardly. In practice many on-device runtimes run prefill on the NPU or GPU and decode on whichever unit has the most efficient access to memory, and the most important specification of an AI-capable phone is its memory bandwidth and capacity, not its TOPS.</p>
 
-<h2 id="s25-3">25.3 llama.cpp and GGUF</h2>
+<h2 id="s25-3">29.3 llama.cpp and GGUF</h2>
 <p>llama.cpp<span class="cite"><a href="#r-llamacpp">[1]</a></span> began as a single file of C++ that implemented the LLaMA forward pass on the CPU with hand-written SIMD kernels and 4-bit weights. It grew into the most widely used local inference engine, built on the <em>ggml</em> tensor library, with back ends for x86 and ARM CPUs, Apple Metal, CUDA, Vulkan, SYCL and others, and support for hundreds of model architectures. Its design priorities differ from those of data-centre engines: minimal dependencies, a single portable binary, low memory overhead, memory-mapped model files that load instantly and are shared between processes, and good performance at batch 1 on whatever hardware the user has. It also includes a server with an OpenAI-compatible API and parallel "slots" for a few concurrent users, which is how applications such as Ollama and LM Studio expose it.</p>
 <p>In August 2023 the project introduced <strong>GGUF</strong>, a single-file format for models. A GGUF file contains a header, a key–value metadata section describing the architecture, hyperparameters and tokenizer (vocabulary, merges, special tokens, chat template), a table of tensor descriptors (name, shape, quantisation type, offset), and the aligned tensor data itself. Everything needed to run the model is in one file, which can be memory-mapped so that the operating system pages weights in on demand and shares them between processes.</p>
 
@@ -126,9 +126,9 @@
 <text x="360" y="150" text-anchor="middle" class="t-xs">mixed precision: embeddings, attention and FFN tensors can use different quantisation types (e.g. "Q4_K_M")</text>
 <text x="360" y="176" text-anchor="middle" class="t-xs">conversion: Hugging Face checkpoint → GGUF (f16) → quantised GGUF, optionally with an importance matrix</text>
 </svg>
-<figcaption><b>Figure 25.3 — The GGUF format.</b> A header, self-describing metadata (including the tokenizer and chat template), a tensor table and aligned, memory-mappable tensor data in per-tensor quantisation types.</figcaption></figure>
+<figcaption><b>Figure 29.3 — The GGUF format.</b> A header, self-describing metadata (including the tokenizer and chat template), a tensor table and aligned, memory-mappable tensor data in per-tensor quantisation types.</figcaption></figure>
 
-<p>Figure 25.3 shows the layout. The format's quantisation types encode the block scaling of §14.2. The early types were simple: Q4_0 stores blocks of 32 weights as 4-bit integers with one FP16 scale, \(4+16/32=4.5\) bits per weight; Q8_0 the same with 8-bit integers. The <strong>k-quants</strong>, added in mid-2023, use two-level blocking: a <em>super-block</em> of 256 weights is divided into 16 blocks of 16 (or 8 of 32), each block has its own low-precision scale (and minimum, for asymmetric types), and the super-block has full-precision scales for those scales. This captures local variation in magnitude, as small groups do, while spending few bits on scales. Q4_K, for example, uses 4-bit weights with 6-bit block scales and minimums and FP16 super-block scales, about 4.5 bits per weight; Q2_K to Q6_K span roughly 2.6 to 6.6 bits.</p>
+<p>Figure 29.3 shows the layout. The format's quantisation types encode the block scaling of §14.2. The early types were simple: Q4_0 stores blocks of 32 weights as 4-bit integers with one FP16 scale, \(4+16/32=4.5\) bits per weight; Q8_0 the same with 8-bit integers. The <strong>k-quants</strong>, added in mid-2023, use two-level blocking: a <em>super-block</em> of 256 weights is divided into 16 blocks of 16 (or 8 of 32), each block has its own low-precision scale (and minimum, for asymmetric types), and the super-block has full-precision scales for those scales. This captures local variation in magnitude, as small groups do, while spending few bits on scales. Q4_K, for example, uses 4-bit weights with 6-bit block scales and minimums and FP16 super-block scales, about 4.5 bits per weight; Q2_K to Q6_K span roughly 2.6 to 6.6 bits.</p>
 <p>Two refinements matter for quality. <em>Mixed-precision presets</em> such as Q4_K_M keep the most sensitive tensors, typically parts of the attention and the FFN down-projection, at a higher type, giving an average of about 4.8 bits per weight with noticeably better quality than uniform 4-bit. And an <em>importance matrix</em> (imatrix), computed by running calibration text through the model and recording the squared activations reaching each weight, weights the quantisation error by how much each weight matters, the same activation-aware idea as AWQ (§14.7). With these, 4- to 5-bit GGUF models are close to their 16-bit originals on most tasks, and 3-bit models usable for many.</p>
 <div class="box example">
 <div class="box-title">Worked example — bits per weight of a k-quant</div>
@@ -153,17 +153,17 @@
 <text x="360" y="164" text-anchor="middle" class="t-xs">weight ≈ d·s_b·q − m·m_b, with s_b, m_b the block's 6-bit codes and d, m the super-block's FP16 values</text>
 <text x="360" y="186" text-anchor="middle" class="t-xs">1,024 + 96 + 32 = 1,152 bits per 256 weights = 4.5 bits per weight</text>
 </svg>
-<figcaption><b>Figure 25.4 — Two-level block scaling.</b> Small blocks get their own low-precision scales and minimums, which a super-block scales in turn. The layout captures local magnitude variation at a small cost in bits.</figcaption></figure>
+<figcaption><b>Figure 29.4 — Two-level block scaling.</b> Small blocks get their own low-precision scales and minimums, which a super-block scales in turn. The layout captures local magnitude variation at a small cost in bits.</figcaption></figure>
 
-<p>Figure 25.4 draws the layout of this super-block.</p>
+<p>Figure 29.4 draws the layout of this super-block.</p>
 
 
-<h2 id="s25-4">25.4 MLX and other on-device runtimes</h2>
-<p>Apple's <strong>MLX</strong> (December 2023)<span class="cite"><a href="#r-mlx">[2]</a></span> is an array framework designed for Apple Silicon's unified memory. Arrays live in memory shared by CPU and GPU, so operations can run on either without copies; computation is lazy, building a graph that is evaluated when results are needed, which allows fusion; and its API resembles NumPy and PyTorch. The companion MLX-LM package runs and fine-tunes Hugging Face models with quantised weights, and on high-bandwidth Macs it approaches the bandwidth ceiling of Figure 25.1. MLX made the Mac a common platform for local experimentation with large models, including 4-bit 70B models on 128 GB laptops and quantised versions of very large MoE models on Mac Studios with 512 GB of memory.</p>
+<h2 id="s25-4">29.4 MLX and other on-device runtimes</h2>
+<p>Apple's <strong>MLX</strong> (December 2023)<span class="cite"><a href="#r-mlx">[2]</a></span> is an array framework designed for Apple Silicon's unified memory. Arrays live in memory shared by CPU and GPU, so operations can run on either without copies; computation is lazy, building a graph that is evaluated when results are needed, which allows fusion; and its API resembles NumPy and PyTorch. The companion MLX-LM package runs and fine-tunes Hugging Face models with quantised weights, and on high-bandwidth Macs it approaches the bandwidth ceiling of Figure 29.1. MLX made the Mac a common platform for local experimentation with large models, including 4-bit 70B models on 128 GB laptops and quantised versions of very large MoE models on Mac Studios with 512 GB of memory.</p>
 <p>Other runtimes target other niches. <strong>ExecuTorch</strong>, from the PyTorch project, compiles models ahead of time for mobile and embedded deployment, with delegates that hand subgraphs to vendor NPUs (Qualcomm, MediaTek, Apple Core ML) and a small runtime suitable for apps. <strong>MLC-LLM</strong> uses the TVM compiler to generate kernels for many back ends, including WebGPU, which lets models run inside a web browser. Vendor stacks, such as Qualcomm's AI Engine and Apple's Core ML, provide the most efficient path to their own NPUs but require models converted to their formats. And <strong>Ollama</strong> and <strong>LM Studio</strong> wrap llama.cpp (and MLX) in model management, a local API and a user interface.</p>
-<p>All of these share the concerns of the data-centre engines, kernels, quantisation, caching, scheduling, but weighted differently. Start-up time and memory overhead matter more, because a phone app may load a model on demand and must coexist with others. Portability matters more, because the hardware is diverse. Batch sizes are one or a few, so continuous batching is irrelevant but prompt caching is not. And energy, discussed in §25.7, becomes a first-class metric.</p>
+<p>All of these share the concerns of the data-centre engines, kernels, quantisation, caching, scheduling, but weighted differently. Start-up time and memory overhead matter more, because a phone app may load a model on demand and must coexist with others. Portability matters more, because the hardware is diverse. Batch sizes are one or a few, so continuous batching is irrelevant but prompt caching is not. And energy, discussed in §29.7, becomes a first-class metric.</p>
 
-<h2 id="s25-5">25.5 Fitting the model: memory budgets</h2>
+<h2 id="s25-5">29.5 Fitting the model: memory budgets</h2>
 <p>On a device, the model, its cache, the runtime and everything else the user is running must fit in memory together, and the operating system enforces limits: a phone app may be allowed only a few gigabytes even on a 12 GB phone, and a laptop user expects their browser and editor to keep working. Planning therefore starts from a memory budget.</p>
 
 <figure class="chart" id="fig-25-5">
@@ -180,18 +180,18 @@
   {"name":"3-bit","color":"s3","points":[[1,0.38],[3,1.12],[8,3.0],[14,5.25],[32,12],[70,26.3]]}
  ]}
 </script>
-<figcaption><b>Figure 25.5 — Precision decides what fits.</b> Weight bytes for dense models at four precisions, against typical memory limits. A phone app's budget admits a 3B model at 4–8 bits or an 8B model at 3 bits; a 24 GB GPU a 32B model at 4.5 bits; a 128 GB laptop a 70B model at 8 bits.</figcaption></figure>
+<figcaption><b>Figure 29.5 — Precision decides what fits.</b> Weight bytes for dense models at four precisions, against typical memory limits. A phone app's budget admits a 3B model at 4–8 bits or an 8B model at 3 bits; a 24 GB GPU a 32B model at 4.5 bits; a 128 GB laptop a 70B model at 8 bits.</figcaption></figure>
 
-<p>Figure 25.5 lines up weight memory against three typical limits. On phones, the practical sizes are 1–4B parameters at 4 bits, which is why vendors' on-device models cluster there, and why their training emphasises distillation from larger models (§15.7): a well-distilled 3B model is far more useful than a crudely quantised 8B one that barely fits. Apple described its 2024 on-device model as about three billion parameters compressed with a mixed 2-bit and 4-bit scheme averaging under 4 bits per weight, with low-rank adapters, swapped in for different tasks, recovering the quality lost to compression, a phone-scale version of the multi-LoRA serving of §23.4.</p>
+<p>Figure 29.5 lines up weight memory against three typical limits. On phones, the practical sizes are 1–4B parameters at 4 bits, which is why vendors' on-device models cluster there, and why their training emphasises distillation from larger models (§15.7): a well-distilled 3B model is far more useful than a crudely quantised 8B one that barely fits. Apple described its 2024 on-device model as about three billion parameters compressed with a mixed 2-bit and 4-bit scheme averaging under 4 bits per weight, with low-rank adapters, swapped in for different tasks, recovering the quality lost to compression, a phone-scale version of the multi-LoRA serving of §27.4.</p>
 <p>The KV cache must fit too, and on devices it is often the factor that limits context length. Llama 3.2 3B, with 28 layers and 8 key–value heads of dimension 128, stores 112 KiB per token in 16-bit precision: a 4k context needs about 460 MB and a 32k context 3.7 GB, more than the model itself. On-device runtimes therefore quantise the cache to 8 or 4 bits (§8.6), cap the context at what the product needs, and reuse cached prefixes such as system prompts across turns. Runtime overhead, scratch buffers for activations and the operating system's own needs add the rest; a useful rule of thumb is to keep the model's weights under about half of the memory the application can actually obtain.</p>
 
 <details class="drill">
-<summary>Drill 25.1 — Plan a phone deployment</summary>
+<summary>Drill 29.1 — Plan a phone deployment</summary>
 <p>An app may use about 4 GB on a phone with 60 GB/s of bandwidth. Choose between Llama 3.2 3B at 4.5 bits and Llama 3 8B at 3 bits, for 4k-token conversations. Estimate memory and decode speed for each, and say which you would pick.</p>
 <p><em>Solution.</em> <strong>3B at 4.5 bits:</strong> weights about 1.8 GB (3.2B parameters), cache at 4k with an 8-bit cache about 230 MB, total with overhead about 2.5 GB; decode ceiling \(60/(1.8+0.23)\approx30\) tokens/s, perhaps 20 in practice. <strong>8B at 3 bits:</strong> weights about 3.0 GB, cache (128 KiB per token at 16-bit, 64 KiB at 8-bit) about 270 MB at 4k, total about 3.7 GB, at the limit; decode ceiling \(60/3.3\approx18\) tokens/s, perhaps 12 in practice. The 3B model leaves headroom, runs faster and, at 4.5 bits, loses little to quantisation; the 8B model at 3 bits risks memory pressure and is noticeably degraded by 3-bit quantisation. Unless the task needs the 8B model's knowledge, choose the 3B model, ideally a version distilled for the app's task.</p>
 </details>
 
-<h2 id="s25-6">25.6 Larger than memory: flash, sparsity and experts</h2>
+<h2 id="s25-6">29.6 Larger than memory: flash, sparsity and experts</h2>
 <p>When a model does not fit in DRAM, the next tier is flash storage, which on phones and laptops reads at a few GB/s, tens to hundreds of times slower than DRAM. Streaming all weights from flash for every token would take seconds per token. Apple's "LLM in a flash" (Alizadeh et al., 2023)<span class="cite"><a href="#r-flash">[3]</a></span> showed how to run models up to twice the size of available DRAM by reading from flash only what each token needs. It relies on the activation sparsity of FFN layers (§15.8): with a predictor, only the FFN neurons likely to be active for the current token are loaded. Two further ideas make flash reads efficient: <em>windowing</em> keeps the neurons used by the last few tokens in DRAM, since consecutive tokens activate overlapping sets, so only the difference is loaded; and <em>row–column bundling</em> stores the up-projection row and down-projection column of each neuron contiguously, so that one larger read fetches both, matching flash's preference for large sequential reads. The paper reported speed-ups of several times on CPU and over twenty times on GPU compared with naive loading.</p>
 
 <figure class="diagram" id="fig-25-6">
@@ -209,47 +209,47 @@
 <line x1="220" y1="110" x2="298" y2="120" class="ln" marker-end="url(#a255)"/><line x1="578" y1="110" x2="502" y2="122" class="ln dash" marker-end="url(#a255)"/>
 <text x="360" y="208" text-anchor="middle" class="t-xs">the same logic serves MoE models: keep attention resident, fetch only the experts each token routes to</text>
 </svg>
-<figcaption><b>Figure 25.6 — Reading from flash only what a token needs.</b> Dense always-used parts stay in DRAM; FFN neurons predicted to be active are fetched from flash in large bundled reads, and those used by recent tokens stay cached in a sliding window.</figcaption></figure>
+<figcaption><b>Figure 29.6 — Reading from flash only what a token needs.</b> Dense always-used parts stay in DRAM; FFN neurons predicted to be active are fetched from flash in large bundled reads, and those used by recent tokens stay cached in a sliding window.</figcaption></figure>
 
-<p>Figure 25.6 summarises the scheme. Its effectiveness depends on activation sparsity, which, as §15.8 showed, is high for ReLU-style models and lower for SwiGLU models unless they are trained or thresholded for it, and on batch size, which on a device is one, exactly the regime where contextual sparsity pays. PowerInfer-2 (2024) applied related ideas to smartphones, splitting "hot" and "cold" neurons between DRAM and flash and pipelining flash reads with computation. Mixture-of-experts models fit the same pattern even more naturally: at batch 1 each token uses only \(k_r\) experts per layer (§18.4), so the attention and shared weights can stay in fast memory while experts are fetched on demand from slower memory or flash, with caching of recently used experts. This is how quantised MoE models with tens or hundreds of billions of total parameters run, slowly but usefully, on workstations and high-memory laptops, and why models such as gpt-oss-20b, released with 4-bit MoE weights, were designed to fit in about 16 GB.</p>
+<p>Figure 29.6 summarises the scheme. Its effectiveness depends on activation sparsity, which, as §15.8 showed, is high for ReLU-style models and lower for SwiGLU models unless they are trained or thresholded for it, and on batch size, which on a device is one, exactly the regime where contextual sparsity pays. PowerInfer-2 (2024) applied related ideas to smartphones, splitting "hot" and "cold" neurons between DRAM and flash and pipelining flash reads with computation. Mixture-of-experts models fit the same pattern even more naturally: at batch 1 each token uses only \(k_r\) experts per layer (§19.4), so the attention and shared weights can stay in fast memory while experts are fetched on demand from slower memory or flash, with caching of recently used experts. This is how quantised MoE models with tens or hundreds of billions of total parameters run, slowly but usefully, on workstations and high-memory laptops, and why models such as gpt-oss-20b, released with 4-bit MoE weights, were designed to fit in about 16 GB.</p>
 
 <div class="box example">
 <div class="box-title">Worked example — an MoE model larger than memory</div>
 <p><strong>Setup.</strong> A laptop has 16 GB of unified memory at 120 GB/s, of which about 10 GB can be given to a model, and an SSD that reads at about 5 GB/s. The model is a 30B-parameter MoE with 3B active parameters per token, quantised to 4.5 bits per weight: 17 GB in total, 1.7 GB read per token.</p>
-<p><strong>If everything fitted.</strong> Decode would read 1.7 GB per token from DRAM, a ceiling of \(120/1.7\approx70\) tokens per second, far faster than a dense 8B model (§25.1). That is the attraction of MoE on devices.</p>
+<p><strong>If everything fitted.</strong> Decode would read 1.7 GB per token from DRAM, a ceiling of \(120/1.7\approx70\) tokens per second, far faster than a dense 8B model (§29.1). That is the attraction of MoE on devices.</p>
 <p><strong>With experts streamed from flash.</strong> Attention, embeddings and the most popular experts stay in DRAM; the rest are read from the SSD when routed to. If a fraction \(m\) of the active expert bytes miss the DRAM cache, each token costs \(1.7/120\) s plus \(1.7m/5\) s. With \(m=0.05\) that is 14 + 17 ms, about 32 tokens per second; with \(m=0.2\), 14 + 68 ms, 12 tokens per second; with \(m=0.5\), under 6.</p>
-<p><strong>Consequence.</strong> The SSD is 24 times slower than DRAM, so the hit rate must exceed about 96% before flash stops dominating. That is why on-device MoE work concentrates on predicting and caching experts (exploiting the fact that consecutive tokens tend to reuse experts) and on reading in large contiguous chunks, as §25.6 described for dense models.</p>
+<p><strong>Consequence.</strong> The SSD is 24 times slower than DRAM, so the hit rate must exceed about 96% before flash stops dominating. That is why on-device MoE work concentrates on predicting and caching experts (exploiting the fact that consecutive tokens tend to reuse experts) and on reading in large contiguous chunks, as §29.6 described for dense models.</p>
 </div>
 
-<h2 id="s25-7">25.7 Power, heat and battery</h2>
+<h2 id="s25-7">29.7 Power, heat and battery</h2>
 <p>On a mains-powered GPU, energy is a cost; on a phone, it is a hard limit twice over. The battery holds a fixed amount of energy, typically 15–20 watt-hours, and the case can dissipate only a few watts continuously without becoming uncomfortable or throttling. Both limits translate into token budgets. If decoding a 3B model draws about 5 W at 20 tokens per second, each token costs 0.25 J; a 15 Wh battery holds 54 kJ, enough for about 200,000 tokens if the model did nothing else, a fraction of a day's heavy use. Energy per token falls with smaller and more aggressively quantised models, since fewer bytes are moved, and with efficient processors: NPUs usually deliver more operations per joule than GPUs, which deliver more than CPUs, which is the strongest argument for NPU offload even in memory-bound decode.</p>
 <p>Heat imposes a second, time-dependent limit. A phone or fanless laptop can run at peak power for seconds to a minute, after which its temperature rises and the system lowers clocks to stay within its thermal envelope. Benchmarks that run for ten seconds therefore overstate sustained performance; a fair on-device benchmark runs long enough to reach thermal steady state and reports both burst and sustained tokens per second. For memory-bound decode the effect is softer than for compute-bound work, since lower clocks hurt bandwidth-limited work less, but prefill, which is compute-bound, slows noticeably under throttling, lengthening TTFT for long prompts.</p>
 
 <details class="drill">
-<summary>Drill 25.2 — Tokens per battery</summary>
+<summary>Drill 29.2 — Tokens per battery</summary>
 <p>A phone with a 16 Wh battery runs a 3B model whose decode draws 4 W at 25 tokens/s and whose prefill draws 8 W at 300 tokens/s. A typical interaction has a 1,500-token prompt and a 300-token reply. How many interactions does a full battery support, ignoring everything else?</p>
 <p><em>Solution.</em> Prefill: 1,500 tokens at 300 tokens/s takes 5 s at 8 W, 40 J. Decode: 300 tokens at 25 tokens/s takes 12 s at 4 W, 48 J. Each interaction costs about 88 J. The battery holds \(16\times3600=57{,}600\) J, so about 650 interactions, or a few hours of continuous use. Prefill is nearly half of the energy; caching the system prompt and conversation prefix between turns would cut it substantially, and an NPU running prefill more efficiently would help further.</p>
 </details>
 
-<h2 id="s25-8">25.8 Small models, speculation and hybrid inference</h2>
-<p>The data-centre techniques that do not depend on batching transfer to devices, and some become more valuable. <strong>Speculative decoding</strong> (Chapter 19) is ideal at batch 1, where the target model leaves almost all compute idle: a tiny draft model, or n-gram lookup on the user's own text, proposes tokens that the main model verifies, raising tokens per second at the same bandwidth. llama.cpp and MLX both support draft models, and speculative gains on devices of 1.5–2.5× are common for predictable text. <strong>Prompt caching</strong> saves prefill time and energy across turns of a conversation. <strong>Distilled small models</strong> (§15.7) make the most of the parameters a device can hold.</p>
-<p>The last idea is not to choose between device and cloud at all. <strong>Hybrid inference</strong> runs what it can locally, for privacy, latency and cost, and sends to a server what the local model cannot handle well: a long document, a hard reasoning question, a request for knowledge the small model lacks. The routing decision is the cascade of §23.6 with a twist, since the "small model" is free and private and the "large model" costs money and sends data off the device; Apple's design of on-device models backed by server models running on its own hardware is an example. Designing such a system means deciding which requests may leave the device, how to detect that the local answer is inadequate, and how to keep the experience seamless when the network is slow or absent.</p>
+<h2 id="s25-8">29.8 Small models, speculation and hybrid inference</h2>
+<p>The data-centre techniques that do not depend on batching transfer to devices, and some become more valuable. <strong>Speculative decoding</strong> (Chapter 20) is ideal at batch 1, where the target model leaves almost all compute idle: a tiny draft model, or n-gram lookup on the user's own text, proposes tokens that the main model verifies, raising tokens per second at the same bandwidth. llama.cpp and MLX both support draft models, and speculative gains on devices of 1.5–2.5× are common for predictable text. <strong>Prompt caching</strong> saves prefill time and energy across turns of a conversation. <strong>Distilled small models</strong> (§15.7) make the most of the parameters a device can hold.</p>
+<p>The last idea is not to choose between device and cloud at all. <strong>Hybrid inference</strong> runs what it can locally, for privacy, latency and cost, and sends to a server what the local model cannot handle well: a long document, a hard reasoning question, a request for knowledge the small model lacks. The routing decision is the cascade of §27.6 with a twist, since the "small model" is free and private and the "large model" costs money and sends data off the device; Apple's design of on-device models backed by server models running on its own hardware is an example. Designing such a system means deciding which requests may leave the device, how to detect that the local answer is inadequate, and how to keep the experience seamless when the network is slow or absent.</p>
 
-<h2 id="s25-9">25.9 Beyond phones and laptops: browsers and small servers</h2>
+<h2 id="s25-9">29.9 Beyond phones and laptops: browsers and small servers</h2>
 <p>Two further edge settings complete the picture. The first is the <strong>web browser</strong>. WebGPU, a browser API that exposes the device's GPU to web pages, lets a model run inside a tab with no installation: MLC's WebLLM and similar projects compile models to WebGPU shaders and download quantised weights into the browser's storage. The arithmetic is that of the underlying device, bandwidth over bytes per token, with extra costs: the first visit downloads gigabytes of weights, shader compilation adds start-up time, and browsers limit how much memory a page may allocate. In return, a web application can offer private, offline-capable inference to any visitor with a capable GPU, which suits small models for tasks such as summarising a page or drafting text in a form.</p>
 <p>The second is the <strong>small shared server</strong>: an office workstation, a home server or an industrial edge box that serves a handful of users or devices on a local network. Here the batch is no longer one, and the data-centre ideas return in miniature. llama.cpp's server divides its context into a few parallel <em>slots</em>, each serving one conversation, and batches their decode steps together; with \(B\) active slots, the weights are read once for all of them, so total throughput rises almost linearly with \(B\) while each user's speed falls only slightly, exactly the batching argument of §6.6. The KV cache, divided among the slots, becomes the limit, so the same planning applies: memory for weights, memory per slot for its context, and a cap on concurrent users. For a team of a dozen people, one high-memory workstation running a 30–70B model with a few slots can replace a cloud subscription, at the cost of operating it.</p>
 
 <details class="drill">
-<summary>Drill 25.3 — A workstation serving a small team</summary>
+<summary>Drill 29.3 — A workstation serving a small team</summary>
 <p>A workstation with 128 GB of unified memory at 546 GB/s runs a 32B model at 4.5 bits (18 GB) with 8-bit KV caches of 128 KiB per token. The team wants 8 parallel slots with 16k contexts. Does it fit, and what are the per-user and total decode speeds when all slots are active at 8k average context?</p>
 <p><em>Solution.</em> Cache per slot at 16k: \(16{,}384\times128\) KiB ≈ 2.1 GB, so 8 slots need about 17 GB, plus 18 GB of weights and some overhead: about 40 GB, well within 128 GB. With all 8 slots at 8k average context, each step reads 18 GB of weights plus \(8\times8192\times128\) KiB ≈ 8.6 GB of cache, about 26.6 GB, so a step takes about \(26.6/546\approx49\) ms at the ceiling. Each user sees about 20 tokens/s and the team gets about 160 tokens/s in total, against about 30 tokens/s for a single user alone (\(546/18\)). Batching even a few users multiplies total throughput while keeping each above reading speed.</p>
 </details>
 
-<h2 id="s25-10">25.10 Shipping models to devices</h2>
-<p>Deployment to devices raises engineering problems that data centres do not have. Models must be <em>distributed</em> to millions of devices, so their size matters for download time and storage, which favours shipping one base model with small task adapters, as Apple does, and updating adapters rather than whole models. Devices are <em>heterogeneous</em>: different chips, memory sizes and operating-system versions, so a deployment ships several variants (precision, size) and selects one per device, with fallbacks when memory is short. Models must coexist with <em>other applications</em>: the operating system may evict a model's memory when the user switches apps, so runtimes must reload quickly, which memory-mapped formats help with. And <em>evaluation</em> must happen on real devices, since quantisation kernels, NPU compilers and thermal behaviour differ from the development machine: a model that is accurate and fast on a workstation can be slow or subtly different on a phone's NPU. The measurement discipline of Chapter 24, paired quality checks against the reference and sustained-performance benchmarks, applies with device-specific additions such as memory-pressure and battery tests.</p>
+<h2 id="s25-10">29.10 Shipping models to devices</h2>
+<p>Deployment to devices raises engineering problems that data centres do not have. Models must be <em>distributed</em> to millions of devices, so their size matters for download time and storage, which favours shipping one base model with small task adapters, as Apple does, and updating adapters rather than whole models. Devices are <em>heterogeneous</em>: different chips, memory sizes and operating-system versions, so a deployment ships several variants (precision, size) and selects one per device, with fallbacks when memory is short. Models must coexist with <em>other applications</em>: the operating system may evict a model's memory when the user switches apps, so runtimes must reload quickly, which memory-mapped formats help with. And <em>evaluation</em> must happen on real devices, since quantisation kernels, NPU compilers and thermal behaviour differ from the development machine: a model that is accurate and fast on a workstation can be slow or subtly different on a phone's NPU. The measurement discipline of Chapter 28, paired quality checks against the reference and sustained-performance benchmarks, applies with device-specific additions such as memory-pressure and battery tests.</p>
 
 <h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
-<p>This chapter completes the technical tour of the book. We have followed a token from the transformer's arithmetic, through the GPU's memory hierarchy and kernels, through caches, schedulers, engines and distributed systems, through compression and new architectures, to fleets in data centres and to a single phone in a pocket. The final chapter turns that material to a specific use: the ML-systems design interview, in which a candidate must reason aloud about exactly these trade-offs under time pressure. Chapter 26 presents a framework for such interviews, worked case studies with model answers, and the rubrics by which they are judged.</p>
+<p>This chapter completes the technical tour of the book. We have followed a token from the transformer's arithmetic, through the GPU's memory hierarchy and kernels, through caches, schedulers, engines and distributed systems, through compression and new architectures, to fleets in data centres and to a single phone in a pocket. The final chapter turns that material to a specific use: the ML-systems design interview, in which a candidate must reason aloud about exactly these trade-offs under time pressure. Chapter 30 presents a framework for such interviews, worked case studies with model answers, and the rubrics by which they are judged.</p>
 
 <h2 id="summary">Chapter summary</h2>
 <ul>
@@ -267,193 +267,193 @@
 <h2 id="mcq">Multiple-choice questions</h2>
 <p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
 <div class="quiz-section">
-<div class="mcq" data-id="ch25-mcq-01" data-topic="§25.1 Arithmetic">
+<div class="mcq" data-id="ch25-mcq-01" data-topic="§29.1 Arithmetic">
 <p class="q">Why is batch-1 decode memory-bound on every consumer device?</p>
 <ol class="opts"><li>Devices have no compute</li><li data-correct>Its intensity is about \(2/b_w\) FLOPs per byte, far below every device's ridge point</li><li>Batch 1 is compute-bound</li><li>Caches are disabled</li></ol>
 <div class="explain">Speed is set by bandwidth.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-02" data-topic="§25.1 Arithmetic">
+<div class="mcq" data-id="ch25-mcq-02" data-topic="§29.1 Arithmetic">
 <p class="q">An 8B model at 4.5 bits on a 120 GB/s laptop has a decode ceiling of about:</p>
 <ol class="opts"><li>2.7 tokens/s</li><li data-correct>27 tokens/s</li><li>270 tokens/s</li><li>2,700 tokens/s</li></ol>
 <div class="explain">\(120/4.5\).</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-03" data-topic="§25.1 Arithmetic">
+<div class="mcq" data-id="ch25-mcq-03" data-topic="§29.1 Arithmetic">
 <p class="q">On devices, which phase sets TTFT for long prompts?</p>
 <ol class="opts"><li>Decode</li><li data-correct>Prefill, which is compute-bound</li><li>Tokenisation</li><li>Sampling</li></ol>
 <div class="explain">Hence NPU/GPU prefill and prompt caching.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-04" data-topic="§25.1 Arithmetic">
+<div class="mcq" data-id="ch25-mcq-04" data-topic="§29.1 Arithmetic">
 <p class="q">What mostly decides which models a device can run at all?</p>
 <ol class="opts"><li>Its TOPS</li><li data-correct>Its memory capacity</li><li>Its CPU cores</li><li>Its screen</li></ol>
 <div class="explain">Bandwidth then decides how fast.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-05" data-topic="§25.2 Hardware">
+<div class="mcq" data-id="ch25-mcq-05" data-topic="§29.2 Hardware">
 <p class="q">Why are high-memory Apple Silicon laptops popular for local LLMs?</p>
 <ol class="opts"><li>They have NPUs</li><li data-correct>Unified memory gives large capacity (up to 128–512 GB) at hundreds of GB/s, shared by CPU and GPU</li><li>They are cheap</li><li>They use HBM</li></ol>
 <div class="explain">No discrete consumer GPU matches the capacity.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-06" data-topic="§25.2 Hardware">
+<div class="mcq" data-id="ch25-mcq-06" data-topic="§29.2 Hardware">
 <p class="q">A model that exceeds a discrete GPU's memory and spills into system RAM:</p>
 <ol class="opts"><li>Runs at the same speed</li><li data-correct>Slows dramatically because spilled weights cross PCIe at tens of GB/s</li><li>Cannot run</li><li>Runs faster</li></ol>
 <div class="explain">On PCs, GPU memory size dictates the model.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-07" data-topic="§25.2 NPU">
+<div class="mcq" data-id="ch25-mcq-07" data-topic="§29.2 NPU">
 <p class="q">NPU TOPS ratings primarily help:</p>
 <ol class="opts"><li>Decode speed</li><li data-correct>Compute-bound work such as prefill and vision models</li><li>Memory capacity</li><li>Network speed</li></ol>
 <div class="explain">Decode is limited by shared memory bandwidth.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-08" data-topic="§25.2 NPU">
+<div class="mcq" data-id="ch25-mcq-08" data-topic="§29.2 NPU">
 <p class="q">Constraints of NPUs relative to GPUs include: (select all that apply)</p>
 <ol class="opts"><li data-correct>Preference for static shapes</li><li data-correct>Limited operator support in compilers</li><li data-correct>Specific quantisation formats</li><li>Higher memory bandwidth than the SoC</li></ol>
 <div class="explain">Dynamic attention with growing caches maps awkwardly.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-09" data-topic="§25.3 llama.cpp">
+<div class="mcq" data-id="ch25-mcq-09" data-topic="§29.3 llama.cpp">
 <p class="q">llama.cpp's design priorities include: (select all that apply)</p>
 <ol class="opts"><li data-correct>Minimal dependencies and portability</li><li data-correct>Memory-mapped model files</li><li data-correct>Good batch-1 performance on diverse hardware</li><li>Large-batch data-centre throughput</li></ol>
 <div class="explain">Continuous batching at scale is not its focus.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-10" data-topic="§25.3 GGUF">
+<div class="mcq" data-id="ch25-mcq-10" data-topic="§29.3 GGUF">
 <p class="q">GGUF stores in one file: (select all that apply)</p>
 <ol class="opts"><li data-correct>Architecture metadata and hyperparameters</li><li data-correct>Tokenizer and chat template</li><li data-correct>Quantised tensor data</li><li>Training data</li></ol>
 <div class="explain">Self-describing and memory-mappable.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-11" data-topic="§25.3 GGUF">
+<div class="mcq" data-id="ch25-mcq-11" data-topic="§29.3 GGUF">
 <p class="q">Q4_0 (32 weights at 4 bits with one FP16 scale) costs:</p>
 <ol class="opts"><li>4 bits per weight</li><li data-correct>4.5 bits per weight</li><li>5 bits per weight</li><li>8 bits per weight</li></ol>
 <div class="explain">\(4+16/32\).</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-12" data-topic="§25.3 k-quants">
+<div class="mcq" data-id="ch25-mcq-12" data-topic="§29.3 k-quants">
 <p class="q">k-quants differ from simple block quantisation by:</p>
 <ol class="opts"><li>Using FP32 weights</li><li data-correct>Two-level scaling: small blocks with low-precision scales/minimums inside super-blocks with FP16 scales</li><li>Removing scales</li><li>Using 1-bit weights only</li></ol>
 <div class="explain">Same bits, lower error.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-13" data-topic="§25.3 k-quants">
+<div class="mcq" data-id="ch25-mcq-13" data-topic="§29.3 k-quants">
 <p class="q">The 4-bit k-quant super-block of 256 weights in the worked example costs:</p>
 <ol class="opts"><li>4.0 bits per weight</li><li data-correct>4.5 bits per weight</li><li>5.5 bits per weight</li><li>6.6 bits per weight</li></ol>
 <div class="explain">1,152 bits per 256 weights.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-14" data-topic="§25.3 Quality">
+<div class="mcq" data-id="ch25-mcq-14" data-topic="§29.3 Quality">
 <p class="q">Q4_K_M improves on uniform 4-bit by:</p>
 <ol class="opts"><li>Using larger blocks</li><li data-correct>Keeping sensitive tensors at higher precision (≈ 4.8 bpw average)</li><li>Removing attention</li><li>Using FP8</li></ol>
 <div class="explain">Mixed-precision preset.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-15" data-topic="§25.3 Quality">
+<div class="mcq" data-id="ch25-mcq-15" data-topic="§29.3 Quality">
 <p class="q">llama.cpp's importance matrix (imatrix) is analogous to:</p>
 <ol class="opts"><li>GPTQ's Hessian inverse</li><li data-correct>AWQ's activation-aware weighting of quantisation error</li><li>Pruning</li><li>Distillation</li></ol>
 <div class="explain">Computed from calibration activations.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-16" data-topic="§25.4 MLX">
+<div class="mcq" data-id="ch25-mcq-16" data-topic="§29.4 MLX">
 <p class="q">MLX is designed around:</p>
 <ol class="opts"><li>Discrete GPUs</li><li data-correct>Apple Silicon's unified memory, with lazy evaluation and no CPU–GPU copies</li><li>TPUs</li><li>Phones only</li></ol>
 <div class="explain">MLX-LM runs and fine-tunes models.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-17" data-topic="§25.4 Runtimes">
+<div class="mcq" data-id="ch25-mcq-17" data-topic="§29.4 Runtimes">
 <p class="q">ExecuTorch's role is:</p>
 <ol class="opts"><li>Training at scale</li><li data-correct>Ahead-of-time compilation of PyTorch models for mobile and embedded, with NPU delegates</li><li>A web browser</li><li>A tokenizer</li></ol>
 <div class="explain">MLC-LLM targets WebGPU among others.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-18" data-topic="§25.5 Budgets">
+<div class="mcq" data-id="ch25-mcq-18" data-topic="§29.5 Budgets">
 <p class="q">Typical on-device models for phones are about:</p>
 <ol class="opts"><li>0.1B</li><li data-correct>1–4B parameters at ≈ 4 bits</li><li>70B</li><li>400B</li></ol>
 <div class="explain">Distilled for quality at small size.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-19" data-topic="§25.5 Budgets">
+<div class="mcq" data-id="ch25-mcq-19" data-topic="§29.5 Budgets">
 <p class="q">Llama 3.2 3B's KV cache per token in 16-bit is about:</p>
 <ol class="opts"><li>11 KiB</li><li data-correct>112 KiB</li><li>1.1 MiB</li><li>11 MiB</li></ol>
 <div class="explain">28 layers × 8 KV heads × 128 × 2 × 2 bytes.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-20" data-topic="§25.5 Budgets">
+<div class="mcq" data-id="ch25-mcq-20" data-topic="§29.5 Budgets">
 <p class="q">At 32k context, Llama 3.2 3B's 16-bit cache is about:</p>
 <ol class="opts"><li>370 MB</li><li data-correct>3.7 GB</li><li>37 GB</li><li>370 GB</li></ol>
 <div class="explain">More than the 4-bit weights; quantise and cap context.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-21" data-topic="§25.5 Apple">
+<div class="mcq" data-id="ch25-mcq-21" data-topic="§29.5 Apple">
 <p class="q">Apple's 2024 on-device foundation model used:</p>
 <ol class="opts"><li>A 70B model</li><li data-correct>About 3B parameters with mixed 2- and 4-bit weights and task adapters</li><li>FP32 weights</li><li>No quantisation</li></ol>
 <div class="explain">Adapters recover quality lost to compression.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-22" data-topic="§25.5 Drill">
+<div class="mcq" data-id="ch25-mcq-22" data-topic="§29.5 Drill">
 <p class="q">For a 4 GB phone app budget, the drill preferred:</p>
 <ol class="opts"><li>8B at 3 bits</li><li data-correct>3B at 4.5 bits, for headroom, speed and quality</li><li>70B at 1 bit</li><li>No model</li></ol>
 <div class="explain">3-bit 8B risks memory pressure and degradation.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-23" data-topic="§25.6 Flash">
+<div class="mcq" data-id="ch25-mcq-23" data-topic="§29.6 Flash">
 <p class="q">LLM in a flash runs models larger than DRAM by:</p>
 <ol class="opts"><li>Compressing to 1 bit</li><li data-correct>Loading from flash only predicted-active FFN neurons, with windowing and row–column bundling</li><li>Using the cloud</li><li>Pruning all FFNs</li></ol>
 <div class="explain">Several times to over 20× faster than naive loading.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-24" data-topic="§25.6 Flash">
+<div class="mcq" data-id="ch25-mcq-24" data-topic="§29.6 Flash">
 <p class="q">Row–column bundling stores together:</p>
 <ol class="opts"><li>All attention heads</li><li data-correct>Each FFN neuron's up-projection row and down-projection column</li><li>Embeddings and LM head</li><li>KV blocks</li></ol>
 <div class="explain">One larger sequential read suits flash.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-25" data-topic="§25.6 Flash">
+<div class="mcq" data-id="ch25-mcq-25" data-topic="§29.6 Flash">
 <p class="q">Windowing in LLM in a flash exploits:</p>
 <ol class="opts"><li>Random activations</li><li data-correct>Overlap of active neurons between consecutive tokens</li><li>Parallel requests</li><li>Large batches</li></ol>
 <div class="explain">Only newly needed neurons are loaded.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-26" data-topic="§25.6 MoE">
+<div class="mcq" data-id="ch25-mcq-26" data-topic="§29.6 MoE">
 <p class="q">Why are MoE models well suited to on-device expert offloading?</p>
 <ol class="opts"><li>They are small</li><li data-correct>At batch 1 each token uses only \(k_r\) experts per layer, so most experts can stay in slower memory</li><li>They have no attention</li><li>They need no cache</li></ol>
 <div class="explain">Attention and shared weights stay resident.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-27" data-topic="§25.7 Power">
+<div class="mcq" data-id="ch25-mcq-27" data-topic="§29.7 Power">
 <p class="q">A phone decoding at 4 W and 25 tokens/s spends about how much energy per token?</p>
 <ol class="opts"><li>0.016 J</li><li data-correct>0.16 J</li><li>1.6 J</li><li>16 J</li></ol>
 <div class="explain">4/25.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-28" data-topic="§25.7 Power">
+<div class="mcq" data-id="ch25-mcq-28" data-topic="§29.7 Power">
 <p class="q">Why do short on-device benchmarks overstate performance?</p>
 <ol class="opts"><li>Caches are cold</li><li data-correct>Devices throttle clocks after reaching thermal limits; sustained performance is lower</li><li>Batteries charge</li><li>Models get smaller</li></ol>
 <div class="explain">Report burst and sustained.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-29" data-topic="§25.7 Power">
+<div class="mcq" data-id="ch25-mcq-29" data-topic="§29.7 Power">
 <p class="q">Thermal throttling hurts which phase more?</p>
 <ol class="opts"><li>Decode, which is bandwidth-bound</li><li data-correct>Prefill, which is compute-bound</li><li>Neither</li><li>Tokenisation</li></ol>
 <div class="explain">Lower clocks hurt compute-bound work most.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-30" data-topic="§25.8 Speculation">
+<div class="mcq" data-id="ch25-mcq-30" data-topic="§29.8 Speculation">
 <p class="q">Speculative decoding is especially attractive on devices because:</p>
 <ol class="opts"><li>Devices have huge batches</li><li data-correct>At batch 1 nearly all compute is idle, so verification is almost free</li><li>Draft models are banned in clouds</li><li>It reduces memory</li></ol>
 <div class="explain">1.5–2.5× gains are common.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-31" data-topic="§25.8 Hybrid">
+<div class="mcq" data-id="ch25-mcq-31" data-topic="§29.8 Hybrid">
 <p class="q">Hybrid on-device/cloud inference:</p>
 <ol class="opts"><li>Always uses the cloud</li><li data-correct>Runs what it can locally and escalates hard or knowledge-heavy requests to a server model</li><li>Never uses the cloud</li><li>Trains on device</li></ol>
 <div class="explain">A cascade with privacy constraints.</div>
 </div>
 
-<div class="mcq" data-id="ch25-mcq-32" data-topic="§25.8 Hybrid">
+<div class="mcq" data-id="ch25-mcq-32" data-topic="§29.8 Hybrid">
 <p class="q">Design questions for hybrid inference include: (select all that apply)</p>
 <ol class="opts"><li data-correct>Which requests may leave the device</li><li data-correct>How to detect an inadequate local answer</li><li data-correct>Behaviour when the network is slow or absent</li><li>Which GPU the server uses only</li></ol>
 <div class="explain">Seamless experience matters.</div>

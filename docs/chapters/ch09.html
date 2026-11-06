@@ -572,7 +572,7 @@ m &\leftarrow m^{\text{new}}
 <details class="qa" data-id="ch09-qa-07">
 <summary><span class="lvl core">Core</span> Estimate attention time in prefill for a long prompt with and without FlashAttention.</summary>
 <div class="answer">
-<p>Llama 3 8B, \(T=32{,}768\), H100. Standard: per head \(4T^2b\approx8.6\) GB of S/P traffic; ×32 heads ≈ 275 GB per layer ≈ 82 ms at 3.35 TB/s, and S alone needs 64 GiB per layer, so it does not fit. FlashAttention: FLOPs \(4T^2d_hn_h\approx1.76\times10^{13}\) per layer (non-causal) ≈ 30 ms at 60% MFU, ≈ 15 ms causal; ×32 layers ≈ 0.5 s. Conclusion: FlashAttention is what makes long prefills possible at all; beyond ~30k tokens attention dominates prefill compute (Chapter 3), motivating context parallelism and sparse attention (Chapter 20).</p>
+<p>Llama 3 8B, \(T=32{,}768\), H100. Standard: per head \(4T^2b\approx8.6\) GB of S/P traffic; ×32 heads ≈ 275 GB per layer ≈ 82 ms at 3.35 TB/s, and S alone needs 64 GiB per layer, so it does not fit. FlashAttention: FLOPs \(4T^2d_hn_h\approx1.76\times10^{13}\) per layer (non-causal) ≈ 30 ms at 60% MFU, ≈ 15 ms causal; ×32 layers ≈ 0.5 s. Conclusion: FlashAttention is what makes long prefills possible at all; beyond ~30k tokens attention dominates prefill compute (Chapter 3), motivating context parallelism and sparse attention (Chapter 21).</p>
 </div>
 </details>
 

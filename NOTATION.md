@@ -101,18 +101,18 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(p_{\text{te}}\), \(p_{\text{st}}\) | teacher and student next-token distributions (distillation) |
 | \(\mathrm{KL}(p\,\Vert\,q)\) | Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\) |
 
-## Communication (Ch. 16 onwards)
+## Communication (Ch. 17 onwards)
 | Symbol | Meaning |
 |---|---|
 | \(n_p\) | number of GPUs (ranks) taking part in a collective |
 | \(\nu\) | bytes in each rank's buffer for a collective (the message size) |
 | \(\alpha\) | per-step (per-message) latency of a communication step, seconds |
 | \(\beta_{\text{link}}\) | per-GPU, per-direction link bandwidth, bytes/s (NVLink on H100: 450 GB/s) |
-| \(n_{\text{TP}}, n_{\text{PP}}, n_{\text{DP}}, n_{\text{CP}}, n_{\text{EP}}\) | degrees of tensor, pipeline, data, context and expert parallelism (Ch. 17–18) |
-| \(n_\mu\) | number of micro-batches in flight in a pipeline (Ch. 17) |
-| \(T_c\) | tokens of a sequence held by one device under context parallelism (Ch. 17) |
+| \(n_{\text{TP}}, n_{\text{PP}}, n_{\text{DP}}, n_{\text{CP}}, n_{\text{EP}}\) | degrees of tensor, pipeline, data, context and expert parallelism (Ch. 18–18) |
+| \(n_\mu\) | number of micro-batches in flight in a pipeline (Ch. 18) |
+| \(T_c\) | tokens of a sequence held by one device under context parallelism (Ch. 18) |
 
-## Mixture of experts (Ch. 18)
+## Mixture of experts (Ch. 19)
 | Symbol | Meaning | DeepSeek-V3 |
 |---|---|---|
 | \(n_{\text{exp}}\) | routed experts per MoE layer | 256 |
@@ -123,7 +123,7 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(f_i\), \(\bar p_i\) | fraction of tokens routed to expert \(i\); mean router probability of expert \(i\) | |
 | \(\omega_i\) | routing bias of expert \(i\) (auxiliary-loss-free balancing) | |
 
-## Speculative decoding (Ch. 19)
+## Speculative decoding (Ch. 20)
 | Symbol | Meaning |
 |---|---|
 | \(q(v)\) | draft model's next-token distribution (the target's is \(p(v)\)) |
@@ -132,7 +132,7 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(n_{\text{acc}}\) | tokens produced per verification step (accepted drafts plus one) |
 | \(c_d\) | cost of one draft step relative to one target decode step |
 
-## Long context (Ch. 20)
+## Long context (Ch. 21)
 | Symbol | Meaning |
 |---|---|
 | \(T_{\text{train}}\) | longest context seen in (pre-)training |
@@ -141,17 +141,17 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\) | rotations pair \(r\) completes over the training length; \(c_{\text{lo}},c_{\text{hi}}\) YaRN ramp thresholds |
 | \(k_s\) | tokens (or blocks) selected per query by sparse attention |
 
-## Recurrent and state-space layers (Ch. 21)
+## Recurrent and state-space layers (Ch. 22)
 | Symbol | Meaning |
 |---|---|
 | \(\mathcal S_t\) | matrix-valued recurrent state of a linear-attention head after token \(t\) (\(d_v\times d_k\)) |
 | \(\psi(\cdot)\) | feature map of linear attention, \(\psi(q)^\top\psi(k)\approx\) similarity |
 | \(f_t\), \(\eta_t\) | forget (decay) gate in \((0,1]\) and write rate of a gated / delta-rule state update |
 | \(\mathbf A\), \(\mathbf b_t\), \(\mathbf c_t\) | SSM state matrix (diagonal) and input-dependent input/output vectors (Mamba's \(A,B,C\)) |
-| \(\Delta_t\) | SSM discretisation step (Ch. 21 only; unrelated to the quantisation step of Ch. 14) |
+| \(\Delta_t\) | SSM discretisation step (Ch. 22 only; unrelated to the quantisation step of Ch. 14) |
 | \(d_s\) | SSM state size per channel (Mamba's \(N\)) |
 
-## Reasoning and test-time compute (Ch. 22)
+## Reasoning and test-time compute (Ch. 26)
 | Symbol | Meaning |
 |---|---|
 | \(n_s\) | number of independent samples drawn for one problem (pass@\(n_s\), voting, best-of-\(n_s\)) |
@@ -159,7 +159,7 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(n_{\text{think}}\) | reasoning ("thinking") tokens generated before the answer |
 | \(\mathcal R_i\), \(\hat A_i\) | reward of rollout \(i\); its group-relative advantage (GRPO) |
 
-## Serving at scale (Ch. 23)
+## Serving at scale (Ch. 27)
 | Symbol | Meaning |
 |---|---|
 | \(n_r\) | number of replicas behind a router |

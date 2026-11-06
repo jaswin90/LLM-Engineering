@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ch 20 · Long-Context Inference — Introduction to LLM Engineering</title>
-<meta name="description" content="Chapter 20 of Introduction to LLM Engineering: the cost crossovers of long contexts, RoPE wavelengths and why extrapolation fails, position interpolation, NTK-aware scaling and YaRN, evaluating long-context use, sparse attention (Quest, NSA, MoBA, DSA), fitting caches, and long context versus retrieval.">
+<title>Ch 21 · Long-Context Inference — Introduction to LLM Engineering</title>
+<meta name="description" content="Chapter 21 of Introduction to LLM Engineering: the cost crossovers of long contexts, RoPE wavelengths and why extrapolation fails, position interpolation, NTK-aware scaling and YaRN, evaluating long-context use, sparse attention (Quest, NSA, MoBA, DSA), fitting caches, and long context versus retrieval.">
 <script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -22,12 +22,12 @@
 <aside class="sidebar" aria-label="Chapter contents"></aside>
 <main>
 <article>
-<div class="chapter-kicker">Part VII · Faster Decoding and Longer Contexts — Chapter 20</div>
+<div class="chapter-kicker">Part VII · Faster Decoding and Longer Contexts — Chapter 21</div>
 <h1 id="top">Long-Context Inference</h1>
 <p class="lede">Contexts grew from 2,048 tokens in 2020 to 128k as a standard and a million at the frontier. At those lengths every assumption of short-context serving breaks: attention dominates prefill, the cache dominates decode and outgrows GPU memory, and the positional encoding meets positions it never saw in training. This chapter derives where the costs cross over, explains how RoPE is stretched to new lengths, how sparse attention cuts the cost of reading a long cache, and when retrieval is the better answer.</p>
 
 <h2 id="opening" class="unnumbered">Why this chapter</h2>
-<p>Long context changed what language models are used for. A model that can read a whole codebase, a contract with its appendices, an hour of transcribed meeting or the full history of an agent's actions can answer questions no retrieval system would route correctly. Reasoning models (Chapter 22) generate tens of thousands of tokens of thought, so even short prompts produce long contexts. By 2025, 128k-token windows were the norm for open models such as Llama 3.1, and providers offered a million tokens or more.</p>
+<p>Long context changed what language models are used for. A model that can read a whole codebase, a contract with its appendices, an hour of transcribed meeting or the full history of an agent's actions can answer questions no retrieval system would route correctly. Reasoning models (Chapter 26) generate tens of thousands of tokens of thought, so even short prompts produce long contexts. By 2025, 128k-token windows were the norm for open models such as Llama 3.1, and providers offered a million tokens or more.</p>
 <p>For the inference engineer, long context is where the costs of earlier chapters change their shape. The attention term that we could ignore at 2k tokens grows quadratically and overtakes the linear layers. The KV cache that was a few hundred megabytes per sequence becomes tens of gigabytes, so the memory-limited batch collapses and the cache, not the weights, sets the time of each decode step. And the model itself must be made to work at lengths beyond those it was pretrained on, because pretraining on million-token sequences is prohibitively expensive. This chapter takes these problems in order: what long contexts cost and where the crossovers lie; how rotary position embeddings are extended (position interpolation, NTK-aware scaling, YaRN); how to tell whether a model really uses its long context; how sparse attention, from training-free page selection to DeepSeek's trained sparse attention, cuts the bytes each decode step must read; and how long context compares with retrieval.</p>
 
 <div class="box objectives">
@@ -43,7 +43,7 @@
 <p class="small muted">Uses: Chapters 2 (§2.5, RoPE), 3, 6, 8, 9, 10, 13 and 17. Symbols: <a href="../notation.html">notation page</a>.</p>
 </div>
 
-<h2 id="s20-1">20.1 What long context costs</h2>
+<h2 id="s20-1">21.1 What long context costs</h2>
 <p>Two crossovers organise everything. In <strong>prefill</strong>, a prompt of \(T\) tokens costs about \(2NT\) FLOPs in the linear layers and, with a causal mask, about \(2LdT^2\) in attention: each query attends on average to \(T/2\) earlier positions, with \(2d\) FLOPs for the score and \(2d\) for the weighted value per position and layer (§2.10). The attention share of prefill FLOPs is therefore</p>
 \[ \frac{LdT}{N+LdT},\qquad\text{equal to one half at}\quad T^{*}_{\text{FLOP}}=\frac{N}{Ld}. \]
 <p>For Llama 3 8B, \(T^{*}_{\text{FLOP}}=8.03\times10^{9}/(32\times4096)\approx61{,}000\) tokens; for Llama 3 70B, \(70.6\times10^{9}/(80\times8192)\approx108{,}000\). Below these lengths prefill is dominated by the dense matrix products and costs roughly linear time; above them it becomes quadratic. Notice that the ratio depends on the model's width-to-depth balance, not its size alone: wider, shallower models reach the crossover later.</p>
@@ -62,11 +62,11 @@
   {"name":"Llama 3 8B: LdT / (N + LdT)","color":"s1","points":[[1024,0.016],[4096,0.063],[16384,0.211],[32768,0.348],[65536,0.517],[131072,0.681],[262144,0.811],[1048576,0.945]]}
  ]}
 </script>
-<figcaption><b>Figure 20.1 — Beyond the crossover, attention is the model.</b> At 4k tokens attention is 6% of prefill FLOPs; at 128k it is 68%, and at a million 95%. The crossover \(T^{*}=N/(Ld)\) is about 61k tokens for Llama 3 8B and 108k for Llama 3 70B.</figcaption></figure>
+<figcaption><b>Figure 21.1 — Beyond the crossover, attention is the model.</b> At 4k tokens attention is 6% of prefill FLOPs; at 128k it is 68%, and at a million 95%. The crossover \(T^{*}=N/(Ld)\) is about 61k tokens for Llama 3 8B and 108k for Llama 3 70B.</figcaption></figure>
 
-<p>Figure 20.1 plots the attention share for Llama 3 8B. At the 2k–8k contexts of the earlier chapters it is a few per cent, which is why we could treat prefill as \(2NT\). At 128k it is two thirds, and at a million it is almost everything: a million-token prompt to an 8B model costs about \(2\times8\times10^{15}\) linear FLOPs plus \(2.7\times10^{17}\) attention FLOPs, around eight minutes on one H100 at 60% utilisation. This is why the context parallelism of §17.4 exists, why FlashAttention's efficiency matters most at long lengths (Chapter 9), and why long prefixes are such valuable targets for prefix caching (Chapter 10). In decode, the corresponding fact is that time per output token at 128k is dominated by reading 16 GB of cache per sequence, so the batch sizes that make short-context decode efficient are not available. Before addressing these costs, though, there is a more basic problem: a model pretrained on 8k-token sequences does not work at 128k at all.</p>
+<p>Figure 21.1 plots the attention share for Llama 3 8B. At the 2k–8k contexts of the earlier chapters it is a few per cent, which is why we could treat prefill as \(2NT\). At 128k it is two thirds, and at a million it is almost everything: a million-token prompt to an 8B model costs about \(2\times8\times10^{15}\) linear FLOPs plus \(2.7\times10^{17}\) attention FLOPs, around eight minutes on one H100 at 60% utilisation. This is why the context parallelism of §18.4 exists, why FlashAttention's efficiency matters most at long lengths (Chapter 9), and why long prefixes are such valuable targets for prefix caching (Chapter 10). In decode, the corresponding fact is that time per output token at 128k is dominated by reading 16 GB of cache per sequence, so the batch sizes that make short-context decode efficient are not available. Before addressing these costs, though, there is a more basic problem: a model pretrained on 8k-token sequences does not work at 128k at all.</p>
 
-<h2 id="s20-2">20.2 Positions beyond training</h2>
+<h2 id="s20-2">21.2 Positions beyond training</h2>
 <p>Recall rotary position embedding from §2.5. The \(d_h\) coordinates of each query and key are grouped into \(d_h/2\) pairs, and pair \(r\) at position \(i\) is rotated by the angle \(i\theta_r\), with frequencies \(\theta_r=\Theta^{-2r/d_h}\) for \(r=0,\dots,d_h/2-1\). The dot product of a query at position \(i\) and a key at position \(j\) then depends on positions only through the angles \((i-j)\theta_r\). Each frequency has a <strong>wavelength</strong> \(\Lambda_r=2\pi/\theta_r\), the distance in tokens over which pair \(r\) completes one rotation. For Llama 3, with \(\Theta=500{,}000\) and \(d_h=128\), the wavelengths range from about 6 tokens for \(r=0\) to about 2.5 million tokens for \(r=63\), geometrically spaced.</p>
 
 <figure class="diagram" id="fig-20-2">
@@ -90,12 +90,12 @@
 <text x="142" y="176" class="t-xs">r = 0: Λ ≈ 6 tokens</text><text x="694" y="176" text-anchor="end" class="t-xs">r = 63: Λ ≈ 2.5M tokens</text>
 <text x="360" y="204" text-anchor="middle" class="t-xs">high-frequency pairs encode local order; low-frequency pairs encode coarse, long-range position</text>
 </svg>
-<figcaption><b>Figure 20.2 — Which frequencies break.</b> High-frequency pairs complete many rotations within the training length, so the model has seen every angle they can take. Low-frequency pairs complete less than one rotation in training, so at longer positions they produce angles the model never saw.</figcaption></figure>
+<figcaption><b>Figure 21.2 — Which frequencies break.</b> High-frequency pairs complete many rotations within the training length, so the model has seen every angle they can take. Low-frequency pairs complete less than one rotation in training, so at longer positions they produce angles the model never saw.</figcaption></figure>
 
-<p>Figure 20.2 places the wavelengths on a log scale against an 8k training length. The high-frequency pairs, with wavelengths of a few to a few hundred tokens, complete many full rotations within the training length, so every angle they can take has been seen in training at many relative distances; these pairs encode fine-grained, local order, and they are unaffected by longer contexts. The low-frequency pairs, with wavelengths longer than the training length, never complete a rotation in training. The angles \((i-j)\theta_r\) that the model saw for them lay in an interval \([0,T_{\text{train}}\theta_r)\) smaller than \(2\pi\); at relative distances beyond \(T_{\text{train}}\), these pairs produce angles outside that interval, inputs the attention heads have never been trained on. This is why naive extrapolation fails: perplexity explodes a little beyond the training length, not because the model cannot represent long-range relationships, but because its low-frequency position features go out of distribution.</p>
+<p>Figure 21.2 places the wavelengths on a log scale against an 8k training length. The high-frequency pairs, with wavelengths of a few to a few hundred tokens, complete many full rotations within the training length, so every angle they can take has been seen in training at many relative distances; these pairs encode fine-grained, local order, and they are unaffected by longer contexts. The low-frequency pairs, with wavelengths longer than the training length, never complete a rotation in training. The angles \((i-j)\theta_r\) that the model saw for them lay in an interval \([0,T_{\text{train}}\theta_r)\) smaller than \(2\pi\); at relative distances beyond \(T_{\text{train}}\), these pairs produce angles outside that interval, inputs the attention heads have never been trained on. This is why naive extrapolation fails: perplexity explodes a little beyond the training length, not because the model cannot represent long-range relationships, but because its low-frequency position features go out of distribution.</p>
 <p>The diagnosis suggests the cure: change the frequencies so that, at the new length, every pair's angles stay within the range seen in training, while disturbing the well-learned high-frequency pairs as little as possible. The methods of the next section differ precisely in how they distribute this change across frequencies.</p>
 
-<h2 id="s20-3">20.3 Stretching RoPE: interpolation, NTK and YaRN</h2>
+<h2 id="s20-3">21.3 Stretching RoPE: interpolation, NTK and YaRN</h2>
 <p>Let \(\mu=T_{\text{target}}/T_{\text{train}}\) be the extension factor, for example 16 to go from 8k to 128k. <strong>Position interpolation</strong> (PI; Chen, Wong, Chen and Tian, Meta, June 2023)<span class="cite"><a href="#r-pi">[1]</a></span> is the simplest remedy: divide every position by \(\mu\), equivalently divide every frequency, \(\theta_r'=\theta_r/\mu\). Positions up to \(T_{\text{target}}\) then map into \([0,T_{\text{train}})\), so no pair ever sees an angle outside its trained range. With about a thousand steps of fine-tuning on long sequences, PI extended LLaMA models from 2k to 32k tokens. Its weakness is that it compresses the high-frequency pairs too: two adjacent tokens are now separated by \(1/\mu\) of the angle they had in training, so the model's resolution of local order is degraded, and some short-context quality is lost.</p>
 <p><strong>NTK-aware scaling</strong> (proposed by a contributor known as bloc97 in June 2023, motivated by neural-tangent-kernel arguments about learning high-frequency functions) changes the base instead of the positions: \(\Theta'=\Theta\,\kappa\) with \(\kappa=\mu^{d_h/(d_h-2)}\). Then \(\theta_r'=\theta_r\,\kappa^{-2r/d_h}\): the highest frequency (\(r=0\)) is unchanged, the lowest (\(r=d_h/2-1\)) is divided by exactly \(\mu\), and the frequencies in between are scaled by a geometrically varying factor. High frequencies keep their local resolution; low frequencies are interpolated. It works without fine-tuning for moderate extensions and better with it, and a "dynamic" variant scales \(\Theta\) with the current sequence length, so short contexts are untouched. Raising \(\Theta\) itself became standard practice for long-context training: Llama 3's \(\Theta=500{,}000\), against Llama 2's 10,000, is an example.</p>
 <p><strong>YaRN</strong> (Peng, Quesnelle, Fan and Shippole, 2023)<span class="cite"><a href="#r-yarn">[2]</a></span> makes the frequency-dependent treatment explicit. For each pair it counts the rotations completed over the training length, \(n_{\text{rot}}(r)=T_{\text{train}}/\Lambda_r\). Pairs with many rotations (\(n_{\text{rot}}&gt;c_{\text{hi}}\), typically 32) are left alone; pairs with less than one rotation (\(n_{\text{rot}}&lt;c_{\text{lo}}\), typically 1) are fully interpolated by \(\mu\); pairs in between are blended with a linear ramp,</p>
@@ -114,13 +114,13 @@
   {"name":"YaRN: keep, ramp, interpolate","color":"s1","points":[[0,1],[4,1],[8,1],[12,1],[16,1],[20,0.6852],[24,0.3198],[28,0.1589],[32,0.088],[36,0.0625],[40,0.0625],[48,0.0625],[60,0.0625]]}
  ]}
 </script>
-<figcaption><b>Figure 20.3 — Where each method spends its interpolation.</b> Llama 3 frequencies (\(\Theta=500{,}000\)) with \(T_{\text{train}}=8{,}192\). PI compresses every frequency equally, including the local ones. NTK leaves the highest frequency untouched and interpolates progressively. YaRN keeps all pairs with more than 32 training rotations exactly, fully interpolates those with less than one, and ramps between.</figcaption></figure>
+<figcaption><b>Figure 21.3 — Where each method spends its interpolation.</b> Llama 3 frequencies (\(\Theta=500{,}000\)) with \(T_{\text{train}}=8{,}192\). PI compresses every frequency equally, including the local ones. NTK leaves the highest frequency untouched and interpolates progressively. YaRN keeps all pairs with more than 32 training rotations exactly, fully interpolates those with less than one, and ramps between.</figcaption></figure>
 
-<p>Figure 20.3 compares the three schemes for an extension from 8k to 128k. PI is a flat line at 1/16: every pair, even the six-token-wavelength one, is slowed sixteen-fold. NTK starts at 1 for the highest frequency and declines smoothly to 1/16 at the lowest, so it interpolates mid-frequency pairs that YaRN would leave alone. YaRN's curve is flat at 1 for the first twenty pairs, whose wavelengths are under about 250 tokens and which complete more than 32 rotations in 8k tokens, falls steeply through the pairs whose wavelengths are comparable to the training length, and reaches 1/16 for every pair with a wavelength beyond 8k. The design principle is the diagnosis of §20.2: leave alone what was well learned, interpolate what was never seen, and blend the rest.</p>
+<p>Figure 21.3 compares the three schemes for an extension from 8k to 128k. PI is a flat line at 1/16: every pair, even the six-token-wavelength one, is slowed sixteen-fold. NTK starts at 1 for the highest frequency and declines smoothly to 1/16 at the lowest, so it interpolates mid-frequency pairs that YaRN would leave alone. YaRN's curve is flat at 1 for the first twenty pairs, whose wavelengths are under about 250 tokens and which complete more than 32 rotations in 8k tokens, falls steeply through the pairs whose wavelengths are comparable to the training length, and reaches 1/16 for every pair with a wavelength beyond 8k. The design principle is the diagnosis of §21.2: leave alone what was well learned, interpolate what was never seen, and blend the rest.</p>
 <p>None of these methods removes the need for long training data. A model extended by YaRN can attend at 128k, but to use that range well it must be trained on documents in which long-range dependencies matter, which is why every serious long-context model includes a continued-pretraining or fine-tuning phase on long sequences, often with progressively increasing lengths. LongRoPE (2024) went further, searching per-dimension scaling factors to extend models to two million tokens. Positional extension makes long contexts <em>possible</em>; whether the model makes good use of them is a separate question, and it must be measured.</p>
 
 <details class="drill">
-<summary>Drill 20.1 — Which pairs need interpolation?</summary>
+<summary>Drill 21.1 — Which pairs need interpolation?</summary>
 <p>For a model with \(\Theta=10{,}000\), \(d_h=128\) and \(T_{\text{train}}=4{,}096\) (Llama 2), find the pair index above which the wavelength exceeds the training length, and the index below which pairs complete more than 32 rotations. What fraction of pairs does YaRN leave untouched?</p>
 <p><em>Solution.</em> \(\Lambda_r=2\pi\,\Theta^{2r/d_h}=2\pi\times10^{4r/64}\). \(\Lambda_r&gt;4096\) when \(10^{r/16}&gt;652\), i.e. \(r&gt;16\log_{10}652\approx45\). More than 32 rotations means \(\Lambda_r&lt;128\), i.e. \(10^{r/16}&lt;20.4\), \(r&lt;21\). So pairs 0–20 (about a third) are kept exactly, pairs 46–63 (about 28%) are fully interpolated, and the 25 in between are ramped. Llama 3, with base 500,000 and an 8k training length, has 28 never-completed pairs (\(r\ge36\)), because a larger base stretches all wavelengths.</p>
 </details>
@@ -130,15 +130,15 @@
 <p><strong>Setup.</strong> Llama 3 was pretrained at \(T_{\text{train}}=8192\) with \(\Theta=500{,}000\) and \(d_h=128\), so it has 64 frequency pairs with \(\theta_r=\Theta^{-2r/d_h}\) and wavelengths \(\Lambda_r=2\pi\Theta^{2r/d_h}\). Llama 3.1 extends the context to 128k with a scale factor of 8, keeping high-frequency pairs (\(\Lambda_r&lt;T_{\text{train}}/4=2048\)), dividing the frequency of low-frequency pairs (\(\Lambda_r>T_{\text{train}}\)) by 8, and blending in between.</p>
 <p><strong>Low-frequency pairs.</strong> \(\Lambda_r>8192\) means \(\Theta^{2r/128}>8192/2\pi\approx1304\), i.e. \(2r/128>\ln1304/\ln500{,}000=7.17/13.12=0.547\), so \(r\ge35\). Pairs 35–63, 29 of them, never completed a full rotation during pretraining. Their angles at positions beyond 8k would be new to the model, so they are interpolated.</p>
 <p><strong>High-frequency pairs.</strong> \(\Lambda_r&lt;2048\) means \(\Theta^{2r/128}&lt;326\), i.e. \(2r/128&lt;0.441\), so \(r\le28\). Pairs 0–28, also 29, rotated at least four times within the training length and saw every angle many times; they encode local order and are left alone.</p>
-<p><strong>Consequence.</strong> Only the six pairs \(r=29,\dots,34\) are blended. The model keeps its fine positional resolution exactly where it matters for nearby tokens and stretches only the slow dimensions, which is why a short continued-training phase suffices, as opposed to the full positional interpolation of §20.3, which compresses every pair and blurs local order.</p>
+<p><strong>Consequence.</strong> Only the six pairs \(r=29,\dots,34\) are blended. The model keeps its fine positional resolution exactly where it matters for nearby tokens and stretches only the slow dimensions, which is why a short continued-training phase suffices, as opposed to the full positional interpolation of §21.3, which compresses every pair and blurs local order.</p>
 </div>
 
-<h2 id="s20-4">20.4 Does the model use its context?</h2>
+<h2 id="s20-4">21.4 Does the model use its context?</h2>
 <p>Advertised context lengths say how many tokens a model accepts, not how well it uses them. The first popular test, the "needle in a haystack" (Kamradt, 2023), hides a sentence such as a passphrase at a chosen depth in a long irrelevant document and asks for it back, sweeping length and depth. Most long-context models now pass it almost perfectly, which shows that attention can retrieve a distinctive fact from anywhere in the window. It is also a weak test, because finding one unusual sentence by lexical match is much easier than reasoning over many dispersed pieces of information.</p>
 <p>Harder evaluations expose real limits. Liu and colleagues (2023)<span class="cite"><a href="#r-lost">[3]</a></span> found that in multi-document question answering, accuracy followed a U-shape over the position of the relevant document: high when it was near the beginning or end of the context, markedly lower in the middle, an effect they called <strong>lost in the middle</strong>. RULER (Hsieh et al., 2024)<span class="cite"><a href="#r-ruler">[4]</a></span> combined multi-needle retrieval, variable tracking across the context, aggregation of frequent words and question answering with distractors, and defined a model's <em>effective</em> context length as the longest at which it stays above a quality threshold; for many models of 2024 the effective length was a fraction of the advertised one, sometimes a quarter. Benchmarks of long-document reasoning, such as multi-hop questions over books and code repositories, show similar gaps.</p>
 <p>For deployment, two lessons follow. First, a long-context capability must be evaluated on the product's own task at the lengths it will see, not inferred from a needle test or a context-length specification. Second, how information is placed matters: putting the question after the documents, and the most relevant material near the start or end, measurably improves accuracy, and prompt structure interacts with prefix caching (§10.6), since stable documents placed first can be cached across requests. Quality limits and cost limits often point the same way, towards reading less of the context more carefully, which is the idea behind sparse attention.</p>
 
-<h2 id="s20-5">20.5 Sparse attention</h2>
+<h2 id="s20-5">21.5 Sparse attention</h2>
 <p>In a long context, most keys receive almost no attention from any given query: the softmax concentrates on a small number of relevant positions plus a few structural ones (the attention sinks of §8.7). If we knew in advance which keys matter, we could read only those, and decode at 128k would cost little more than at a few thousand. Sparse attention methods differ in how they decide which keys to read, and whether the model is trained to work with the selection.</p>
 <p>The <em>static</em> patterns of Chapter 8, sliding windows and local/global hybrids, fix the selection by position and must be trained into the model; they bound the cache but cannot retrieve a distant fact that a window has dropped. <em>Training-free, query-aware</em> methods choose keys dynamically at decode time without changing the model. Quest (Tang et al., 2024)<span class="cite"><a href="#r-quest">[5]</a></span> keeps, for each page of the paged cache (Chapter 10), the elementwise minimum and maximum of its keys; for a query \(q\), the sum over coordinates of \(\max(q_cm_c,q_cM_c)\) is an upper bound on \(q\cdot k\) for every key in the page, so the pages with the largest bounds are the only ones that can contain high-scoring keys. Quest reads those pages fully and skips the rest, cutting the cache bytes read per step by an order of magnitude at little accuracy cost on many tasks. The limitation of training-free methods is that the model was never trained to attend sparsely, so when the selection misses a relevant key, nothing compensates.</p>
 
@@ -155,9 +155,9 @@
 <text x="40" y="172" class="t-xs">read the top-scoring pages fully (shaded); skip the rest: no page can hide a key scoring above its bound</text>
 <text x="360" y="194" text-anchor="middle" class="t-xs">training-free and exact in the bound, approximate in the choice of how many pages to read</text>
 </svg>
-<figcaption><b>Figure 20.4 — Page selection by upper bounds.</b> Each page of the paged cache keeps the minimum and maximum of its keys in every coordinate, which bounds the score any of its keys can achieve against the current query. Only the pages with the highest bounds are read at full resolution.</figcaption></figure>
+<figcaption><b>Figure 21.4 — Page selection by upper bounds.</b> Each page of the paged cache keeps the minimum and maximum of its keys in every coordinate, which bounds the score any of its keys can achieve against the current query. Only the pages with the highest bounds are read at full resolution.</figcaption></figure>
 
-<p>Figure 20.4 illustrates the bound on eight pages.</p>
+<p>Figure 21.4 illustrates the bound on eight pages.</p>
 
 <p><em>Trained</em> sparse attention builds selection into the model. DeepSeek's <strong>Native Sparse Attention</strong> (NSA; Yuan et al., 2025)<span class="cite"><a href="#r-nsa">[6]</a></span> computes each query's attention through three branches: a <em>compressed</em> branch attending to block-level summaries of the whole context, a <em>selected</em> branch attending at full resolution to the top-scoring blocks identified from the compressed scores, and a <em>sliding-window</em> branch for local context, combined by learned gates. The block structure is chosen to match GPU memory access, so the sparsity translates into real speed, and because the model is trained this way from the start (or continued-pretrained), it learns to put the information it needs where the selection will find it. Moonshot's MoBA (2025) applies a mixture-of-experts-style gate over blocks of keys.</p>
 
@@ -179,29 +179,29 @@
 <rect x="110" y="152" width="500" height="44" rx="8" class="bx4"/><text x="360" y="172" text-anchor="middle" class="t-xs t-b">gated combination of branch outputs</text><text x="360" y="188" text-anchor="middle" class="t-xs">bytes read ≈ summaries + k_s selected tokens + window, instead of the whole cache</text>
 <text x="360" y="220" text-anchor="middle" class="t-xs">trained with the model, so it learns to make relevant information findable by the selector</text>
 </svg>
-<figcaption><b>Figure 20.5 — Trained sparse attention.</b> A cheap pass over compressed summaries or an indexer scores the whole context; full-resolution attention is computed only for the selected blocks and a local window. Because the model is trained with the selection, missing keys are rare and the sparsity is aligned with GPU memory blocks.</figcaption></figure>
+<figcaption><b>Figure 21.5 — Trained sparse attention.</b> A cheap pass over compressed summaries or an indexer scores the whole context; full-resolution attention is computed only for the selected blocks and a local window. Because the model is trained with the selection, missing keys are rare and the sparsity is aligned with GPU memory blocks.</figcaption></figure>
 
-<p>Figure 20.5 sketches the common structure. DeepSeek took it into production with <strong>DeepSeek Sparse Attention</strong> (DSA) in DeepSeek-V3.2-Exp (September 2025)<span class="cite"><a href="#r-dsa">[7]</a></span>. A small "lightning indexer", with its own low-dimensional FP8 keys, scores every previous token for each query, and the main MLA attention then attends only to the top \(k_s=2048\) tokens. The indexer still touches every token, so its cost grows linearly with context, but each touch is far cheaper than full attention, and the expensive part becomes constant in context length. DeepSeek reported that long-context costs fell enough to cut API prices substantially, with quality on par with the dense-attention predecessor.</p>
+<p>Figure 21.5 sketches the common structure. DeepSeek took it into production with <strong>DeepSeek Sparse Attention</strong> (DSA) in DeepSeek-V3.2-Exp (September 2025)<span class="cite"><a href="#r-dsa">[7]</a></span>. A small "lightning indexer", with its own low-dimensional FP8 keys, scores every previous token for each query, and the main MLA attention then attends only to the top \(k_s=2048\) tokens. The indexer still touches every token, so its cost grows linearly with context, but each touch is far cheaper than full attention, and the expensive part becomes constant in context length. DeepSeek reported that long-context costs fell enough to cut API prices substantially, with quality on par with the dense-attention predecessor.</p>
 <div class="box example">
 <div class="box-title">Worked example — the bytes of DSA at 128k</div>
 <p>Per decode token at context \(T=131{,}072\), DeepSeek-V3's dense MLA attention reads the whole latent cache, \(T\times68.6\) KiB ≈ 9.2 GB (across all 61 layers). With DSA, the indexer reads one small FP8 key per token per layer, 128 bytes, so \(T\times61\times128\) B ≈ 1.0 GB, and the main attention reads only \(2048\times68.6\) KiB ≈ 0.14 GB. Cache bytes per token fall from about 9.2 GB to about 1.2 GB, a factor of about 8, and the factor grows with context: at a million tokens, from about 72 GB to about 8 GB. The indexer, now the dominant term, is linear in \(T\) with a small constant, so the remaining cost is \(O(T)\) with a coefficient about nine times smaller than dense MLA's.</p>
 </div>
 <p>The example shows the economics of trained sparse attention: it does not make long contexts free, but it changes the constant in front of the dominant term by close to an order of magnitude, in both bytes (decode) and FLOPs (prefill, where selected attention replaces quadratic dense attention for each query). That is enough to change prices. And it composes with everything else in this chapter: positional extension makes the range usable, sparse attention makes it affordable, and memory management makes it fit.</p>
 
-<h2 id="s20-6">20.6 Fitting the cache: offload, compression and distribution</h2>
+<h2 id="s20-6">21.6 Fitting the cache: offload, compression and distribution</h2>
 <p>A 128k context of Llama 3 70B occupies \(131{,}072\times320\) KiB ≈ 43 GB in BF16, half an H100; a million tokens occupy about 344 GB. There are three ways to make such caches fit, each with a characteristic cost. The first is <em>compression</em>: an FP8 or 4-bit cache (§8.6) halves or quarters the bytes, and architectural choices such as GQA and MLA (Chapter 8) reduce them far more, which is why long-context models are almost always GQA or MLA models. Eviction and selection methods (§8.7) discard or skip tokens the model is unlikely to need, approximately.</p>
 <p>The second is <em>offload</em>: keep most of the cache in CPU memory, or in a tiered store (Chapter 13), and bring parts of it to the GPU when needed. The arithmetic is unforgiving for dense attention. Each decode step must read the whole cache; over PCIe Gen5 at about 64 GB/s, a 43 GB cache would take about 670 ms per token, a hundred times slower than reading it from HBM. Offload therefore pairs naturally with sparse attention: if only the selected pages are needed each step, only those must cross PCIe, and prefetching the pages the next step will probably need hides much of the latency. Offload is also useful in coarser forms, for example to hold the caches of paused conversations or agent sessions between turns, where the transfer cost is paid once per turn rather than per token.</p>
-<p>The third is <em>distribution</em>: spread one sequence's cache across several GPUs, by tensor parallelism over KV heads (§17.2) or by context parallelism (§17.4), so that each GPU holds a slice. For prefill, context parallelism also divides the quadratic attention work. For decode, each step's attention becomes a split-KV computation across devices with a small reduction of partial softmax results per layer. The memory and the bandwidth of several GPUs are then applied to one long sequence, at the cost of a latency-bound collective in each layer. In practice, long-context services combine all three: GQA or MLA caches in FP8, distributed over a tensor-parallel group, with prefix caching for documents that recur and tiered storage for idle sessions.</p>
+<p>The third is <em>distribution</em>: spread one sequence's cache across several GPUs, by tensor parallelism over KV heads (§18.2) or by context parallelism (§18.4), so that each GPU holds a slice. For prefill, context parallelism also divides the quadratic attention work. For decode, each step's attention becomes a split-KV computation across devices with a small reduction of partial softmax results per layer. The memory and the bandwidth of several GPUs are then applied to one long sequence, at the cost of a latency-bound collective in each layer. In practice, long-context services combine all three: GQA or MLA caches in FP8, distributed over a tensor-parallel group, with prefix caching for documents that recur and tiered storage for idle sessions.</p>
 
 <details class="drill">
-<summary>Drill 20.2 — How many 128k sequences fit?</summary>
+<summary>Drill 21.2 — How many 128k sequences fit?</summary>
 <p>Llama 3 70B on eight H100s with TP = 8. How many concurrent sequences at 128k context fit with a BF16 cache, with an FP8 cache, and what is the decode step time at that batch (BF16 weights, FP8 cache, 5 µs all-reduces)?</p>
-<p><em>Solution.</em> Each GPU holds 17.6 GB of weights; with 90% memory utilisation and about 3 GB for activations, about 51 GB per GPU, 408 GB in total, is available for cache. A 128k sequence needs about 43 GB in BF16, so 9 sequences fit, or 19 with FP8 (21.5 GB each). At batch 19 with FP8, each GPU reads 17.6 GB of weights plus \(19\times21.5/8\approx51\) GB of cache per step, about 20.5 ms at 3.35 TB/s, plus 160 all-reduces of \(19\times8192\times2\) bytes, about 0.8 ms: TPOT ≈ 21 ms for 19 sequences, about 110 tokens/s per GPU, compared with about 1,500 at 2k context (Figure 17.3). Long context reduces throughput per GPU by an order of magnitude, which is the economic case for sparse attention and caching.</p>
+<p><em>Solution.</em> Each GPU holds 17.6 GB of weights; with 90% memory utilisation and about 3 GB for activations, about 51 GB per GPU, 408 GB in total, is available for cache. A 128k sequence needs about 43 GB in BF16, so 9 sequences fit, or 19 with FP8 (21.5 GB each). At batch 19 with FP8, each GPU reads 17.6 GB of weights plus \(19\times21.5/8\approx51\) GB of cache per step, about 20.5 ms at 3.35 TB/s, plus 160 all-reduces of \(19\times8192\times2\) bytes, about 0.8 ms: TPOT ≈ 21 ms for 19 sequences, about 110 tokens/s per GPU, compared with about 1,500 at 2k context (Figure 18.3). Long context reduces throughput per GPU by an order of magnitude, which is the economic case for sparse attention and caching.</p>
 </details>
 
-<h2 id="s20-7">20.7 Long context or retrieval?</h2>
+<h2 id="s20-7">21.7 Long context or retrieval?</h2>
 <p>Before long context was cheap, the standard way to give a model access to a large corpus was <strong>retrieval-augmented generation</strong> (RAG): split documents into chunks, embed them, retrieve the few chunks most similar to the query, and put only those into a short prompt. Long context offers an alternative: put the whole document, or many documents, into the prompt and let attention find what matters. The choice is a trade-off between cost and recall, and it is worth making quantitatively.</p>
-<p>The cost of long context is the prefill of the whole context, plus the decode steps reading its cache. For Llama 3 8B, a 128k prompt costs about \(2\times8\times10^{9}\times131{,}072\approx2.1\times10^{15}\) linear FLOPs plus \(2LdT^2\approx4.5\times10^{15}\) attention FLOPs, \(6.6\times10^{15}\) in all, about 11 seconds of one H100 at 60% utilisation; a RAG prompt of 4k tokens costs about \(6.8\times10^{13}\), a hundredth as much, plus the retrieval itself, which is cheap. Long context therefore costs one to two orders of magnitude more per query, unless the long prefix is shared across queries: with prefix caching, a document asked many questions is prefilled once, and each further question pays only for its own tokens and for decode steps that read the cache. Quality points the other way. Retrieval can miss: the relevant chunk may not be similar to the query, the answer may require combining many chunks, or chunking may cut context the answer depends on. Long context sees everything, subject to the effective-length limits of §20.4.</p>
+<p>The cost of long context is the prefill of the whole context, plus the decode steps reading its cache. For Llama 3 8B, a 128k prompt costs about \(2\times8\times10^{9}\times131{,}072\approx2.1\times10^{15}\) linear FLOPs plus \(2LdT^2\approx4.5\times10^{15}\) attention FLOPs, \(6.6\times10^{15}\) in all, about 11 seconds of one H100 at 60% utilisation; a RAG prompt of 4k tokens costs about \(6.8\times10^{13}\), a hundredth as much, plus the retrieval itself, which is cheap. Long context therefore costs one to two orders of magnitude more per query, unless the long prefix is shared across queries: with prefix caching, a document asked many questions is prefilled once, and each further question pays only for its own tokens and for decode steps that read the cache. Quality points the other way. Retrieval can miss: the relevant chunk may not be similar to the query, the answer may require combining many chunks, or chunking may cut context the answer depends on. Long context sees everything, subject to the effective-length limits of §21.4.</p>
 <figure class="diagram" id="fig-20-6">
 <svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Retrieval versus long context">
 <defs><marker id="a206" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
@@ -218,23 +218,23 @@
 <path d="M605,86 C605,102 605,104 605,118" class="ln dash" marker-end="url(#a206)"/><text x="595" y="106" text-anchor="end" class="t-xs">Self-Route: escalate only if the RAG answer reports missing information</text>
 <text x="360" y="200" text-anchor="middle" class="t-xs">retrieval narrows what must be read; long context reads it well; caching makes repeated reading cheap</text>
 </svg>
-<figcaption><b>Figure 20.6 — Retrieval, long context and a hybrid.</b> Retrieval sends a short prompt with the top-ranked chunks; long context sends everything. A self-routing hybrid answers from retrieval first and escalates to long context only when the model judges the retrieved chunks insufficient.</figcaption></figure>
+<figcaption><b>Figure 21.6 — Retrieval, long context and a hybrid.</b> Retrieval sends a short prompt with the top-ranked chunks; long context sends everything. A self-routing hybrid answers from retrieval first and escalates to long context only when the model judges the retrieved chunks insufficient.</figcaption></figure>
 
-<p>Figure 20.6 contrasts the two paths and the hybrid that connects them. Studies comparing the two found that long-context models generally answered better when they could afford to read everything, while RAG was far cheaper and nearly as good on many queries. Li and colleagues (2024)<span class="cite"><a href="#r-selfroute">[8]</a></span> proposed a hybrid, Self-Route, in which the model first answers from retrieved chunks and reports whether they suffice, and only the queries it judges unanswerable are routed to full long context; it retained most of long context's accuracy at a fraction of its cost. The general lesson is that retrieval and long context are complements: retrieval narrows what must be read, long context reads it well, and caching makes repeated reading cheap. Production systems increasingly combine all three.</p>
+<p>Figure 21.6 contrasts the two paths and the hybrid that connects them. Studies comparing the two found that long-context models generally answered better when they could afford to read everything, while RAG was far cheaper and nearly as good on many queries. Li and colleagues (2024)<span class="cite"><a href="#r-selfroute">[8]</a></span> proposed a hybrid, Self-Route, in which the model first answers from retrieved chunks and reports whether they suffice, and only the queries it judges unanswerable are routed to full long context; it retained most of long context's accuracy at a fraction of its cost. The general lesson is that retrieval and long context are complements: retrieval narrows what must be read, long context reads it well, and caching makes repeated reading cheap. Production systems increasingly combine all three.</p>
 
 <details class="drill">
-<summary>Drill 20.3 — When does prefix caching make long context competitive?</summary>
+<summary>Drill 21.3 — When does prefix caching make long context competitive?</summary>
 <p>A team asks \(Q\) questions about the same 100k-token document with Llama 3 8B. Compare the prefill FLOPs of long context without caching, long context with prefix caching, and RAG with 4k-token prompts. For what \(Q\) is cached long context within 2× of RAG on prefill cost?</p>
 <p><em>Solution.</em> One 100k prefill: \(2NT+2LdT^2\approx1.6\times10^{15}+2.6\times10^{15}=4.2\times10^{15}\) FLOPs. Without caching: \(4.2Q\times10^{15}\). With caching: \(4.2\times10^{15}\) once, plus a few hundred tokens per question (each attending to the cached 100k: about \(4Ld\times100\text{k}+2N\approx7\times10^{10}\) FLOPs per token, so about \(2\times10^{13}\) for a 300-token question). RAG: about \(6.8\times10^{13}\) per question. Cached long context costs \(4.2\times10^{15}+2Q\times10^{13}\); RAG costs \(6.8Q\times10^{13}\). Within 2×: \(4.2\times10^{15}+2\times10^{13}Q\le1.36\times10^{14}Q\), i.e. \(Q\ge36\). After a few dozen questions on the same document, long context with caching costs about the same as RAG in prefill, though each decode step still reads a 100k cache, about 13 GB, which RAG avoids.</p>
 </details>
 
-<h2 id="s20-8">20.8 Contexts that grow: agents and reasoning</h2>
-<p>The long contexts of this chapter have so far been long <em>prompts</em>: a document, a codebase, a transcript. A second kind of long context grows during a session. An agent that calls tools appends each tool result and each of its own actions to its context, turn after turn, so that after an hour of work its context may hold hundreds of thousands of tokens of history. A reasoning model (Chapter 22) appends thousands of tokens of thought before each answer. These workloads change the shape of the cost: the context is not prefilled once but extended many times, and the same prefix is re-read on every turn.</p>
-<p>Two engineering consequences follow. The first is that <em>session-level caching</em> becomes essential. Between turns, the agent's cache should not be discarded and recomputed; it should be kept, on the GPU if the next turn is imminent, or offloaded to CPU memory or a tiered store if the agent is waiting for a slow tool, and the next turn should be routed to wherever the cache lives (§13.8). With caching, each turn pays only for its new tokens and for decode steps that read the accumulated cache; without it, each turn re-prefills the whole history, and the cost of a session grows quadratically with its number of turns. The second consequence is that decode steps late in a session read very large caches, so the batch sizes that make decode efficient are not available, exactly the regime of §20.1 in which speculative decoding (Chapter 19) and sparse attention pay most.</p>
+<h2 id="s20-8">21.8 Contexts that grow: agents and reasoning</h2>
+<p>The long contexts of this chapter have so far been long <em>prompts</em>: a document, a codebase, a transcript. A second kind of long context grows during a session. An agent that calls tools appends each tool result and each of its own actions to its context, turn after turn, so that after an hour of work its context may hold hundreds of thousands of tokens of history. A reasoning model (Chapter 26) appends thousands of tokens of thought before each answer. These workloads change the shape of the cost: the context is not prefilled once but extended many times, and the same prefix is re-read on every turn.</p>
+<p>Two engineering consequences follow. The first is that <em>session-level caching</em> becomes essential. Between turns, the agent's cache should not be discarded and recomputed; it should be kept, on the GPU if the next turn is imminent, or offloaded to CPU memory or a tiered store if the agent is waiting for a slow tool, and the next turn should be routed to wherever the cache lives (§13.8). With caching, each turn pays only for its new tokens and for decode steps that read the accumulated cache; without it, each turn re-prefills the whole history, and the cost of a session grows quadratically with its number of turns. The second consequence is that decode steps late in a session read very large caches, so the batch sizes that make decode efficient are not available, exactly the regime of §21.1 in which speculative decoding (Chapter 20) and sparse attention pay most.</p>
 <p>Agents also manage their contexts actively, which is a design choice with inference consequences. <em>Compaction</em> replaces old history with a summary written by the model, keeping the context within a budget at the cost of an extra generation and of losing detail; it also invalidates the cache from the point of the change, since everything after an edited prefix must be recomputed. <em>Context editing</em> removes stale tool results for the same reason, with the same cost. A well-designed agent therefore edits its context rarely and at the end where possible, keeps stable material (system prompt, tool definitions, task description) at the beginning so that it remains cached, and appends rather than rewrites. These are the prefix-caching rules of §10.6 applied to a context that changes over hours rather than seconds, and they matter as much for cost as any kernel optimisation.</p>
 
 <h2 id="looking-ahead" class="unnumbered">Looking ahead</h2>
-<p>Every technique in this chapter works around a property of softmax attention: each new token must be compared with every earlier one, so the state carried forward, the KV cache, grows linearly with context, and the work grows with it. Sparse attention reduces the constant; it does not change the growth. A different line of research asks whether a model can carry a <em>fixed-size</em> state instead, updated at each token like a recurrent network, so that decode costs the same at a million tokens as at one. Chapter 21 develops state-space models, linear attention and their hybrids with attention, explains why they returned in 2023–25 after recurrent networks lost to Transformers, and analyses what they cost and what they give up.</p>
+<p>Every technique in this chapter works around a property of softmax attention: each new token must be compared with every earlier one, so the state carried forward, the KV cache, grows linearly with context, and the work grows with it. Sparse attention reduces the constant; it does not change the growth. A different line of research asks whether a model can carry a <em>fixed-size</em> state instead, updated at each token like a recurrent network, so that decode costs the same at a million tokens as at one. Chapter 22 develops state-space models, linear attention and their hybrids with attention, explains why they returned in 2023–25 after recurrent networks lost to Transformers, and analyses what they cost and what they give up.</p>
 
 <h2 id="summary">Chapter summary</h2>
 <ul>
@@ -250,205 +250,205 @@
 <h2 id="mcq">Multiple-choice questions</h2>
 <p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
 <div class="quiz-section">
-<div class="mcq" data-id="ch20-mcq-01" data-topic="§20.1 Costs">
+<div class="mcq" data-id="ch20-mcq-01" data-topic="§21.1 Costs">
 <p class="q">Attention accounts for half of causal prefill FLOPs at a prompt length of about:</p>
 <ol class="opts"><li>\(N/d\)</li><li data-correct>\(N/(Ld)\)</li><li>\(L/d\)</li><li>\(\sqrt N\)</li></ol>
 <div class="explain">About 61k tokens for Llama 3 8B.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-02" data-topic="§20.1 Costs">
+<div class="mcq" data-id="ch20-mcq-02" data-topic="§21.1 Costs">
 <p class="q">For Llama 3 70B, the prefill attention crossover \(N/(Ld)\) is about:</p>
 <ol class="opts"><li>8k</li><li>61k</li><li data-correct>108k</li><li>1M</li></ol>
 <div class="explain">\(70.6\times10^9/(80\times8192)\).</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-03" data-topic="§20.1 Costs">
+<div class="mcq" data-id="ch20-mcq-03" data-topic="§21.1 Costs">
 <p class="q">One Llama 3 8B sequence's BF16 cache exceeds the weight bytes beyond about:</p>
 <ol class="opts"><li>8k tokens</li><li>32k tokens</li><li data-correct>122k tokens</li><li>1M tokens</li></ol>
 <div class="explain">\(16.06\,\text{GB}/128\,\text{KiB}\).</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-04" data-topic="§20.1 Costs">
+<div class="mcq" data-id="ch20-mcq-04" data-topic="§21.1 Costs">
 <p class="q">At 128k context, what fraction of Llama 3 8B's prefill FLOPs is attention?</p>
 <ol class="opts"><li>6%</li><li>35%</li><li data-correct>68%</li><li>95%</li></ol>
-<div class="explain">Figure 20.1.</div>
+<div class="explain">Figure 21.1.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-05" data-topic="§20.1 Costs">
+<div class="mcq" data-id="ch20-mcq-05" data-topic="§21.1 Costs">
 <p class="q">Why is long-context decode throughput per GPU so much lower than short-context?</p>
 <ol class="opts"><li>Kernels are slower</li><li data-correct>Each sequence's cache is huge, so few sequences fit and each step reads mostly cache</li><li>Weights grow</li><li>Sampling is slower</li></ol>
 <div class="explain">Batch collapses and bytes per step grow.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-06" data-topic="§20.2 RoPE">
+<div class="mcq" data-id="ch20-mcq-06" data-topic="§21.2 RoPE">
 <p class="q">The wavelength of RoPE pair \(r\) is:</p>
 <ol class="opts"><li>\(\theta_r\)</li><li data-correct>\(2\pi/\theta_r=2\pi\Theta^{2r/d_h}\)</li><li>\(r\)</li><li>\(d_h\)</li></ol>
 <div class="explain">From about 6 tokens to about 2.5M for Llama 3.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-07" data-topic="§20.2 RoPE">
+<div class="mcq" data-id="ch20-mcq-07" data-topic="§21.2 RoPE">
 <p class="q">Why does naive extrapolation beyond the training length fail?</p>
 <ol class="opts"><li>High-frequency pairs alias</li><li data-correct>Low-frequency pairs, which never completed a rotation in training, produce unseen angles</li><li>Attention overflows FP16</li><li>The vocabulary runs out</li></ol>
 <div class="explain">Their position features go out of distribution.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-08" data-topic="§20.2 RoPE">
+<div class="mcq" data-id="ch20-mcq-08" data-topic="§21.2 RoPE">
 <p class="q">Which RoPE pairs encode fine-grained local order?</p>
 <ol class="opts"><li>Low-frequency</li><li data-correct>High-frequency (short wavelength)</li><li>Only pair 63</li><li>None</li></ol>
 <div class="explain">They complete many rotations within training.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-09" data-topic="§20.3 PI">
+<div class="mcq" data-id="ch20-mcq-09" data-topic="§21.3 PI">
 <p class="q">Position interpolation:</p>
 <ol class="opts"><li>Keeps high frequencies</li><li data-correct>Divides every frequency (equivalently every position) by the extension factor</li><li>Changes the vocabulary</li><li>Removes RoPE</li></ol>
 <div class="explain">Compresses local resolution too.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-10" data-topic="§20.3 NTK">
+<div class="mcq" data-id="ch20-mcq-10" data-topic="§21.3 NTK">
 <p class="q">NTK-aware scaling multiplies the RoPE base by \(\mu^{d_h/(d_h-2)}\), which:</p>
 <ol class="opts"><li>Divides all frequencies by \(\mu\)</li><li data-correct>Leaves the highest frequency unchanged and divides the lowest by exactly \(\mu\)</li><li>Doubles all frequencies</li><li>Has no effect</li></ol>
 <div class="explain">Geometric interpolation across pairs.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-11" data-topic="§20.3 YaRN">
+<div class="mcq" data-id="ch20-mcq-11" data-topic="§21.3 YaRN">
 <p class="q">YaRN leaves a RoPE pair untouched when:</p>
 <ol class="opts"><li>Its wavelength exceeds the training length</li><li data-correct>It completes more than \(c_{\text{hi}}\) (≈ 32) rotations over the training length</li><li>It is pair 0 only</li><li>Never</li></ol>
 <div class="explain">It fully interpolates pairs with fewer than \(c_{\text{lo}}\) (≈ 1) rotations.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-12" data-topic="§20.3 YaRN">
+<div class="mcq" data-id="ch20-mcq-12" data-topic="§21.3 YaRN">
 <p class="q">YaRN's attention temperature adjustment:</p>
 <ol class="opts"><li>Lowers logits</li><li data-correct>Sharpens logits to counter higher softmax entropy over more tokens</li><li>Removes softmax</li><li>Is only for training</li></ol>
 <div class="explain">Queries and keys multiplied by \(0.1\ln\mu+1\).</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-13" data-topic="§20.3 Practice">
+<div class="mcq" data-id="ch20-mcq-13" data-topic="§21.3 Practice">
 <p class="q">Raising the RoPE base (e.g. Llama 3's 500,000 versus Llama 2's 10,000):</p>
 <ol class="opts"><li>Shortens all wavelengths</li><li data-correct>Stretches wavelengths, a standard step in long-context training</li><li>Removes positions</li><li>Is unrelated to context</li></ol>
 <div class="explain">The idea behind NTK scaling.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-14" data-topic="§20.3 Practice">
+<div class="mcq" data-id="ch20-mcq-14" data-topic="§21.3 Practice">
 <p class="q">Why do long-context models still need long training data after RoPE scaling?</p>
 <ol class="opts"><li>To fix the tokenizer</li><li data-correct>Scaling makes long positions valid inputs, but using long-range dependencies must be learned</li><li>Because scaling is lossy for short contexts only</li><li>It is not needed</li></ol>
 <div class="explain">Continued pretraining on long documents.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-15" data-topic="§20.4 Evaluation">
+<div class="mcq" data-id="ch20-mcq-15" data-topic="§21.4 Evaluation">
 <p class="q">Why is needle-in-a-haystack a weak long-context test?</p>
 <ol class="opts"><li>It is too hard</li><li data-correct>Retrieving one distinctive sentence is much easier than reasoning over dispersed information</li><li>It uses short contexts</li><li>It measures speed only</li></ol>
 <div class="explain">Most models now pass it.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-16" data-topic="§20.4 Evaluation">
+<div class="mcq" data-id="ch20-mcq-16" data-topic="§21.4 Evaluation">
 <p class="q">'Lost in the middle' refers to:</p>
 <ol class="opts"><li>Tokens lost in transfer</li><li data-correct>Accuracy dropping when relevant information sits in the middle of a long context</li><li>Middle layers being pruned</li><li>Cache eviction</li></ol>
 <div class="explain">A U-shaped accuracy curve over position.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-17" data-topic="§20.4 Evaluation">
+<div class="mcq" data-id="ch20-mcq-17" data-topic="§21.4 Evaluation">
 <p class="q">RULER defines a model's effective context length as:</p>
 <ol class="opts"><li>The advertised length</li><li data-correct>The longest length at which it stays above a quality threshold on harder synthetic tasks</li><li>Training length</li><li>Half the advertised length</li></ol>
 <div class="explain">Often far below advertised.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-18" data-topic="§20.4 Practice">
+<div class="mcq" data-id="ch20-mcq-18" data-topic="§21.4 Practice">
 <p class="q">A simple prompt-structure change that often improves long-context accuracy is:</p>
 <ol class="opts"><li>Putting the question before the documents</li><li data-correct>Putting the question after the documents and key material near the ends</li><li>Removing system prompts</li><li>Shuffling documents</li></ol>
 <div class="explain">Also helps prefix caching of stable documents.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-19" data-topic="§20.5 Sparse">
+<div class="mcq" data-id="ch20-mcq-19" data-topic="§21.5 Sparse">
 <p class="q">Quest's page bound for a query \(q\) uses:</p>
 <ol class="opts"><li>The mean key</li><li data-correct>The elementwise min and max of keys in the page: \(\sum_c\max(q_cm_c,q_cM_c)\)</li><li>Random sampling</li><li>The value vectors</li></ol>
 <div class="explain">An upper bound on \(q\cdot k\) within the page.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-20" data-topic="§20.5 Sparse">
+<div class="mcq" data-id="ch20-mcq-20" data-topic="§21.5 Sparse">
 <p class="q">A key limitation of training-free sparse attention is:</p>
 <ol class="opts"><li>It needs retraining</li><li data-correct>The model was not trained to attend sparsely, so missed keys are not compensated</li><li>It is slower than dense</li><li>It requires MoE</li></ol>
 <div class="explain">Trained methods address this.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-21" data-topic="§20.5 NSA">
+<div class="mcq" data-id="ch20-mcq-21" data-topic="§21.5 NSA">
 <p class="q">NSA combines which branches? (select all that apply)</p>
 <ol class="opts"><li data-correct>Compressed block summaries</li><li data-correct>Selected full-resolution blocks</li><li data-correct>A sliding window</li><li>A retrieval database</li></ol>
 <div class="explain">Combined by learned gates.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-22" data-topic="§20.5 DSA">
+<div class="mcq" data-id="ch20-mcq-22" data-topic="§21.5 DSA">
 <p class="q">DeepSeek Sparse Attention selects per query:</p>
 <ol class="opts"><li>All tokens</li><li data-correct>The top 2,048 tokens chosen by a lightning indexer</li><li>The last 2,048 tokens only</li><li>One random block</li></ol>
 <div class="explain">Main MLA attention reads only those.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-23" data-topic="§20.5 DSA">
+<div class="mcq" data-id="ch20-mcq-23" data-topic="§21.5 DSA">
 <p class="q">At 128k context, DSA reduces DeepSeek-V3's cache bytes per decode token by about:</p>
 <ol class="opts"><li>1.1×</li><li data-correct>8×</li><li>100×</li><li>1,000×</li></ol>
 <div class="explain">≈ 9.2 GB → ≈ 1.2 GB; the indexer becomes dominant.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-24" data-topic="§20.5 DSA">
+<div class="mcq" data-id="ch20-mcq-24" data-topic="§21.5 DSA">
 <p class="q">Why is DSA's cost still linear in context length?</p>
 <ol class="opts"><li>It reads all MLA latents</li><li data-correct>Its indexer scores every token, though cheaply</li><li>It uses a window</li><li>It does not; it is constant</li></ol>
 <div class="explain">With a coefficient about nine times smaller.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-25" data-topic="§20.6 Memory">
+<div class="mcq" data-id="ch20-mcq-25" data-topic="§21.6 Memory">
 <p class="q">A 128k BF16 cache of Llama 3 70B is about:</p>
 <ol class="opts"><li>4 GB</li><li data-correct>43 GB</li><li>430 GB</li><li>4.3 TB</li></ol>
 <div class="explain">\(131{,}072\times320\) KiB.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-26" data-topic="§20.6 Offload">
+<div class="mcq" data-id="ch20-mcq-26" data-topic="§21.6 Offload">
 <p class="q">Why is per-token CPU offload of a dense-attention cache impractical?</p>
 <ol class="opts"><li>CPUs cannot store it</li><li data-correct>Each step must move the whole cache over PCIe (≈ 64 GB/s), hundreds of ms per token</li><li>It breaks exactness</li><li>It needs NVLink</li></ol>
 <div class="explain">Viable with sparse attention or per conversation turn.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-27" data-topic="§20.6 Distribution">
+<div class="mcq" data-id="ch20-mcq-27" data-topic="§21.6 Distribution">
 <p class="q">Decode over a context-parallel or TP-distributed cache needs per layer:</p>
 <ol class="opts"><li>Nothing</li><li data-correct>A small reduction of partial softmax results across devices (split-KV)</li><li>A full all-gather of the cache</li><li>Recomputation</li></ol>
 <div class="explain">Latency-bound collective per layer.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-28" data-topic="§20.6 Drill">
+<div class="mcq" data-id="ch20-mcq-28" data-topic="§21.6 Drill">
 <p class="q">With Llama 3 70B at TP = 8 and FP8 cache, about how many 128k sequences fit?</p>
 <ol class="opts"><li>2</li><li data-correct>19</li><li>200</li><li>2,000</li></ol>
 <div class="explain">About 51 GB per GPU available for cache.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-29" data-topic="§20.7 RAG">
+<div class="mcq" data-id="ch20-mcq-29" data-topic="§21.7 RAG">
 <p class="q">Per query without caching, 128k-token long context costs roughly how much more prefill than a 4k RAG prompt for Llama 3 8B?</p>
 <ol class="opts"><li>2×</li><li>10×</li><li data-correct>100×</li><li>10,000×</li></ol>
 <div class="explain">About \(6.6\times10^{15}\) versus \(7\times10^{13}\) FLOPs.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-30" data-topic="§20.7 RAG">
+<div class="mcq" data-id="ch20-mcq-30" data-topic="§21.7 RAG">
 <p class="q">What makes long context competitive with RAG for repeated questions on one document?</p>
 <ol class="opts"><li>Larger batches</li><li data-correct>Prefix caching: the document is prefilled once</li><li>FP4</li><li>Speculative decoding</li></ol>
-<div class="explain">Drill 20.3: after a few dozen questions.</div>
+<div class="explain">Drill 21.3: after a few dozen questions.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-31" data-topic="§20.7 RAG">
+<div class="mcq" data-id="ch20-mcq-31" data-topic="§21.7 RAG">
 <p class="q">Self-Route:</p>
 <ol class="opts"><li>Always uses long context</li><li data-correct>Answers from retrieved chunks first and escalates to long context only when the model judges them insufficient</li><li>Always uses RAG</li><li>Routes by user ID</li></ol>
 <div class="explain">Most of long context's accuracy at a fraction of the cost.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-32" data-topic="§20.7 RAG">
+<div class="mcq" data-id="ch20-mcq-32" data-topic="§21.7 RAG">
 <p class="q">A weakness of RAG is that:</p>
 <ol class="opts"><li>It is expensive</li><li data-correct>The retriever can miss information that is relevant but not similar to the query, or that spans chunks</li><li>It needs long context</li><li>It cannot use embeddings</li></ol>
 <div class="explain">Long context sees everything, within effective-length limits.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-33" data-topic="§20.8 Agents">
+<div class="mcq" data-id="ch20-mcq-33" data-topic="§21.8 Agents">
 <p class="q">Why should an agent avoid editing early parts of its context, such as old tool results, on every turn?</p>
 <ol class="opts"><li>Editing is not allowed by the API</li><li data-correct>Any change to a prefix invalidates the cached KV for everything after it, forcing recomputation of the rest of the history</li><li>It makes the model forget the system prompt</li><li>It increases the vocabulary size</li></ol>
 <div class="explain">Append rather than rewrite, and compact rarely, so that the accumulated cache stays valid across turns.</div>
 </div>
 
-<div class="mcq" data-id="ch20-mcq-34" data-topic="§20.8 Agents">
+<div class="mcq" data-id="ch20-mcq-34" data-topic="§21.8 Agents">
 <p class="q">Without session-level KV caching, how does the total prefill cost of an agent session grow with its number of turns, if each turn adds a similar number of tokens?</p>
 <ol class="opts"><li>Linearly</li><li data-correct>Quadratically, because every turn re-prefills the whole accumulated history</li><li>It stays constant</li><li>Logarithmically</li></ol>
 <div class="explain">Caching makes each turn pay only for its new tokens plus decode over the cache.</div>
@@ -502,7 +502,7 @@
 <details class="qa" data-id="ch20-qa-07">
 <summary><span class="lvl core">Core</span> Compare RAG and long context on cost and quality.</summary>
 <div class="answer">
-<p>Cost: long context prefills the whole document (for 8B at 128k, about \(6.6\times10^{15}\) FLOPs, ~11 s of an H100) and every decode step reads a large cache; RAG prefills a few thousand tokens (about 1% of that) plus cheap retrieval. Quality: RAG can miss information that is relevant but dissimilar to the query, spread over many chunks, or split by chunking; long context sees everything, within effective-length limits. Caching changes the calculus: a document asked many questions is prefilled once, making long context competitive after a few dozen questions (Drill 20.3). Hybrids such as Self-Route answer from retrieval first and escalate to long context when the model reports missing information, keeping most of long context's accuracy at much lower cost.</p>
+<p>Cost: long context prefills the whole document (for 8B at 128k, about \(6.6\times10^{15}\) FLOPs, ~11 s of an H100) and every decode step reads a large cache; RAG prefills a few thousand tokens (about 1% of that) plus cheap retrieval. Quality: RAG can miss information that is relevant but dissimilar to the query, spread over many chunks, or split by chunking; long context sees everything, within effective-length limits. Caching changes the calculus: a document asked many questions is prefilled once, making long context competitive after a few dozen questions (Drill 21.3). Hybrids such as Self-Route answer from retrieval first and escalate to long context when the model reports missing information, keeping most of long context's accuracy at much lower cost.</p>
 </div>
 </details>
 
