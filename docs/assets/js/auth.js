@@ -211,7 +211,7 @@ async function main() {
   async function pushAll() {
     const u = BookAuth.user; if (!u || !ready) return;
     const d = Book.store.data;
-    try { await F.setDoc(F.doc(db, 'users', u.uid), { items: d.items, chapters: d.chapters, updatedAt: F.serverTimestamp(), profile: { name: u.displayName || '', email: u.email || '' } }); }
+    try { await F.setDoc(F.doc(db, 'users', u.uid), { items: d.items, chapters: d.chapters, updatedAt: F.serverTimestamp(), profile: { name: u.displayName || '', email: u.email || '' } }, { mergeFields: ['items', 'chapters', 'updatedAt', 'profile'] }); }
     catch (e) { console.error(e); }
   }
   Book.store.onChange(queue);
