@@ -30,7 +30,7 @@
 <ul class="small">
 <li><b>Not signed in:</b> your answers, ratings and completed chapters are stored only in this browser (localStorage). Nothing is sent anywhere. Clearing this site's data deletes them.</li>
 <li><b>Sync link and file:</b> your progress is packed into the link itself, after the <code>#</code>, which browsers never send to any server. Anyone who has the link can load your progress, so share it only with yourself.</li>
-<li><b>Signed in with Google</b> (when enabled): a copy is kept in the book's Google Cloud Firestore project, under your account ID, with your name and email. Only you can read or write it; the site's owner can see it in the Firebase console. Resetting while signed in deletes it there too.</li>
+<li><b>Signed in</b> (email and password, or Google; when enabled): a copy is kept in the book's Google Cloud Firestore project, under your account ID, with your name and email, once your email address is confirmed. Passwords are handled by Google's Firebase Authentication and are never seen or stored by this site. Only you can read or write your progress; the site's owner can see it in the Firebase console. Resetting while signed in deletes it there too.</li>
 </ul>
 <p><button class="btn" id="reset">Reset all progress</button></p>
 </div>

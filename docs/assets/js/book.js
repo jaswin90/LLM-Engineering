@@ -132,13 +132,13 @@
     $('#toc-toggle').addEventListener('click', () => { const s = $('.sidebar'); if (s) s.classList.toggle('open'); });
     $('#auth-btn').addEventListener('click', () => {
       if (window.BookAuth && window.BookAuth.configured) window.BookAuth.signIn();
-      else toast('Google sign-in is not enabled yet. Your progress is saved in this browser; use My progress → Copy sync link to move it to another device.');
+      else toast('Accounts are not enabled yet. Your progress is saved in this browser; use My progress → Copy sync link to move it to another device.');
     });
   }
   function renderAuth(user, syncing) {
     const slot = $('#auth-slot'); if (!slot) return;
     if (!user) {
-      slot.innerHTML = '<button class="btn" id="auth-btn" title="Sign in with Google to sync progress across devices">Sign in with Google</button>';
+      slot.innerHTML = '<button class="btn" id="auth-btn" title="Sign in or create an account to keep your progress on every device">Sign in</button>';
       $('#auth-btn').addEventListener('click', () => window.BookAuth && window.BookAuth.signIn());
       return;
     }

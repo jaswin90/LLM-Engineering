@@ -17,12 +17,12 @@ The workflow (`.github/workflows/pages.yml`) uploads the `docs/` folder as-is. T
 - **Sync link / file (no setup, already live):** on *My progress*, "Copy sync link" packs the reader's progress into the link's `#` fragment (deflate-compressed, about 6 KB even with every question answered). Opening the link on another device merges it in, keeping the newer answer per question. Browsers never send the `#` part to the server, so no server stores anything. "Export file" / "Import file" do the same with a JSON file.
 - **Google sign-in (optional, below):** automatic sync across devices, stored in your Firebase project.
 
-## 3. Enable "Sign in with Google" and cloud-synced progress (optional, ~10 minutes)
+## 3. Enable accounts (email + password, or Google) and cloud-synced progress (optional, ~10 minutes)
 
 Without this step the book works fully, with browser storage and sync links. With it, signed-in readers get their history on every device automatically.
 
 1. Go to https://console.firebase.google.com and **create a project** (Analytics not needed).
-2. **Build → Authentication → Get started → Sign-in method → Google → Enable.** Set a support email and save.
+2. **Build → Authentication → Get started → Sign-in method.** Enable **Email/Password** (readers sign up with name, email and password and confirm by email) and, optionally, **Google**. Set a support email and save. Optional: under **Authentication → Templates**, edit the sender name and the confirmation email text.
 3. **Authentication → Settings → Authorized domains → Add domain:** `jaswin90.github.io`
 4. **Build → Firestore Database → Create database** (production mode; pick a region near your readers, e.g. `asia-south1` Mumbai).
 5. **Firestore → Rules**, paste and publish:
@@ -32,7 +32,10 @@ Without this step the book works fully, with browser storage and sync links. Wit
    service cloud.firestore {
      match /databases/{database}/documents {
        match /users/{uid} {
-         allow read, write: if request.auth != null && request.auth.uid == uid;
+         // Only the signed-in owner, and only after the email address is confirmed
+         // (Google accounts are confirmed automatically).
+         allow read, write: if request.auth != null && request.auth.uid == uid
+                            && request.auth.token.email_verified == true;
        }
      }
    }
