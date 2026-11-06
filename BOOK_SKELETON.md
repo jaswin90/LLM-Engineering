@@ -163,7 +163,7 @@ The book follows one causal chain. Each part answers the question the previous p
 ### Chapter 23 — Reinforcement Learning for Language Models ✅ *(v3, new)*
 - Generation as a token-level MDP; returns and the sequence-level reward; the policy-gradient theorem and REINFORCE; variance, baselines and advantages; value functions and GAE; the KL-regularised objective and its closed-form optimum; trust regions to PPO's clipped surrogate; the four models of PPO for LLMs and what they cost.
 
-### Chapter 24 — Learning from Human Preferences ⏳ *(v3, new)*
+### Chapter 24 — Learning from Human Preferences ✅ *(v3, new)*
 - SFT → reward model → RL (InstructGPT, 2022); Bradley–Terry reward models; reward hacking and over-optimisation; DPO from the closed-form optimum; IPO, KTO, ORPO, SimPO; online versus offline preference learning; Constitutional AI and RLAIF.
 
 ### Chapter 25 — Reinforcement Learning with Verifiable Rewards ⏳ *(v3, new)*
@@ -211,7 +211,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 21 | Long-Context Inference | ✅ v2 |
 | 22 | Beyond Attention: SSMs and Hybrids | ✅ v2 |
 | 23 | Reinforcement Learning for Language Models | ✅ v3 (new) |
-| 24 | Learning from Human Preferences | ⏳ v3 (new) |
+| 24 | Learning from Human Preferences | ✅ v3 (new) |
 | 25 | Reinforcement Learning with Verifiable Rewards | ⏳ v3 (new) |
 | 26 | Reasoning Models and Test-Time Compute | ✅ v2 |
 | 27 | Serving at Scale | ✅ v2 |

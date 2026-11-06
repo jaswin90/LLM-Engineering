@@ -179,6 +179,12 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(\varrho_t\), \(\epsilon_{\text{clip}}\) | importance ratio \(p_\theta/p_{\theta_{\text{old}}}\) of token \(t\); PPO clipping range |
 | \(\varrho^{\text{ref}}_t\), \(k_1,k_2,k_3\) | ratio \(p_{\text{ref}}/p_\theta\); the three per-token KL estimators |
 | \(p^*\), \(Z(x)\) | optimum of the KL-regularised objective, \(p^*\propto p_{\text{ref}}e^{\mathcal R/\beta_{\text{KL}}}\); its normaliser |
+| \(y_w\succ y_l\) | preferred ("winning") and rejected responses of a comparison (Ch. 24) |
+| \(\mathcal R_\phi\) | learned reward model with parameters \(\phi\) |
+| \(\sigma(u)\) | logistic function \(1/(1+e^{-u})\) (as a function; not a singular value) |
+| \(\hat{\mathcal R}_\theta=\beta_{\text{KL}}\log(p_\theta/p_{\text{ref}})\) | DPO's implicit reward |
+| \(h_\theta\) | log-ratio margin \(\log\frac{p_\theta(y_w)}{p_{\text{ref}}(y_w)}-\log\frac{p_\theta(y_l)}{p_{\text{ref}}(y_l)}\) (IPO) |
+| \(m_{\text{SimPO}}\) | SimPO's target reward margin |
 
 ## Reasoning and test-time compute (Ch. 26)
 | Symbol | Meaning |

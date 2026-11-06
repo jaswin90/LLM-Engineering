@@ -182,6 +182,12 @@
 <tr><td>\(\varrho_t\), \(\epsilon_{\text{clip}}\)</td><td>importance ratio \(p_\theta/p_{\theta_{\text{old}}}\) of token \(t\); PPO clipping range</td></tr>
 <tr><td>\(\varrho^{\text{ref}}_t\), \(k_1,k_2,k_3\)</td><td>ratio \(p_{\text{ref}}/p_\theta\); the three per-token KL estimators</td></tr>
 <tr><td>\(p^*\), \(Z(x)\)</td><td>optimum of the KL-regularised objective, \(p^*\propto p_{\text{ref}}e^{\mathcal R/\beta_{\text{KL}}}\); its normaliser</td></tr>
+<tr><td>\(y_w\succ y_l\)</td><td>preferred ("winning") and rejected responses of a comparison (Ch. 24)</td></tr>
+<tr><td>\(\mathcal R_\phi\)</td><td>learned reward model with parameters \(\phi\)</td></tr>
+<tr><td>\(\sigma(u)\)</td><td>logistic function \(1/(1+e^{-u})\) (as a function; not a singular value)</td></tr>
+<tr><td>\(\hat{\mathcal R}_\theta=\beta_{\text{KL}}\log(p_\theta/p_{\text{ref}})\)</td><td>DPO's implicit reward</td></tr>
+<tr><td>\(h_\theta\)</td><td>log-ratio margin \(\log\frac{p_\theta(y_w)}{p_{\text{ref}}(y_w)}-\log\frac{p_\theta(y_l)}{p_{\text{ref}}(y_l)}\) (IPO)</td></tr>
+<tr><td>\(m_{\text{SimPO}}\)</td><td>SimPO's target reward margin</td></tr>
 </tbody></table></div>
 <h2>Reasoning and test-time compute (Ch. 26)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
