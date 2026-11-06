@@ -166,7 +166,7 @@ The book follows one causal chain. Each part answers the question the previous p
 ### Chapter 24 — Learning from Human Preferences ✅ *(v3, new)*
 - SFT → reward model → RL (InstructGPT, 2022); Bradley–Terry reward models; reward hacking and over-optimisation; DPO from the closed-form optimum; IPO, KTO, ORPO, SimPO; online versus offline preference learning; Constitutional AI and RLAIF.
 
-### Chapter 25 — Reinforcement Learning with Verifiable Rewards ⏳ *(v3, new)*
+### Chapter 25 — Reinforcement Learning with Verifiable Rewards ✅ *(v3, new)*
 - Verifiable rewards (math, code, tests); GRPO derived; RLOO and REINFORCE++; Dr. GRPO and DAPO fixes; outcome versus process rewards; entropy collapse and exploration; rollout systems: synchronous vs asynchronous, weight sync, off-policy correction; bridge to reasoning models (Ch 26).
 
 
@@ -212,7 +212,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 22 | Beyond Attention: SSMs and Hybrids | ✅ v2 |
 | 23 | Reinforcement Learning for Language Models | ✅ v3 (new) |
 | 24 | Learning from Human Preferences | ✅ v3 (new) |
-| 25 | Reinforcement Learning with Verifiable Rewards | ⏳ v3 (new) |
+| 25 | Reinforcement Learning with Verifiable Rewards | ✅ v3 (new) |
 | 26 | Reasoning Models and Test-Time Compute | ✅ v2 |
 | 27 | Serving at Scale | ✅ v2 |
 | 28 | Benchmarking, Observability and Evaluation | ✅ v2 |

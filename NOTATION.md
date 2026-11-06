@@ -185,6 +185,10 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(\hat{\mathcal R}_\theta=\beta_{\text{KL}}\log(p_\theta/p_{\text{ref}})\) | DPO's implicit reward |
 | \(h_\theta\) | log-ratio margin \(\log\frac{p_\theta(y_w)}{p_{\text{ref}}(y_w)}-\log\frac{p_\theta(y_l)}{p_{\text{ref}}(y_l)}\) (IPO) |
 | \(m_{\text{SimPO}}\) | SimPO's target reward margin |
+| \(n_{y,i}\) | length of response \(i\) of a group (Ch. 25) |
+| \(P_{\text{info}}(p_s,n_s)\) | probability that a group of \(n_s\) samples contains both a success and a failure |
+| \(\epsilon_{\text{low}},\epsilon_{\text{high}}\) | DAPO's decoupled lower and upper clipping ranges |
+| \(n_{\text{stale}}\) | policy updates by which rollouts lag the trained policy in asynchronous RL |
 
 ## Reasoning and test-time compute (Ch. 26)
 | Symbol | Meaning |

@@ -33,7 +33,7 @@
     { id: 'ch21', n: 22, part: 'VII', title: 'Beyond Attention: SSMs and Hybrids', sub: 'Linear attention, Mamba, RWKV, hybrid models', file: 'chapters/ch21.html', ready: true },
     { id: 'ch28', n: 23, part: 'VIII', title: 'Reinforcement Learning for Language Models', sub: 'Policy gradients, advantages, KL control, PPO', file: 'chapters/ch28.html', ready: true },
     { id: 'ch29', n: 24, part: 'VIII', title: 'Learning from Human Preferences', sub: 'Reward models, RLHF, DPO and its variants', file: 'chapters/ch29.html', ready: true },
-    { id: 'ch30', n: 25, part: 'VIII', title: 'Reinforcement Learning with Verifiable Rewards', sub: 'GRPO, DAPO, process rewards, rollout systems', file: 'chapters/ch30.html', ready: false },
+    { id: 'ch30', n: 25, part: 'VIII', title: 'Reinforcement Learning with Verifiable Rewards', sub: 'GRPO, DAPO, process rewards, rollout systems', file: 'chapters/ch30.html', ready: true },
     { id: 'ch22', n: 26, part: 'VIII', title: 'Reasoning Models and Test-Time Compute', sub: 'o1/R1, inference scaling, long-output serving', file: 'chapters/ch22.html', ready: true },
     { id: 'ch23', n: 27, part: 'IX', title: 'Serving at Scale', sub: 'Routing, autoscaling, multi-LoRA, cost modelling', file: 'chapters/ch23.html', ready: true },
     { id: 'ch24', n: 28, part: 'IX', title: 'Benchmarking and Observability', sub: 'Methodology, MLPerf, tracing, quality regressions', file: 'chapters/ch24.html', ready: true },
