@@ -104,7 +104,7 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 ## Fine-tuning and parameter-efficient adaptation (Ch. 16)
 | Symbol | Meaning |
 |---|---|
-| \(\mathcal R\) | set of response positions that carry loss in supervised fine-tuning |
+| \(\mathcal I\) | set of response positions that carry loss in supervised fine-tuning |
 | \(W_0\), \(\Delta W\) | frozen pre-trained matrix; the update fine-tuning learns |
 | \(W_{\downarrow}, W_{\uparrow}\), \(r_a\) | LoRA down- and up-projections and adapter rank (as in Ch. 27) |
 | \(\alpha_a\), \(s\) | LoRA scaling constant; effective scale \(s=\alpha_a/r_a\) (\(\alpha_a/\sqrt{r_a}\) in rsLoRA). Not the latency \(\alpha\) |
@@ -163,6 +163,22 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(\mathbf A\), \(\mathbf b_t\), \(\mathbf c_t\) | SSM state matrix (diagonal) and input-dependent input/output vectors (Mamba's \(A,B,C\)) |
 | \(\Delta_t\) | SSM discretisation step (Ch. 22 only; unrelated to the quantisation step of Ch. 14) |
 | \(d_s\) | SSM state size per channel (Mamba's \(N\)) |
+
+## Reinforcement learning (Ch. 23–25)
+| Symbol | Meaning |
+|---|---|
+| \(p_\theta\), \(p_{\text{ref}}\), \(p_{\theta_{\text{old}}}\) | policy (the model's distribution; never \(\pi\), which is peak FLOP/s); frozen reference policy; policy that generated the rollouts |
+| \(x\), \(y=(y_1,\dots,y_{n_y})\) | prompt; sampled response of \(n_y\) tokens |
+| \(s_t=(x,y_{&lt;t})\), \(a_t=y_t\) | state (prefix) and action (token) of the token-level MDP |
+| \(\mathcal R(x,y)\), \(\mathcal R_t\) | sequence reward; per-step reward (zero except at the end, plus KL shaping) |
+| \(J(\theta)\), \(J_{\text{KL}}\) | expected reward; KL-regularised objective |
+| \(V^{p}\), \(Q^{p}\), \(A^{p}\); \(V_\psi\) | state-value, action-value and advantage functions of policy \(p\); learned critic (not the attention matrices \(V\), \(Q\)) |
+| \(\hat A_t\), \(\delta_t\) | advantage estimate; TD error \(\mathcal R_t+\gamma_dV(s_{t+1})-V(s_t)\) |
+| \(\gamma_d\), \(\lambda_{\text{GAE}}\) | discount factor (usually 1); GAE parameter (not the draft length \(\gamma\) or arrival rate \(\lambda\)) |
+| \(\beta_{\text{KL}}\) | KL-penalty coefficient (not the bandwidth \(\beta\)) |
+| \(\varrho_t\), \(\epsilon_{\text{clip}}\) | importance ratio \(p_\theta/p_{\theta_{\text{old}}}\) of token \(t\); PPO clipping range |
+| \(\varrho^{\text{ref}}_t\), \(k_1,k_2,k_3\) | ratio \(p_{\text{ref}}/p_\theta\); the three per-token KL estimators |
+| \(p^*\), \(Z(x)\) | optimum of the KL-regularised objective, \(p^*\propto p_{\text{ref}}e^{\mathcal R/\beta_{\text{KL}}}\); its normaliser |
 
 ## Reasoning and test-time compute (Ch. 26)
 | Symbol | Meaning |

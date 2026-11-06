@@ -48,8 +48,8 @@
 
 <h2 id="s16-1">16.1 What fine-tuning is, and when to do it</h2>
 <p>A pre-trained model is a distribution over continuations of text, and a base model continues whatever it is given. Ask it a question and it may answer, or it may produce three more questions, because questions in its training data were often followed by more questions. The first fine-tuning that nearly every deployed model receives is therefore <strong>supervised fine-tuning</strong> (SFT), also called instruction tuning: training on examples of the behaviour we want, written as a prompt followed by an ideal response. Google's FLAN (2021)<span class="cite"><a href="#r-flan">[21]</a></span> showed that instruction tuning on many tasks made models follow unseen instructions far better, and OpenAI's InstructGPT (2022) made SFT the first stage of the pipeline that Chapter 24 develops.</p>
-<p>The objective is the familiar next-token cross-entropy of pre-training, with one change. An SFT example is a sequence \(x_1,\dots,x_T\) in which positions belong either to the prompt or to the response, and we want the model to learn to produce responses, not to imitate prompts. So the loss is summed only over response positions \(\mathcal R\subseteq\{1,\dots,T\}\):</p>
-\[ \mathcal L_{\text{SFT}}(\theta)\;=\;-\frac{1}{|\mathcal R|}\sum_{t\in\mathcal R}\log p_\theta(x_t\mid x_{&lt;t}). \]
+<p>The objective is the familiar next-token cross-entropy of pre-training, with one change. An SFT example is a sequence \(x_1,\dots,x_T\) in which positions belong either to the prompt or to the response, and we want the model to learn to produce responses, not to imitate prompts. So the loss is summed only over response positions \(\mathcal I\subseteq\{1,\dots,T\}\):</p>
+\[ \mathcal L_{\text{SFT}}(\theta)\;=\;-\frac{1}{|\mathcal I|}\sum_{t\in\mathcal I}\log p_\theta(x_t\mid x_{&lt;t}). \]
 <p>In code this is a mask: the labels at prompt positions are set to an ignore value, so they contribute neither loss nor gradient, although the model still reads them as context. Figure 16.1 shows a chat example laid out as one sequence. The special tokens of the chat template, which mark where the system message, the user turn and the assistant turn begin and end, are part of the sequence, and the model learns them too: a fine-tuned model ends its turn because it was trained to emit the end-of-turn token at the end of every response.</p>
 
 <figure class="diagram" id="fig-16-1">
@@ -591,7 +591,7 @@
 <details class="qa" data-id="ch27-qa-01">
 <summary><span class="lvl warm">Warm-up</span> What is supervised fine-tuning, and what exactly is the loss?</summary>
 <div class="answer">
-<p>SFT trains a pre-trained model on examples of desired behaviour, each a prompt followed by an ideal response, usually formatted with a chat template. The loss is next-token cross-entropy averaged over response positions only, \(-\frac1{|\mathcal R|}\sum_{t\in\mathcal R}\log p_\theta(x_t\mid x_{&lt;t})\). Prompt and template tokens are masked out of the loss, though they are still processed as context and so still cost compute. The response's end-of-turn token is included, which is how the model learns to stop. Short examples are typically packed into long sequences with attention masks that prevent cross-example attention.</p>
+<p>SFT trains a pre-trained model on examples of desired behaviour, each a prompt followed by an ideal response, usually formatted with a chat template. The loss is next-token cross-entropy averaged over response positions only, \(-\frac1{|\mathcal I|}\sum_{t\in\mathcal I}\log p_\theta(x_t\mid x_{&lt;t})\). Prompt and template tokens are masked out of the loss, though they are still processed as context and so still cost compute. The response's end-of-turn token is included, which is how the model learns to stop. Short examples are typically packed into long sequences with attention masks that prevent cross-example attention.</p>
 </div>
 </details>
 

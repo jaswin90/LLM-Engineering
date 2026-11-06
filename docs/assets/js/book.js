@@ -31,7 +31,7 @@
     { id: 'ch19', n: 20, part: 'VII', title: 'Speculative Decoding', sub: 'Exactness proof, Medusa, EAGLE 1–3, MTP, tree verification', file: 'chapters/ch19.html', ready: true },
     { id: 'ch20', n: 21, part: 'VII', title: 'Long-Context Inference', sub: 'RoPE scaling, sparse attention, context parallelism', file: 'chapters/ch20.html', ready: true },
     { id: 'ch21', n: 22, part: 'VII', title: 'Beyond Attention: SSMs and Hybrids', sub: 'Linear attention, Mamba, RWKV, hybrid models', file: 'chapters/ch21.html', ready: true },
-    { id: 'ch28', n: 23, part: 'VIII', title: 'Reinforcement Learning for Language Models', sub: 'Policy gradients, advantages, KL control, PPO', file: 'chapters/ch28.html', ready: false },
+    { id: 'ch28', n: 23, part: 'VIII', title: 'Reinforcement Learning for Language Models', sub: 'Policy gradients, advantages, KL control, PPO', file: 'chapters/ch28.html', ready: true },
     { id: 'ch29', n: 24, part: 'VIII', title: 'Learning from Human Preferences', sub: 'Reward models, RLHF, DPO and its variants', file: 'chapters/ch29.html', ready: false },
     { id: 'ch30', n: 25, part: 'VIII', title: 'Reinforcement Learning with Verifiable Rewards', sub: 'GRPO, DAPO, process rewards, rollout systems', file: 'chapters/ch30.html', ready: false },
     { id: 'ch22', n: 26, part: 'VIII', title: 'Reasoning Models and Test-Time Compute', sub: 'o1/R1, inference scaling, long-output serving', file: 'chapters/ch22.html', ready: true },

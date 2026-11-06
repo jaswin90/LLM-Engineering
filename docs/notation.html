@@ -113,7 +113,7 @@
 </tbody></table></div>
 <h2>Fine-tuning and parameter-efficient adaptation (Ch. 16)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
-<tr><td>\(\mathcal R\)</td><td>set of response positions that carry loss in supervised fine-tuning</td></tr>
+<tr><td>\(\mathcal I\)</td><td>set of response positions that carry loss in supervised fine-tuning</td></tr>
 <tr><td>\(W_0\), \(\Delta W\)</td><td>frozen pre-trained matrix; the update fine-tuning learns</td></tr>
 <tr><td>\(W_{\downarrow}, W_{\uparrow}\), \(r_a\)</td><td>LoRA down- and up-projections and adapter rank (as in Ch. 27)</td></tr>
 <tr><td>\(\alpha_a\), \(s\)</td><td>LoRA scaling constant; effective scale \(s=\alpha_a/r_a\) (\(\alpha_a/\sqrt{r_a}\) in rsLoRA). Not the latency \(\alpha\)</td></tr>
@@ -167,6 +167,21 @@
 <tr><td>\(\mathbf A\), \(\mathbf b_t\), \(\mathbf c_t\)</td><td>SSM state matrix (diagonal) and input-dependent input/output vectors (Mamba's \(A,B,C\))</td></tr>
 <tr><td>\(\Delta_t\)</td><td>SSM discretisation step (Ch. 22 only; unrelated to the quantisation step of Ch. 14)</td></tr>
 <tr><td>\(d_s\)</td><td>SSM state size per channel (Mamba's \(N\))</td></tr>
+</tbody></table></div>
+<h2>Reinforcement learning (Ch. 23–25)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(p_\theta\), \(p_{\text{ref}}\), \(p_{\theta_{\text{old}}}\)</td><td>policy (the model's distribution; never \(\pi\), which is peak FLOP/s); frozen reference policy; policy that generated the rollouts</td></tr>
+<tr><td>\(x\), \(y=(y_1,\dots,y_{n_y})\)</td><td>prompt; sampled response of \(n_y\) tokens</td></tr>
+<tr><td>\(s_t=(x,y_{&lt;t})\), \(a_t=y_t\)</td><td>state (prefix) and action (token) of the token-level MDP</td></tr>
+<tr><td>\(\mathcal R(x,y)\), \(\mathcal R_t\)</td><td>sequence reward; per-step reward (zero except at the end, plus KL shaping)</td></tr>
+<tr><td>\(J(\theta)\), \(J_{\text{KL}}\)</td><td>expected reward; KL-regularised objective</td></tr>
+<tr><td>\(V^{p}\), \(Q^{p}\), \(A^{p}\); \(V_\psi\)</td><td>state-value, action-value and advantage functions of policy \(p\); learned critic (not the attention matrices \(V\), \(Q\))</td></tr>
+<tr><td>\(\hat A_t\), \(\delta_t\)</td><td>advantage estimate; TD error \(\mathcal R_t+\gamma_dV(s_{t+1})-V(s_t)\)</td></tr>
+<tr><td>\(\gamma_d\), \(\lambda_{\text{GAE}}\)</td><td>discount factor (usually 1); GAE parameter (not the draft length \(\gamma\) or arrival rate \(\lambda\))</td></tr>
+<tr><td>\(\beta_{\text{KL}}\)</td><td>KL-penalty coefficient (not the bandwidth \(\beta\))</td></tr>
+<tr><td>\(\varrho_t\), \(\epsilon_{\text{clip}}\)</td><td>importance ratio \(p_\theta/p_{\theta_{\text{old}}}\) of token \(t\); PPO clipping range</td></tr>
+<tr><td>\(\varrho^{\text{ref}}_t\), \(k_1,k_2,k_3\)</td><td>ratio \(p_{\text{ref}}/p_\theta\); the three per-token KL estimators</td></tr>
+<tr><td>\(p^*\), \(Z(x)\)</td><td>optimum of the KL-regularised objective, \(p^*\propto p_{\text{ref}}e^{\mathcal R/\beta_{\text{KL}}}\); its normaliser</td></tr>
 </tbody></table></div>
 <h2>Reasoning and test-time compute (Ch. 26)</h2>
 <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
