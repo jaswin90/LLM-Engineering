@@ -101,6 +101,19 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 | \(p_{\text{te}}\), \(p_{\text{st}}\) | teacher and student next-token distributions (distillation) |
 | \(\mathrm{KL}(p\,\Vert\,q)\) | Kullback–Leibler divergence \(\sum_v p(v)\log\frac{p(v)}{q(v)}\) |
 
+## Fine-tuning and parameter-efficient adaptation (Ch. 16)
+| Symbol | Meaning |
+|---|---|
+| \(\mathcal R\) | set of response positions that carry loss in supervised fine-tuning |
+| \(W_0\), \(\Delta W\) | frozen pre-trained matrix; the update fine-tuning learns |
+| \(W_{\downarrow}, W_{\uparrow}\), \(r_a\) | LoRA down- and up-projections and adapter rank (as in Ch. 27) |
+| \(\alpha_a\), \(s\) | LoRA scaling constant; effective scale \(s=\alpha_a/r_a\) (\(\alpha_a/\sqrt{r_a}\) in rsLoRA). Not the latency \(\alpha\) |
+| \(\nabla_W\) | full-fine-tuning gradient \(X^\top G\) of a matrix (never formed in LoRA) |
+| \(\eta_{\text{lr}}\) | learning rate (subscript distinguishes it from the sparsity \(\eta\)) |
+| \(m\), \(\lVert V\rVert_c\) | DoRA magnitude vector; vector of column norms |
+| \(l_p\) | number of learned prefix or soft-prompt positions |
+| \(n_{\text{DP}}\) | data-parallel degree (ZeRO/FSDP sharding factor) |
+
 ## Communication (Ch. 17 onwards)
 | Symbol | Meaning |
 |---|---|

@@ -122,7 +122,7 @@ The book follows one causal chain. Each part answers the question the previous p
 
 ---
 
-### Chapter 16 — Fine-Tuning and Parameter-Efficient Adaptation ⏳ *(v3, new)*
+### Chapter 16 — Fine-Tuning and Parameter-Efficient Adaptation ✅ *(v3, new)*
 - Why adapt; the memory bill of full fine-tuning (weights, gradients, Adam, activations); the low-rank hypothesis and intrinsic dimension; LoRA derivation, initialisation, \(\alpha/r\) scaling, merging; which matrices and which rank; QLoRA (NF4, double quantisation, paged optimisers); DoRA, rsLoRA, LoRA+; adapters, prefix and prompt tuning, IA³; choosing a method; bridge to multi-LoRA serving (Ch 27).
 
 ## Part VI — Distributed Inference
@@ -203,7 +203,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 13 | Disaggregated Serving | ✅ v2 |
 | 14 | Quantisation | ✅ v2 |
 | 15 | Pruning, Sparsity and Distillation | ✅ v2 |
-| 16 | Fine-Tuning and Parameter-Efficient Adaptation | ⏳ v3 (new) |
+| 16 | Fine-Tuning and Parameter-Efficient Adaptation | ✅ v3 (new) |
 | 17 | Distributed Computing Fundamentals | ✅ v2 |
 | 18 | Parallelism Strategies for Inference | ✅ v2 |
 | 19 | Mixture of Experts at Inference | ✅ v2 |

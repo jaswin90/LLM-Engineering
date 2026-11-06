@@ -24,7 +24,7 @@
     { id: 'ch13', n: 13, part: 'IV', title: 'Disaggregated Serving', sub: 'Splitwise, DistServe, Mooncake, Dynamo, KV transfer', file: 'chapters/ch13.html', ready: true },
     { id: 'ch14', n: 14, part: 'V', title: 'Quantisation', sub: 'FP8, INT4, MXFP4/NVFP4, GPTQ, AWQ, SmoothQuant, rotations', file: 'chapters/ch14.html', ready: true },
     { id: 'ch15', n: 15, part: 'V', title: 'Pruning, Sparsity and Distillation', sub: 'SparseGPT, Wanda, 2:4, Minitron, distillation', file: 'chapters/ch15.html', ready: true },
-    { id: 'ch27', n: 16, part: 'V', title: 'Fine-Tuning and Parameter-Efficient Adaptation', sub: 'Full fine-tuning, LoRA, QLoRA, DoRA, adapters', file: 'chapters/ch27.html', ready: false },
+    { id: 'ch27', n: 16, part: 'V', title: 'Fine-Tuning and Parameter-Efficient Adaptation', sub: 'Full fine-tuning, LoRA, QLoRA, DoRA, adapters', file: 'chapters/ch27.html', ready: true },
     { id: 'ch16', n: 17, part: 'VI', title: 'Distributed Computing Fundamentals', sub: 'Collectives, the α–β model, ring all-reduce, NVLink, InfiniBand, NCCL', file: 'chapters/ch16.html', ready: true },
     { id: 'ch17', n: 18, part: 'VI', title: 'Parallelism Strategies for Inference', sub: 'Tensor, pipeline, sequence and context parallelism', file: 'chapters/ch17.html', ready: true },
     { id: 'ch18', n: 19, part: 'VI', title: 'Mixture of Experts at Inference', sub: 'Routing, expert parallelism, all-to-all, the DeepSeek-V3 deployment', file: 'chapters/ch18.html', ready: true },
