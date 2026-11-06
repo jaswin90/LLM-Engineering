@@ -34,7 +34,7 @@
     { id: 'ch23', n: 23, part: 'VIII', title: 'Serving at Scale', sub: 'Routing, autoscaling, multi-LoRA, cost modelling', file: 'chapters/ch23.html', ready: true },
     { id: 'ch24', n: 24, part: 'VIII', title: 'Benchmarking and Observability', sub: 'Methodology, MLPerf, tracing, quality regressions', file: 'chapters/ch24.html', ready: true },
     { id: 'ch25', n: 25, part: 'VIII', title: 'On-Device and Edge Inference', sub: 'llama.cpp, GGUF, MLX, NPUs', file: 'chapters/ch25.html', ready: true },
-    { id: 'ch26', n: 26, part: 'VIII', title: 'The ML-Systems Design Interview', sub: 'Worked case studies and rubrics', ready: false }
+    { id: 'ch26', n: 26, part: 'VIII', title: 'The ML-Systems Design Interview', sub: 'Worked case studies and rubrics', file: 'chapters/ch26.html', ready: true }
   ];
   const PARTS = { I: 'Foundations: What We Run and Why It Is Expensive', II: 'The Machine: Hardware for Mathematicians', III: 'Attention and Memory', IV: 'Serving Systems', V: 'Making Models Smaller', VI: 'Distributed Inference', VII: 'Faster Decoding and Longer Contexts', VIII: 'Production' };
 
