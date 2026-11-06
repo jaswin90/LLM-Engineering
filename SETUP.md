@@ -11,14 +11,20 @@ The workflow (`.github/workflows/pages.yml`) uploads the `docs/` folder as-is. T
 
 > Alternative: choose **Deploy from a branch**, pick `claude/funny-hopper-lcw8ww` (or `main` after merging) and the `/docs` folder. `docs/.nojekyll` is already present.
 
-## 2. Enable "Sign in with Google" and cloud-synced progress (optional, ~10 minutes)
+## 2. Where readers' progress lives
 
-Without this step, readers' answers are saved in their own browser (localStorage). With it, signed-in readers get their history on every device.
+- **Default (no setup):** answers, ratings and completed chapters are saved in the reader's own browser (localStorage). Nothing is sent anywhere.
+- **Sync link / file (no setup, already live):** on *My progress*, "Copy sync link" packs the reader's progress into the link's `#` fragment (deflate-compressed, about 6 KB even with every question answered). Opening the link on another device merges it in, keeping the newer answer per question. Browsers never send the `#` part to the server, so no server stores anything. "Export file" / "Import file" do the same with a JSON file.
+- **Google sign-in (optional, below):** automatic sync across devices, stored in your Firebase project.
+
+## 3. Enable "Sign in with Google" and cloud-synced progress (optional, ~10 minutes)
+
+Without this step the book works fully, with browser storage and sync links. With it, signed-in readers get their history on every device automatically.
 
 1. Go to https://console.firebase.google.com and **create a project** (Analytics not needed).
 2. **Build → Authentication → Get started → Sign-in method → Google → Enable.** Set a support email and save.
 3. **Authentication → Settings → Authorized domains → Add domain:** `jaswin90.github.io`
-4. **Build → Firestore Database → Create database** (production mode, any region).
+4. **Build → Firestore Database → Create database** (production mode; pick a region near your readers, e.g. `asia-south1` Mumbai).
 5. **Firestore → Rules**, paste and publish:
 
    ```
@@ -37,7 +43,7 @@ Without this step, readers' answers are saved in their own browser (localStorage
 
 Each reader's progress is a single Firestore document `users/{uid}` containing their MCQ answers, interview-question ratings and chapter completion. Free-tier Firestore limits are far above what a book needs.
 
-## 3. Preview locally
+## 4. Preview locally
 
 ```bash
 cd docs && python3 -m http.server 8000

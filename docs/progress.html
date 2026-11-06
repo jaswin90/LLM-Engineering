@@ -14,7 +14,7 @@
 <body data-root="./">
 <div class="cover">
 <h1>My progress</h1>
-<p class="sub" id="sync-state">Your answers are saved in this browser. Sign in with Google to sync them across devices.</p>
+<p class="sub" id="sync-state">Your answers are saved in this browser. Use a sync link (below) to move them to another device.</p>
 <div class="table-wrap"><table>
 <thead><tr><th>Chapter</th><th class="num">MCQs answered</th><th class="num">Correct</th><th class="num">Interview Qs mastered</th><th class="num">To review</th><th>Status</th></tr></thead>
 <tbody id="rows"></tbody>
@@ -22,9 +22,17 @@
 <h2>Questions to revisit</h2>
 <p class="small muted">MCQs you got wrong on your latest attempt, and interview questions you marked "review again".</p>
 <ul id="review"></ul>
-<h2>Your data</h2>
-<p><button class="btn" id="export">Export as JSON</button> <button class="btn" id="reset">Reset all progress</button></p>
-<p class="small muted">Signed-in progress is stored in Google Firebase (Cloud Firestore) under your account ID and is readable only by you. Resetting while signed in clears it there too.</p>
+<h2>Move your progress to another device</h2>
+<p>No account is needed. <b>Sync link:</b> copy the link, open it on your other device, and your answers are merged in (the newer answer wins for each question). <b>File:</b> export a backup file and import it anywhere.</p>
+<p><button class="btn" id="synclink">Copy sync link</button> <button class="btn" id="export">Export file</button> <button class="btn" id="import">Import file</button> <input type="file" id="importfile" accept="application/json,.json" hidden></p>
+<p class="small muted" id="sync-msg"></p>
+<h2>Your data and privacy</h2>
+<ul class="small">
+<li><b>Not signed in:</b> your answers, ratings and completed chapters are stored only in this browser (localStorage). Nothing is sent anywhere. Clearing this site's data deletes them.</li>
+<li><b>Sync link and file:</b> your progress is packed into the link itself, after the <code>#</code>, which browsers never send to any server. Anyone who has the link can load your progress, so share it only with yourself.</li>
+<li><b>Signed in with Google</b> (when enabled): a copy is kept in the book's Google Cloud Firestore project, under your account ID, with your name and email. Only you can read or write it; the site's owner can see it in the Firebase console. Resetting while signed in deletes it there too.</li>
+</ul>
+<p><button class="btn" id="reset">Reset all progress</button></p>
 </div>
 <script>
 document.addEventListener('book:ready', function () {
@@ -46,11 +54,73 @@ document.addEventListener('book:ready', function () {
     document.getElementById('review').innerHTML = rev || '<li class="muted">Nothing to review yet.</li>';
   }
   paint(); B.store.onChange(paint);
+  var msg = document.getElementById('sync-msg');
+  function say(s) { msg.textContent = s; B.toast(s); }
+  function count(d) { return Object.keys((d && d.items) || {}).length; }
+  function valid(d) { return d && typeof d === 'object' && d.items && typeof d.items === 'object' && !Array.isArray(d.items); }
+
+  /* Compact form for links: drop titles and chapter ids (derivable from the item id). */
+  function compact(d) {
+    var items = {}, chapters = {};
+    Object.keys(d.items).forEach(function (id) {
+      var r = d.items[id]; if (!r) return;
+      var o = {}; Object.keys(r).forEach(function (k) { if (k !== 'title' && k !== 'ch') o[k] = r[k]; });
+      items[id] = o;
+    });
+    Object.keys(d.chapters || {}).forEach(function (c) { chapters[c] = d.chapters[c]; });
+    return { v: 1, items: items, chapters: chapters };
+  }
+  function expand(d) {
+    Object.keys(d.items).forEach(function (id) { var r = d.items[id]; if (r && !r.ch) r.ch = id.split('-')[0]; });
+    d.chapters = d.chapters || {}; return d;
+  }
+  function b64u(bytes) { var s = ''; for (var i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+  function unb64u(s) { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; var b = atob(s), u = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+  async function pipe(bytes, stream) { return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer()); }
+  async function encode(d) {
+    var raw = new TextEncoder().encode(JSON.stringify(compact(d)));
+    if (window.CompressionStream) { try { return 'z' + b64u(await pipe(raw, new CompressionStream('deflate-raw'))); } catch (e) {} }
+    return 'j' + b64u(raw);
+  }
+  async function decode(s) {
+    var bytes = unb64u(s.slice(1));
+    if (s[0] === 'z') bytes = await pipe(bytes, new DecompressionStream('deflate-raw'));
+    return expand(JSON.parse(new TextDecoder().decode(bytes)));
+  }
+  function mergeIn(d, source) {
+    if (!valid(d)) { say('That ' + source + ' does not contain book progress.'); return; }
+    var before = count(B.store.data);
+    B.store.merge(d);
+    say('Merged ' + count(d) + ' saved answers from the ' + source + ' (' + before + ' → ' + count(B.store.data) + ' in this browser).');
+  }
+
+  document.getElementById('synclink').onclick = async function () {
+    if (!count(B.store.data)) { say('Answer some questions first — there is nothing to sync yet.'); return; }
+    var url = location.origin + location.pathname + '#sync=' + await encode(B.store.data);
+    try {
+      if (navigator.share && /Mobi|Android|iPhone|iPad/.test(navigator.userAgent)) { await navigator.share({ title: 'My LLM Engineering progress', url: url }); say('Sync link shared. Open it on your other device.'); return; }
+      await navigator.clipboard.writeText(url); say('Sync link copied (' + Math.round(url.length / 1024) + ' KB). Open it on your other device.');
+    } catch (e) { window.prompt('Copy this link and open it on your other device:', url); }
+  };
   document.getElementById('export').onclick = function () {
     var a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(B.store.data, null, 2)], { type: 'application/json' }));
     a.download = 'llm-engineering-progress.json'; a.click();
   };
+  var fileIn = document.getElementById('importfile');
+  document.getElementById('import').onclick = function () { fileIn.click(); };
+  fileIn.onchange = function () {
+    var f = fileIn.files[0]; if (!f) return;
+    f.text().then(function (txt) { var d; try { d = JSON.parse(txt); } catch (e) { say('That file is not valid JSON.'); return; } mergeIn(d, 'file'); })
+      .finally(function () { fileIn.value = ''; });
+  };
+  async function fromHash() {
+    var m = location.hash.match(/^#sync=([A-Za-z0-9_-]+)$/); if (!m) return;
+    history.replaceState(null, '', location.pathname);
+    var d; try { d = await decode(m[1]); } catch (e) { say('This sync link is damaged or incomplete.'); return; }
+    if (confirm('Merge ' + count(d) + ' saved answers from this sync link into this browser? For each question the newer answer is kept.')) mergeIn(d, 'link');
+  }
+  fromHash(); window.addEventListener('hashchange', fromHash);
   document.getElementById('reset').onclick = function () { if (confirm('Delete all saved answers and ratings?')) { B.store.reset(); B.toast('Progress reset'); } };
 });
 </script>

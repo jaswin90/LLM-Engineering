@@ -6,7 +6,7 @@ A free, interactive, web-native textbook on **LLM inference engineering**: KV ca
 
 - 📐 Equations rendered with KaTeX, diagrams as inline SVG, charts rendered from data in the page. No images.
 - ✅ Interactive MCQs with explanations, plus graded interview questions with model answers.
-- 🔐 Optional Google sign-in (Firebase) keeps each reader's history across devices.
+- 🔐 Progress is saved in the browser; a no-account **sync link** (or export/import file) moves it between devices, and optional Google sign-in (Firebase, see `SETUP.md`) syncs it automatically.
 - 📚 Primary-source references in every chapter and a consolidated [bibliography](docs/references.html).
 
 ## Repository layout

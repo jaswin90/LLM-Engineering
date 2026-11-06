@@ -132,7 +132,7 @@
     $('#toc-toggle').addEventListener('click', () => { const s = $('.sidebar'); if (s) s.classList.toggle('open'); });
     $('#auth-btn').addEventListener('click', () => {
       if (window.BookAuth && window.BookAuth.configured) window.BookAuth.signIn();
-      else toast('Google sign-in is not configured on this deployment yet — your progress is saved in this browser.');
+      else toast('Google sign-in is not enabled yet. Your progress is saved in this browser; use My progress → Copy sync link to move it to another device.');
     });
   }
   function renderAuth(user, syncing) {

@@ -79,7 +79,7 @@ async function main() {
 
 function rebindLocal(Book) {
   const b = document.getElementById('auth-btn');
-  if (b) b.addEventListener('click', () => Book.toast('Google sign-in is not configured on this deployment yet — progress is saved in this browser.'));
+  if (b) b.addEventListener('click', () => Book.toast('Google sign-in is not enabled yet. Your progress is saved in this browser; use My progress → Copy sync link to move it to another device.'));
 }
 
 main().catch(e => console.error(e));
