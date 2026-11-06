@@ -385,6 +385,12 @@ Equivalently, if \(R_i\) is the block-diagonal matrix of \(2\times2\) rotations,
 <p><em>Solution.</em> The blocks are identical to Llama 3 8B's: 218.11M per layer, 6.980B in total. The embedding and head add \(2\times32{,}000\times4096=262\)M. Total ≈ 7.24B, which is Mistral's published figure. The only difference from Llama 3 8B's 8.03B is the vocabulary.</p>
 </details>
 
+<details class="drill">
+<summary>Drill 2.2 — Counting Llama 3 70B</summary>
+<p>Llama 3 70B has \(L=80\), \(d=8192\), 64 query heads and 8 key/value heads of dimension 128, \(d_{ff}=28{,}672\), a vocabulary of 128,256 and untied embedding and output matrices. Count its parameters.</p>
+<p><em>Solution.</em> Embedding and LM head: \(2\times128{,}256\times8192\approx2.10\)B. Per layer, attention: \(W_Q\) and \(W_O\) are \(8192\times8192\) each (134.2M together), \(W_K\) and \(W_V\) are \(8192\times1024\) each (16.8M together), about 151M; the SwiGLU FFN has three \(8192\times28{,}672\) matrices, about 704.6M; norms add a negligible 16k. So about 855.6M per layer, 68.45B for 80 layers, and 70.55B in total, matching the published 70.6B. The FFN holds 82% of each layer's parameters, as §2.7 argued.</p>
+</details>
+
 <h2 id="s2-10">2.10 Counting FLOPs</h2>
 <p>Parameters tell us how many bytes must be stored and, in decode, read. Floating-point operations (FLOPs) tell us how much arithmetic must be done. Both are needed, because Chapter 3 will show that the speed of each phase is set by whichever of the two limits binds first.</p>
 <div class="box def">

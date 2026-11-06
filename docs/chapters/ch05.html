@@ -253,6 +253,12 @@
 
 <p>Read the table as a story with two threads. The first is <strong>lower precision</strong>. Each halving of operand width (FP16 → FP8 → FP4) roughly doubles throughput per unit of area and power, and halves the bytes that must be moved. The hardware followed the algorithms here: Hopper's FP8 arrived as research showed that Transformers could be trained and served in 8 bits, and Blackwell's FP4 as 4-bit inference with fine-grained scaling matured (Chapter 14). The second thread is <strong>asynchrony</strong>. On Volta and Ampere, a warp issued a tensor-core instruction and waited for it. On Hopper, a group of four warps issues a large MMA that proceeds asynchronously, while the TMA copies the next tiles from HBM into shared memory in the background. On Blackwell, accumulators move out of registers into dedicated tensor memory, so warps can do other work entirely. The goal throughout is to keep the tensor cores fed. As they got faster, everything around them (copying, softmax, bookkeeping) had to be overlapped with them, or it would become the bottleneck. Kernels written for one generation therefore often perform poorly on the next. This is why FlashAttention has had four versions (Chapter 9).</p>
 
+<details class="drill">
+<summary>Drill 5.1 — Deriving peak FLOP/s from the SM count</summary>
+<p>An H100 SXM has 132 SMs, four tensor cores per SM, and each tensor core performs 512 dense BF16 fused multiply-adds per clock at a boost clock of about 1.83 GHz. Derive the dense BF16 peak, and say what FP8 and 2:4 sparsity change.</p>
+<p><em>Solution.</em> \(132\times4\times512\) FMAs per clock is 270,336 FMAs, or 540,672 FLOPs per clock; at \(1.83\times10^{9}\) clocks per second that is about \(9.89\times10^{14}\), the familiar 989 TFLOP/s. FP8 tensor cores process twice as many elements per clock, giving about 1,979 TFLOP/s. The 2:4 structured-sparsity figures quoted on spec sheets double these again by skipping zeros, which is why this book always quotes dense numbers (§5.9). Sustained clocks under load are often lower than boost, so achieved peaks are a few per cent below the formula even before kernel inefficiency.</p>
+</details>
+
 <h2 id="s5-6">5.6 HBM: why bandwidth is expensive</h2>
 <p>If bandwidth is the limit for decode, why not simply add more? To answer, we need to know what HBM physically is. <strong>High-bandwidth memory</strong> consists of stacks of DRAM dies, eight to twelve or more, connected vertically by thousands of through-silicon vias and placed beside the GPU die on a silicon <em>interposer</em> that carries very fine wiring. The key to its bandwidth is width. Each stack has a 1,024-bit interface (HBM4 doubles this to 2,048 bits), compared with 32 or 64 bits for conventional memory, so a stack transfers 128 bytes per transfer cycle. The bandwidth of a GPU's memory system is therefore</p>
 \[ \beta = (\text{number of stacks})\times\frac{\text{bus width per stack}}{8}\times(\text{data rate per pin}) . \]
@@ -263,6 +269,12 @@
 </div>
 
 <p>Each term in that formula is hard to grow. More stacks need more space beside the die, and the interposer and package are already at the limits of manufacturable size. Wider buses need more connections through the interposer. Faster pins need more power per bit and run into signal-integrity limits. HBM is also expensive, a large fraction of the cost of an accelerator, and it is supplied by only three manufacturers. Compare this with compute, which scales with transistor density and with narrower number formats. This asymmetry is the physical root of the memory wall of §1.9. It is also why every generation's headline improvement in FLOP/s is accompanied by a much smaller improvement in bandwidth.</p>
+
+<details class="drill">
+<summary>Drill 5.2 — Bandwidth from the memory bus</summary>
+<p>The H100 SXM uses five HBM3 stacks, each with a 1,024-bit interface, at about 5.2 Gb/s per pin. The H200 uses six HBM3e stacks at about 6.25 Gb/s per pin. Compute both bandwidths and the ratio of decode speed you would expect for a memory-bound model.</p>
+<p><em>Solution.</em> H100: \(5\times1024\times5.2\times10^{9}/8\approx3.33\times10^{12}\) B/s, the quoted 3.35 TB/s. H200: \(6\times1024\times6.25\times10^{9}/8=4.8\times10^{12}\) B/s. For memory-bound decode, time per step is bytes over bandwidth, so the H200 decodes about \(4.8/3.35\approx1.43\) times faster at the same batch, with no change in compute; its extra capacity (141 GB versus 80 GB) also allows larger batches. Bandwidth comes from bus width times pin rate, and both are expensive, which is the theme of §5.6.</p>
+</details>
 
 <h2 id="s5-7">5.7 Beyond one GPU: NVLink, NVSwitch and the network</h2>
 <p>Llama 3 70B does not fit in one H100, and DeepSeek-V3 needs a server just for its weights (§2.11). GPUs must therefore cooperate, and the bandwidth between them shapes which kinds of parallelism (Chapter 17) are practical.</p>

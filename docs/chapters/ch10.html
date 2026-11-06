@@ -74,6 +74,11 @@
 
 <p>Figure 10.1 shows a stretch of GPU memory under contiguous allocation. Each request's buffer contains a used part, the prompt and the tokens generated so far, and a large reserved part that may never be used. Between buffers lie gaps left by finished requests, which together could hold another request but individually cannot. The consequence is that the server admits far fewer concurrent requests than its memory could support. By Chapter 3's analysis, fewer concurrent requests means lower throughput at the same latency. The waste is not a minor inefficiency. It is a 2–5× loss in the resource that decides serving cost.</p>
 
+<div class="box example">
+<div class="box-title">Worked example — the cost of reserving the maximum length</div>
+<p>An engine serving Llama 3 8B reserves a contiguous cache of <code>max_model_len</code> = 8,192 tokens for each request, 1 GiB at 128 KiB per token, while requests average 1,500 tokens of prompt and output. With 55 GB of cache memory, the engine admits 51 requests, although they use only about 9.6 GB of cache between them: 82% of the reserved memory holds nothing. Allocating in 16-token blocks as tokens arrive lets the same memory hold about 290 requests of average length, nearly six times the batch, and since decode throughput grows almost linearly with batch in the memory-bound regime, nearly six times the throughput. That is the case for PagedAttention (§10.3).</p>
+</div>
+
 <h2 id="s10-2">10.2 An old idea: virtual memory</h2>
 <p>Operating systems faced exactly this problem in the 1960s. Programs want to believe they have one large contiguous address space, but physical memory is shared by many programs that start, grow and finish unpredictably. The solution, first implemented in the Atlas computer at Manchester (1962) and universal today, is <strong>virtual memory with paging</strong>.</p>
 
@@ -202,6 +207,11 @@
 <div class="box interview">
 <div class="box-title">Pitfalls of prefix caching</div>
 <p>A cached block is reusable only by a prompt that matches it <em>exactly</em>, token for token, from the very first token, at the same positions (cached keys are already rotated by RoPE; §2.5). Prompt templates that put a timestamp, user name or random identifier at the start destroy reuse. Good practice puts stable content first and variable content last. In a multi-replica deployment, a request benefits only if it is routed to the replica that holds its prefix, so routers must be <em>prefix-aware</em> (Chapter 23). Requests that ask for prompt log-probabilities may bypass the cache, because the cached state does not include logits. And caches of different models, adapters (LoRA) or tokenisers must never be mixed, which hash keys must encode.</p>
+</div>
+
+<div class="box example">
+<div class="box-title">Worked example — what a cached system prompt is worth</div>
+<p>A service on Llama 3 8B receives 100 requests per second, each with a 1,500-token system prompt and 500 tokens of user input. Without prefix caching, prefill processes 2,000 tokens per request, \(2{,}000\times1.6\times10^{10}=3.2\times10^{13}\) FLOPs, about 54 ms of an H100 at 60% utilisation, so prefill alone occupies about 5.4 GPUs. With the system prompt cached, only 500 tokens are prefilled (attending to the cached 1,500), about 14 ms per request, about 1.4 GPUs: four GPUs saved, and TTFT cut by about 40 ms per request. The saving holds only if the cached prefix is byte-identical across requests, which is why a timestamp at the top of a system prompt is expensive (§10.6).</p>
 </div>
 
 <h2 id="s10-7">10.7 Beyond GPU memory: KV hierarchies</h2>

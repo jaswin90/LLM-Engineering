@@ -134,6 +134,12 @@ so the weighted sum is taken over latents, and \(W_{UV,i}\) is applied once per 
 <p><strong>Price.</strong> More arithmetic per cached byte, extra projection matrices, and a kernel that must be specially written. For decode-heavy serving this is an excellent trade.</p>
 </div>
 
+<details class="drill">
+<summary>Drill 8.2 — How small is MLA's cache?</summary>
+<p>DeepSeek-V3 has 61 layers and caches, per token and layer, a latent of \(d_c=512\) values plus a decoupled RoPE key of \(d_h^R=64\) values, in BF16. Compute its cache per token, and compare with standard multi-head attention for its 128 heads with 192-dimensional keys and 128-dimensional values.</p>
+<p><em>Solution.</em> MLA: \((512+64)\times2\) bytes = 1,152 bytes per layer, \(\times61\approx70{,}272\) bytes, 68.6 KiB per token. MHA with the same heads: \(128\times(192+128)\times2=81{,}920\) bytes per layer, about 5.0 MB per token over 61 layers, 71 times more. A 128k-token context would need 640 GB with MHA and 9 GB with MLA. Llama 3 8B's GQA cache, 128 KiB per token, is about twice MLA's despite a model eighty times smaller, the comparison promised in this chapter's opening.</p>
+</details>
+
 <h2 id="s8-4">8.4 Fewer tokens per layer: sliding windows and hybrids</h2>
 <p>A different route to a smaller cache is to let most layers attend only to <em>recent</em> tokens. In <strong>sliding-window attention</strong>, the query at position \(i\) attends only to keys at positions \(j\) with \(i-w&lt;j\le i\), for a window size \(w\). That is a banded causal mask, used for efficient long-document Transformers since Longformer (2020) and adopted for an LLM by Mistral 7B (2023) with \(w=4096\)<span class="cite"><a href="#r-mistral">[5]</a></span>. A sliding-window layer needs to cache only the last \(w\) tokens, so its cache stops growing once the sequence exceeds the window. It is typically stored as a ring buffer that overwrites the oldest entry. Information from further back can still reach the current token, but only indirectly, by being carried forward through the residual streams of intermediate positions across layers: with \(L\) layers, the theoretical receptive field is about \(Lw\).</p>
 

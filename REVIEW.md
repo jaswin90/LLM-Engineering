@@ -47,3 +47,15 @@ This file records weaknesses found in the drafts and what was done about them. E
 - **Honest framing of disaggregation (Ch 13).** Headline speed-ups from Splitwise and DistServe are reported with their baselines, and §13.6 proves the colocation bound so that readers see which assumptions disaggregation exploits.
 - **SVG fill classes (Ch 14).** `fill-s1` does not exist in `book.css` and rendered black; use `fill-acc` for the primary colour. Wide tables must sit inside `div.table-wrap` (a five-column table overflowed at 390 px).
 - **Structural check (Ch 16).** A scripted replacement of a theorem box matched the first `</div>` (the box title's) and left a stray closing tag, which pushed later figures outside the article column at desktop width. Added a desktop check that every `figure` stays inside `article`; long inline formulas moved to display maths so their hidden MathML does not widen the page.
+
+## Review 4 — component minimums in early chapters (2026-11-06)
+
+A count against CLAUDE.md §4 found early chapters below the per-chapter minimums: Chapters 4 and 5 had no drills, Chapters 2, 7 and 8 had one, and Chapters 7, 9 and 10 had no worked examples. Added:
+- Ch2: Drill 2.2 (parameter count of Llama 3 70B).
+- Ch4: Drill 4.1 (temperature and top-p by hand), Drill 4.2 (cost of grammar masks).
+- Ch5: Drill 5.1 (peak FLOP/s from SM count), Drill 5.2 (HBM bandwidth from bus width).
+- Ch7: worked examples on uncoalesced reads and launch overhead; Drill 7.2 (tile arithmetic intensity).
+- Ch8: Drill 8.2 (MLA cache vs MHA per token for DeepSeek-V3).
+- Ch9: worked examples on standard-attention HBM traffic and split-KV decoding.
+- Ch10: worked examples on max-length reservation waste and prefix-cache savings.
+Whole-book Playwright check re-run: no errors, 856 MCQs, 427 QAs. Still open: Chapters 6 and 11 have three SVG diagrams each.
