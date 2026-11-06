@@ -58,4 +58,4 @@ A count against CLAUDE.md §4 found early chapters below the per-chapter minimum
 - Ch8: Drill 8.2 (MLA cache vs MHA per token for DeepSeek-V3).
 - Ch9: worked examples on standard-attention HBM traffic and split-KV decoding.
 - Ch10: worked examples on max-length reservation waste and prefix-cache savings.
-Whole-book Playwright check re-run: no errors, 856 MCQs, 427 QAs. Still open: Chapters 6 and 11 have three SVG diagrams each.
+Whole-book Playwright check re-run: no errors, 856 MCQs, 427 QAs. Added Figure 6.8 (roofline floor to measured decode time) and Figure 11.7 (request lifecycle state machine), so every chapter now has at least four SVG diagrams.

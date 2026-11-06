@@ -295,6 +295,27 @@
 
 <p>Figure 6.6 shows the worst case, and it explains a puzzle that confuses many newcomers: making a matrix very slightly larger can make a kernel almost twice as slow. <strong>Launch and synchronisation latency.</strong> Every kernel launch costs a few microseconds of CPU time, and every synchronisation (between thread blocks, between the CPU and GPU, between GPUs) costs latency that no bandwidth or FLOP figure captures. At small batch, decode is often a sequence of hundreds of kernels lasting tens of microseconds each, and this latency adds up (§3.4). <strong>Clock and power throttling.</strong> Peak FLOP/s assumes the rated clock, but a GPU running dense tensor work at its power limit may lower its clock. Sustained throughput can sit 10–20% below the datasheet figure, so measure achieved clocks. <strong>Communication.</strong> In multi-GPU inference, collectives add their own roofline: bytes divided by link bandwidth, plus a per-message latency that dominates for the small messages of decode (Chapter 16). A tensor-parallel decode step can be limited by the <em>latency</em> of its 160 all-reduces rather than by any bandwidth.</p>
 
+<p>It helps to see these effects add up on a single number. Figure 6.8 decomposes the time of one batch-1 decode step of Llama 3 8B on an H100 into the roofline floor and the losses stacked on top of it. The floor is the weight read alone: 16.06 GB at 3.35 TB/s is 4.8 ms. A good implementation measures about 6.5 ms, an MBU of 74%. The figure is schematic, since the exact split depends on the engine and driver, but its proportions are typical. The largest single loss is that no real kernel streams HBM at the datasheet rate; roughly 90% is achievable, which costs half a millisecond before anything else goes wrong. Launch and synchronisation gaps come next, and they are exactly what CUDA graphs (Chapter 7) remove. Small unfused operators and wave tails account for the rest. Reading the figure from right to left is the profiling procedure of Figure 6.5: first remove idle time, then fuse, then tune tiles, and accept that the last 10% is the hardware's.</p>
+
+<figure class="diagram" id="fig-6-8">
+<svg class="dg" viewBox="0 0 720 200" role="img" aria-label="Schematic decomposition of a 6.5 ms decode step into a 4.8 ms roofline floor and four losses">
+<text x="20" y="22" class="t-b">One decode step, Llama 3 8B, batch 1, H100 (schematic)</text>
+<rect x="20" y="50" width="443" height="40" rx="3" class="fill-acc"/>
+<text x="241" y="75" text-anchor="middle" class="t-sm t-on">roofline floor: 16.06 GB / 3.35 TB/s = 4.8 ms</text>
+<rect x="463" y="50" width="46" height="40" class="fill-s2"/>
+<rect x="509" y="50" width="55" height="40" class="fill-s3"/>
+<rect x="564" y="50" width="28" height="40" class="fill-s4"/>
+<rect x="592" y="50" width="28" height="40" class="fill-s5"/>
+<line x1="486" y1="90" x2="486" y2="118" class="ln"/><text x="486" y="132" text-anchor="middle" class="t-xs">HBM at ~90%</text><text x="486" y="146" text-anchor="middle" class="t-xs">+0.5 ms</text>
+<line x1="536" y1="90" x2="536" y2="160" class="ln"/><text x="536" y="174" text-anchor="middle" class="t-xs">launch gaps +0.6 ms</text>
+<line x1="578" y1="90" x2="600" y2="118" class="ln"/><text x="612" y="132" text-anchor="start" class="t-xs">unfused ops +0.3</text>
+<line x1="606" y1="90" x2="640" y2="104" class="ln"/><text x="644" y="108" text-anchor="start" class="t-xs">waves +0.3</text>
+<line x1="20" y1="40" x2="620" y2="40" class="ln dash"/>
+<text x="620" y="34" text-anchor="end" class="t-xs">measured ≈ 6.5 ms (MBU 74%)</text>
+</svg>
+<figcaption><b>Figure 6.8 — From roofline floor to measured time.</b> Bar length is proportional to time. The roofline floor is exact; the four losses are a typical, schematic split for a well-engineered engine. Each loss has its own remedy: better copy kernels for bandwidth, CUDA graphs for launch gaps, fusion for small operators and tile choice for waves.</figcaption>
+</figure>
+
 <div class="box bridge">
 <div class="box-title">For the mathematician — the roofline as a bound, not a model</div>
 <p>The roofline is a lower bound on time, \(t\ge\max(F/\pi,Q/\beta)\), derived from two capacity constraints. It becomes a good <em>prediction</em> only when the implementation overlaps compute and data movement perfectly, keeps enough work in flight to hide latency (Little's law, §5.1), and incurs no other costs. Treat it like a lower bound in optimisation: it tells you how much improvement is possible, and which constraint is active, but not how to reach it.</p>

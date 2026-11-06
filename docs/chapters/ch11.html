@@ -225,6 +225,34 @@
 <p>Notice how much of the book this loop touches. The token budget implements chunked prefill (§11.6). <code>kv.can_append</code> and <code>free_or_swap</code> are PagedAttention and preemption (§10.3, §10.5). <code>match_prefix</code> is prefix caching (§10.6). <code>order_by_policy</code> is the policy of §11.7. The returned batch is executed as one ragged forward pass with selective batching (§11.4), paged attention kernels (§9.8) and, for the decode-only parts, CUDA graphs (§7.8). The watermark is the headroom that keeps preemption rare.</p>
 
 
+<p>The loop is easier to reason about as a state machine on individual requests, which is what Figure 11.7 draws. A request enters <em>waiting</em>. Admission moves it to <em>running</em> only if the token budget has room and the KV allocator can give it blocks with a safety margin (the watermark). While running, it first consumes its prompt in chunks and then decodes one token per step. Two arrows leave the running state. The normal one goes to <em>finished</em>, which returns its blocks to the allocator (or leaves them in the prefix cache). The other goes to <em>preempted</em> when a running request cannot append a token because memory is exhausted; the victim's blocks are freed (recompute) or copied to host memory (swap), and it re-enters the <em>front</em> of the waiting queue so that it is not starved. Every scheduler policy of §11.7 is a choice about which arrow to take and in which order to examine the waiting queue; the state machine itself does not change.</p>
+
+<figure class="diagram" id="fig-11-7">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="Request lifecycle: waiting, running with prefill and decode, finished, and preempted back to waiting">
+<text x="20" y="22" class="t-b">The life of a request inside a continuous-batching scheduler</text>
+<rect x="20" y="80" width="130" height="56" rx="8" class="bx"/>
+<text x="85" y="104" text-anchor="middle" class="t-sm t-b">waiting</text><text x="85" y="122" text-anchor="middle" class="t-xs">queue, policy order</text>
+<rect x="240" y="64" width="230" height="88" rx="8" class="bx3"/>
+<text x="355" y="84" text-anchor="middle" class="t-sm t-b">running</text>
+<rect x="256" y="96" width="92" height="40" rx="5" class="bx2"/><text x="302" y="114" text-anchor="middle" class="t-xs">prefill</text><text x="302" y="128" text-anchor="middle" class="t-xs">in chunks</text>
+<rect x="364" y="96" width="92" height="40" rx="5" class="bx2"/><text x="410" y="114" text-anchor="middle" class="t-xs">decode</text><text x="410" y="128" text-anchor="middle" class="t-xs">1 token / step</text>
+<line x1="348" y1="116" x2="364" y2="116" class="ln"/>
+<rect x="560" y="80" width="140" height="56" rx="8" class="bx4"/>
+<text x="630" y="104" text-anchor="middle" class="t-sm t-b">finished</text><text x="630" y="122" text-anchor="middle" class="t-xs">blocks freed / cached</text>
+<rect x="240" y="180" width="230" height="44" rx="8" class="bx5"/>
+<text x="355" y="198" text-anchor="middle" class="t-sm t-b">preempted</text><text x="355" y="214" text-anchor="middle" class="t-xs">blocks freed (recompute) or swapped</text>
+<line x1="150" y1="108" x2="240" y2="108" class="ln-acc"/>
+<text x="195" y="152" text-anchor="middle" class="t-xs">admit if budget</text><text x="195" y="165" text-anchor="middle" class="t-xs">and KV fit</text><text x="195" y="178" text-anchor="middle" class="t-xs">(watermark)</text>
+<line x1="470" y1="108" x2="560" y2="108" class="ln-acc"/>
+<text x="515" y="98" text-anchor="middle" class="t-xs">EOS / max len</text>
+<line x1="355" y1="152" x2="355" y2="180" class="ln dash"/>
+<text x="362" y="170" text-anchor="start" class="t-xs">out of KV blocks</text>
+<path d="M240 202 L85 202 L85 136" class="ln dash" fill="none"/>
+<text x="160" y="196" text-anchor="middle" class="t-xs">re-queue at front</text>
+</svg>
+<figcaption><b>Figure 11.7 — Request lifecycle.</b> Solid arrows are the normal path; dashed arrows are preemption, taken only when the KV cache is exhausted. Policies (§11.7) decide which waiting request to admit and which running request to preempt; the states themselves are common to vLLM, SGLang and TensorRT-LLM.</figcaption>
+</figure>
+
 <h2 id="s11-10">11.10 From scheduler to capacity plan</h2>
 <p>A scheduler determines how well one replica uses its GPU. An operator must also decide <em>how many</em> replicas to run for a given traffic level, and that decision combines this chapter's queueing view with the operating-point analysis of §6.6. The most common mistake is to size a deployment so that every GPU runs at its maximum sustainable throughput. Queueing theory explains why that fails.</p>
 <p>Think of each replica as a server with a maximum sustainable rate of requests within its TPOT target, \(\lambda_{\max}\), found as in §6.6 from the operating point and the mean request size. For the chat workload of §3.8 on one H100, that was roughly 10 requests per second. If requests arrive at random, as a Poisson process is a good first model for many independent users, then the replica's utilisation is \(\rho=\lambda/\lambda_{\max}\), and the time requests spend <em>waiting</em> to be admitted grows as \(\rho/(1-\rho)\) times the typical service time. That holds for exponential job sizes, and more with heavier tails, by the Pollaczek–Khinchine formula of §11.7. Since waiting time adds directly to TTFT, a TTFT target translates into a utilisation ceiling.</p>
