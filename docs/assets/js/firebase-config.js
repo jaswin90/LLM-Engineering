@@ -1,12 +1,12 @@
-// Firebase web configuration for accounts + progress sync.
-// These values are NOT secrets (they identify the Firebase project; access is
-// controlled by Firestore security rules — see SETUP.md). Leave apiKey empty to
-// run the book in "local progress only" mode.
+// Firebase web configuration. Intentionally empty in this repository: the book is published by
+// jaswin90/jaswin90.github.io at /library/<Field>/<Book>/, and that build writes the real config
+// (from its FIREBASE_CONFIG repository secret) into this file. With an empty apiKey the book still
+// works, with progress saved in the browser only.
 export const firebaseConfig = {
-  apiKey: "AIzaSyBZCOd2GuT1F_Zpou8-l2g4usxSEUwv4m8",
-  authDomain: "jaswin-s-library.firebaseapp.com",
-  projectId: "jaswin-s-library",
-  storageBucket: "jaswin-s-library.firebasestorage.app",
-  messagingSenderId: "240981043036",
-  appId: "1:240981043036:web:56b0fcb737fac9d90ac399"
+  apiKey: "",
+  authDomain: "",
+  projectId: "",
+  storageBucket: "",
+  messagingSenderId: "",
+  appId: ""
 };
