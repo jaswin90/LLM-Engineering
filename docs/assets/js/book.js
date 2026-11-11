@@ -61,7 +61,7 @@
     { id: 'ci14', n: 14, part: 'IV', title: 'Security, Isolation and Multi-Tenancy', sub: 'Threat models, confidential computing, cache side channels, weight protection, supply chain', file: 'cloud/ci14.html', ready: true },
     { id: 'ci15', n: 15, part: 'V', title: 'Serving Multimodal Models', sub: 'Vision encoders, image tokens, encoder caching, speech and real-time audio, video', file: 'cloud/ci15.html', ready: true },
     { id: 'ci16', n: 16, part: 'V', title: 'Embeddings, Retrieval and Vector Search at Scale', sub: 'Embedding serving, HNSW, IVF-PQ, sharded indexes, RAG latency budgets', file: 'cloud/ci16.html', ready: true },
-    { id: 'ci17', n: 17, part: 'V', title: 'Agents and Compound AI Systems', sub: 'Tool calls, MCP, code sandboxes, session state, program-aware scheduling', file: 'cloud/ci17.html', ready: false },
+    { id: 'ci17', n: 17, part: 'V', title: 'Agents and Compound AI Systems', sub: 'Tool calls, MCP, code sandboxes, session state, program-aware scheduling', file: 'cloud/ci17.html', ready: true },
     { id: 'ci18', n: 18, part: 'V', title: 'Guardrails and Moderation Infrastructure', sub: 'Safety classifiers, streaming moderation, guard-model placement, audit', file: 'cloud/ci18.html', ready: false },
     { id: 'ci19', n: 19, part: 'V', title: 'Batch, Offline and Rollout Inference', sub: 'Batch APIs, throughput-optimal pipelines, spot-tolerant jobs, RL rollouts', file: 'cloud/ci19.html', ready: false },
     { id: 'ci20', n: 20, part: 'VI', title: 'The Cloud Infrastructure Design Interview', sub: 'Worked case studies, estimation drills and rubrics', file: 'cloud/ci20.html', ready: false }

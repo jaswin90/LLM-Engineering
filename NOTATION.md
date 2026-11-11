@@ -338,3 +338,11 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(n_{\text{vec}}\), \(k_{\text{nn}}\) | vectors in an index; neighbours returned |
 | \(n_{\text{list}}\), \(n_{\text{probe}}\), \(n_{\text{sub}}\) | IVF lists; lists probed per query; PQ sub-spaces (bytes per code) |
 | \(M_{\text{hnsw}}\), \(ef_{\text{s}}\) | HNSW neighbours per vertex; search beam width |
+
+## Agents (Vol. II Ch. 17)
+| Symbol | Meaning |
+|---|---|
+| \(n_0\), \(n_{\Delta}\) | initial context tokens of an agent task; tokens added per step (output plus tool result) |
+| \(n_{\text{step}}\), \(p_{\text{step}}\) | steps in an agent task; probability one step succeeds |
+| \(m_{\text{kv}}\), \(t_{\text{tool}}\) | bytes of one sequence's KV cache; expected tool duration |
+| \(\varpi_{\text{hbm}}\), \(\varpi_{\text{host}}\) | cost of holding one byte in HBM / host memory for one second |

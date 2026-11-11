@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 17 · Agents and Compound AI Systems — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 17 of Cloud AI Infrastructure: agents as programs of model calls; the quadratic growth of context and how prefix caching linearises it; tool calling and the Model Context Protocol; sandboxes for model-generated code (containers, gVisor, Firecracker microVMs); keeping, offloading or recomputing KV cache across tool calls; program-aware scheduling; the latency and cost of agent loops; and the reliability of multi-step workflows.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci17" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part V · Beyond Chat — Chapter 17</div>
+<h1 id="top">Agents and Compound AI Systems</h1>
+<p class="lede">An agent does not answer a request with one model call. It plans, calls tools—search, code execution, databases, other services—reads their results and calls the model again, often dozens of times, holding a growing context and session state throughout. The unit of work becomes a program, untrusted code must be executed somewhere safe, and the latency, cost and reliability of a task are products of many steps. This chapter develops the infrastructure for agents: context growth and caching, tool protocols, sandboxes, session state across tool calls, program-aware scheduling, and the economics and reliability of long workflows.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>By 2025, a large and growing share of LLM tokens was consumed not by people chatting but by programs calling models in loops: coding agents that read a repository, edit files and run tests; research agents that search and read dozens of pages; customer-service agents that query order systems and issue refunds; computer-use agents that operate a browser. Each user request to such a system can trigger tens to hundreds of model calls and tool invocations, run for minutes, and consume hundreds of thousands of tokens. The engineering of Volume I—batching, caching, scheduling—was designed around independent requests. Agents violate that independence: the calls of one task are sequential and share a growing prefix; between calls the model waits for tools whose latency it does not control; and the task's value lies in its final result, not in the latency of any single call.</p>
+<p>The infrastructure consequences are distinctive, and interviews for AI-platform roles ask about them: "why does an agent's cost grow quadratically with its steps, and how do you fix it?", "how would you run model-generated code safely for a million users?", "what should the engine do with a sequence's KV cache while a tool runs for thirty seconds?", "how would you schedule requests from agents differently from chat?", "a 40-step workflow fails 30% of the time—why, and what do you do?". This chapter answers them.</p>
+<p>We begin by treating an agent as a program and quantifying its context growth (§17.1), then describe tool interfaces including the Model Context Protocol (§17.2) and sandboxes for code execution (§17.3). We analyse what to do with KV state while tools run (§17.4), how schedulers should treat programs (§17.5), what agent loops cost (§17.6), and how to make multi-step workflows reliable (§17.7), closing with agent platforms as infrastructure (§17.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Model an agent task as a sequence of model calls and tool calls, and compute how its prefill tokens grow with and without prefix caching.</li>
+<li>Explain tool calling, structured outputs and the Model Context Protocol, and the infrastructure tool servers need.</li>
+<li>Compare containers, gVisor and Firecracker microVMs for executing model-generated code, and size a sandbox fleet.</li>
+<li>Decide whether to keep, offload or recompute a sequence's KV cache while it waits for a tool, from the costs involved.</li>
+<li>Explain why per-request schedulers mistreat agent programs and how program-aware scheduling (Parrot, Autellix) helps.</li>
+<li>Estimate the cost and latency of an agent loop and design for reliability across many steps.</li>
+</ol>
+<p class="small muted">Uses: prefix caching (Vol. I Chapter 10), scheduling (Vol. I Chapter 11), structured output (Vol. I §4.6), isolation and prompt injection (Chapter 14), streaming (Chapter 11), reliability (Chapter 13).</p>
+</div>
+
+<h2 id="s17-1">17.1 From a request to a program</h2>
+<p>The basic agent loop, popularised by the ReAct pattern of Yao and colleagues (2022)<span class="cite"><a href="#r-react">[1]</a></span>, alternates reasoning and acting: the model receives a task and a list of available tools; it produces either a final answer or a <em>tool call</em> (a structured request such as "search for X" or "run this code"); the system executes the tool and appends its result to the context; and the model is called again with the extended context. Figure 17.1 shows the loop and the components around it.</p>
+
+<figure class="diagram" id="fig-17-1">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="An agent loop and its infrastructure">
+<defs><marker id="a171" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="105" width="110" height="64" rx="8" class="bx"/><text x="70" y="128" text-anchor="middle" class="t-xs t-b">user task</text><text x="70" y="144" text-anchor="middle" class="t-xs">"fix the failing</text><text x="70" y="156" text-anchor="middle" class="t-xs">test in repo X"</text>
+<rect x="160" y="95" width="150" height="84" rx="10" class="bx4"/><text x="235" y="118" text-anchor="middle" class="t-xs t-b">orchestrator</text><text x="235" y="134" text-anchor="middle" class="t-xs">loop, budgets, state,</text><text x="235" y="148" text-anchor="middle" class="t-xs">checkpoints, policy</text><text x="235" y="162" text-anchor="middle" class="t-xs">(durable)</text>
+<rect x="355" y="30" width="150" height="70" rx="10" class="bx2"/><text x="430" y="54" text-anchor="middle" class="t-xs t-b">LLM serving</text><text x="430" y="70" text-anchor="middle" class="t-xs">context grows each step;</text><text x="430" y="84" text-anchor="middle" class="t-xs">prefix cache, KV policy</text>
+<rect x="355" y="175" width="150" height="70" rx="10" class="bx3"/><text x="430" y="199" text-anchor="middle" class="t-xs t-b">tools</text><text x="430" y="215" text-anchor="middle" class="t-xs">search, APIs, DBs (MCP),</text><text x="430" y="229" text-anchor="middle" class="t-xs">code sandbox, browser</text>
+<rect x="550" y="100" width="155" height="74" rx="10" class="bx5"/><text x="627" y="122" text-anchor="middle" class="t-xs t-b">observability</text><text x="627" y="138" text-anchor="middle" class="t-xs">trace of every step,</text><text x="627" y="152" text-anchor="middle" class="t-xs">tokens, cost, audit</text>
+<line x1="125" y1="137" x2="158" y2="137" class="ln" marker-end="url(#a171)"/>
+<path d="M310,115 C330,90 340,70 353,65" class="ln" fill="none" marker-end="url(#a171)"/>
+<text x="300" y="80" class="t-xs">context</text>
+<path d="M430,100 C430,140 430,150 430,173" class="ln ln-acc" fill="none" marker-end="url(#a171)"/>
+<text x="438" y="142" class="t-xs t-acc">tool call</text>
+<path d="M355,210 C330,200 320,185 312,170" class="ln ln-s3" fill="none" marker-end="url(#a171)"/>
+<text x="250" y="215" class="t-xs t-s3">tool result</text>
+<line x1="505" y1="137" x2="548" y2="137" class="ln" stroke-dasharray="4 3"/>
+<text x="360" y="268" text-anchor="middle" class="t-xs">Repeat until the model returns a final answer, a budget is exhausted, or a human must approve an action.</text>
+</svg>
+<figcaption><b>Figure 17.1 — An agent loop.</b> An orchestrator alternates model calls and tool executions, appending each result to the context, under budgets and policies; every step is traced. The model's context grows with every tool result.</figcaption>
+</figure>
+
+<p>The loop has a cost structure that surprises people the first time they see it. Suppose a task starts with a context of \(n_0\) tokens (system prompt, tool descriptions, task), and each step adds \(n_{\Delta}\) tokens (the model's output plus the tool's result). At step \(i\) the context is \(n_0+(i-1)n_{\Delta}\) tokens. If every model call re-processes its whole context, the total prefill work over \(n_{\text{step}}\) steps is</p>
+\[
+\sum_{i=1}^{n_{\text{step}}}\bigl(n_0+(i-1)n_{\Delta}\bigr)=n_{\text{step}}n_0+\tfrac12n_{\text{step}}(n_{\text{step}}-1)n_{\Delta},
+\]
+<p>which grows <em>quadratically</em> in the number of steps. With prefix caching (Vol. I Chapter 10), each call re-uses the cached KV of everything before it and prefills only the new \(n_{\Delta}\) tokens, so the total becomes \(n_0+(n_{\text{step}}-1)n_{\Delta}\), <em>linear</em> in the number of steps. Figure 17.2 shows the difference for a typical coding agent.</p>
+
+<figure class="chart" id="fig-17-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Cumulative prefill tokens of an agent task (n₀ = 4,000; each step adds 1,500 tokens)","height":330,
+ "x":{"label":"Steps in the task","min":0,"max":62,"ticks":[1,10,20,30,40,50,60]},
+ "y":{"label":"Prefill tokens processed (log)","log":true,"min":3000,"max":4000000,"ticks":[10000,30000,100000,300000,1000000,3000000]},
+ "series":[
+  {"name":"No prefix caching (re-prefill whole context each step)","color":"s2","points":[[1,4000],[5,35000],[10,107500],[20,365000],[40,1330000],[60,2895000]]},
+  {"name":"Prefix caching (prefill only new tokens)","color":"s3","points":[[1,4000],[5,10000],[10,17500],[20,32500],[40,62500],[60,92500]]}
+ ]}
+</script>
+<figcaption><b>Figure 17.2 — Caching turns quadratic agent cost into linear cost.</b> At 40 steps, an agent without prefix caching prefills 1.3 million tokens; with caching, 62,500—twenty times fewer. The gap widens with every step.</figcaption>
+</figure>
+
+<p>Figure 17.2 is the single most important fact about serving agents. An agent framework or serving stack that loses the prefix cache between steps—because consecutive calls land on different replicas, because the context is rebuilt with a timestamp or reordered tools at the top, or because the KV was evicted while a tool ran—pays the red curve instead of the green one, an order of magnitude more compute for long tasks. Keeping each task's calls on the same replica (session affinity, Vol. I §27.2), keeping its context append-only, and keeping its KV available across tool calls (§17.4) are therefore the first rules of agent serving. Token-priced APIs reflect the same fact: providers that offer cached-input discounts (§10.4) make long agent tasks affordable only if the agent's context is structured to hit the cache.</p>
+
+<h2 id="s17-2">17.2 Tool calling and the Model Context Protocol</h2>
+<p>A tool call is a piece of structured output: the model emits, instead of free text, an object naming a tool and its arguments in a schema the application declared—typically JSON Schema. Models are trained to produce such calls, and engines enforce them with the grammar-constrained decoding of Vol. I §4.6, which guarantees syntactically valid output. Modern APIs let models emit several tool calls in one turn, which the orchestrator can run in parallel, cutting wall-clock time when the calls are independent (searching several sources at once, reading several files).</p>
+<p>Every application used to wire its own tools to its own model integration, an \(N\times M\) problem between models and tools. The <strong>Model Context Protocol</strong> (MCP), published by Anthropic in November 2024 and adopted widely across the industry in 2025, standardised the interface: an MCP <em>server</em> exposes tools (callable functions), resources (readable data) and prompts to any MCP <em>client</em> (an agent application), over a JSON-RPC protocol carried on local standard input/output or on HTTP with streaming. A company can then expose its ticketing system, its code repository or its database once, as an MCP server, to every agent that needs it.</p>
+<p>For infrastructure, a protocol for tools turns tools into services with the usual service requirements, plus some new ones. Tool servers need <strong>authentication and authorisation</strong> that act on behalf of the end user, not the agent—an agent reading a user's email must have that user's permissions and no more, which typically means delegated tokens (OAuth) scoped per tool and per user. They need <strong>rate limits</strong> and <strong>timeouts</strong>, because agents call tools in loops and a misbehaving agent can hammer a backend. They need <strong>latency</strong> budgets, because tool time adds directly to task time (§17.6). And they need <strong>audit</strong>, because a tool call is an action taken on a user's behalf, and the security principles of §14.7—least privilege, confirmation for side effects, egress control—must be enforced at the tool boundary, not inside the model.</p>
+
+<h2 id="s17-3">17.3 Sandboxes for model-generated code</h2>
+<p>Many of the most capable agents write and run code: to analyse data, test a fix, transform files or drive a browser. That code is untrusted in the strongest sense. It was produced by a model whose context may contain injected instructions (§14.7), it may be buggy enough to consume unbounded resources, and it runs on infrastructure shared with other users. It must therefore execute in a <strong>sandbox</strong>: an environment that limits what it can see and do, from which escape is hard, and whose resources are capped. Figure 17.3 compares the main isolation technologies.</p>
+
+<figure class="diagram" id="fig-17-3">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Isolation technologies for running untrusted code">
+<rect x="10" y="20" width="225" height="235" rx="10" class="bx"/>
+<text x="122" y="42" text-anchor="middle" class="t-sm t-b">Container</text>
+<rect x="30" y="56" width="185" height="34" rx="6" class="bx4"/><text x="122" y="77" text-anchor="middle" class="t-xs">untrusted code</text>
+<rect x="30" y="96" width="185" height="34" rx="6" class="bx2"/><text x="122" y="117" text-anchor="middle" class="t-xs">namespaces + cgroups + seccomp</text>
+<rect x="30" y="136" width="185" height="34" rx="6" class="bx3"/><text x="122" y="157" text-anchor="middle" class="t-xs">shared host kernel</text>
+<text x="122" y="192" text-anchor="middle" class="t-xs">start ≈ ms; overhead ≈ 0</text>
+<text x="122" y="208" text-anchor="middle" class="t-xs">boundary = kernel syscall surface</text>
+<text x="122" y="224" text-anchor="middle" class="t-xs t-s2">weakest for hostile code</text>
+<rect x="248" y="20" width="225" height="235" rx="10" class="bx"/>
+<text x="360" y="42" text-anchor="middle" class="t-sm t-b">gVisor</text>
+<rect x="268" y="56" width="185" height="34" rx="6" class="bx4"/><text x="360" y="77" text-anchor="middle" class="t-xs">untrusted code</text>
+<rect x="268" y="96" width="185" height="34" rx="6" class="bx2"/><text x="360" y="117" text-anchor="middle" class="t-xs">user-space kernel (Sentry)</text>
+<rect x="268" y="136" width="185" height="34" rx="6" class="bx3"/><text x="360" y="157" text-anchor="middle" class="t-xs">narrow syscalls to host kernel</text>
+<text x="360" y="192" text-anchor="middle" class="t-xs">start ≈ 100 ms; syscall overhead</text>
+<text x="360" y="208" text-anchor="middle" class="t-xs">boundary = small re-implemented</text>
+<text x="360" y="224" text-anchor="middle" class="t-xs">kernel interface</text>
+<rect x="486" y="20" width="225" height="235" rx="10" class="bx"/>
+<text x="598" y="42" text-anchor="middle" class="t-sm t-b">Firecracker microVM</text>
+<rect x="506" y="56" width="185" height="34" rx="6" class="bx4"/><text x="598" y="77" text-anchor="middle" class="t-xs">untrusted code + guest kernel</text>
+<rect x="506" y="96" width="185" height="34" rx="6" class="bx2"/><text x="598" y="117" text-anchor="middle" class="t-xs">minimal virtual machine monitor</text>
+<rect x="506" y="136" width="185" height="34" rx="6" class="bx3"/><text x="598" y="157" text-anchor="middle" class="t-xs">KVM hardware virtualisation</text>
+<text x="598" y="192" text-anchor="middle" class="t-xs">boot ≈ 125 ms; ≈ 5 MiB overhead;</text>
+<text x="598" y="208" text-anchor="middle" class="t-xs">snapshots restore faster</text>
+<text x="598" y="224" text-anchor="middle" class="t-xs t-s3">hardware-enforced boundary</text>
+</svg>
+<figcaption><b>Figure 17.3 — Three ways to run code you do not trust.</b> Containers share the host kernel; gVisor interposes a user-space kernel that implements most system calls itself; Firecracker runs each workload in a minimal virtual machine with its own kernel. Isolation strength rises from left to right, with modest costs.</figcaption>
+</figure>
+
+<p>Figure 17.3's left column, the ordinary container of Chapter 6, shares the host's kernel, so a single kernel vulnerability can let hostile code escape; it is adequate for trusted code and not for code an adversary may have influenced. <strong>gVisor</strong>, open-sourced by Google in 2018, runs a user-space kernel (the Sentry) that intercepts the sandboxed program's system calls and implements them itself, passing only a narrow, audited set to the host kernel; it shrinks the attack surface at the cost of some system-call overhead. <strong>Firecracker</strong>, open-sourced by AWS in 2018 and described by Agache and colleagues in 2020, is a minimal virtual machine monitor built on KVM that boots a stripped-down guest kernel in about 125 ms with about 5 MiB of memory overhead, so that each untrusted workload gets a hardware-virtualised boundary at almost container cost<span class="cite"><a href="#r-firecracker">[2]</a></span>; it was built for AWS Lambda and is used by several code-execution services for agents. Snapshot-and-restore of initialised microVMs (the idea of §5.7) brings start times down further.</p>
+<p>Isolation of the kernel is only the beginning of a sandbox policy. A code sandbox for agents also needs <strong>resource limits</strong> (CPU, memory, disk, number of processes, wall-clock time) so that runaway code cannot exhaust a host; <strong>network policy</strong>, usually no egress by default or an allow-list of package mirrors and approved APIs, because exfiltration through the network is the main way an injected instruction can do harm (§14.7); <strong>filesystem scoping</strong>, so the sandbox sees only the files of its task; <strong>no credentials</strong> inside the sandbox beyond what the task strictly needs; and <strong>lifecycle management</strong>, creating sandboxes per task or per session, keeping them alive for follow-up steps, and destroying them reliably afterwards.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — sizing a sandbox fleet</div>
+<p><strong>Demand.</strong> A coding assistant runs 50,000 concurrent agent sessions at peak. Each session keeps a sandbox alive for its duration (mean 12 minutes) and uses it actively about 20% of the time; each sandbox is allocated 2 vCPUs and 4 GiB of memory, with a 10 GiB scratch disk.</p>
+<p><strong>Concurrency.</strong> By Little's law the number of live sandboxes equals the number of sessions: 50,000. Their allocations total 100,000 vCPUs and 200 TiB of memory if reserved in full.</p>
+<p><strong>Overcommitment.</strong> Because sandboxes are busy only 20% of the time and their CPU use is bursty and largely uncorrelated (§2.4's argument applies), CPU can be overcommitted perhaps four-fold: about 25,000 physical vCPUs, roughly 130 servers of 192 vCPUs. Memory is harder to overcommit safely; with idle sandboxes snapshotted to disk after a minute of inactivity and restored on demand, resident memory might fall to about a third.</p>
+<p><strong>Start time.</strong> At 50,000 sessions with 12-minute lifetimes, sandboxes are created at about 70 per second at peak; with microVM snapshots restoring in tens of milliseconds, creation is not a bottleneck, but image and dependency caching (§5.6) is essential, because a task that waits a minute for <code>pip install</code> at every step wastes the user's time and the model's KV memory.</p>
+<p><strong>Lesson.</strong> The sandbox fleet is a CPU-and-memory fleet of a size comparable to the GPU fleet's host CPUs, with its own scheduling, overcommitment and security policies.</p>
+</div>
+
+<h2 id="s17-4">17.4 Session state: what to do with the KV cache while a tool runs</h2>
+<p>Between two model calls of an agent, a tool runs: a search returns in a second, a test suite in thirty seconds, a human approval in minutes. During that time, the sequence's KV cache—possibly tens of gigabytes for a long context on a large model—is idle. The engine has three choices. It can <strong>hold</strong> the KV in HBM, so the next call starts instantly, at the cost of memory that could serve other sequences. It can <strong>offload</strong> the KV to host memory or SSD (Vol. I §10.7) and reload it when the tool returns, at the cost of transfer time and bandwidth. Or it can <strong>discard</strong> it and recompute the prefill when the call resumes, at the cost of prefill compute and latency. Abhyankar and colleagues studied this problem for "augmented" LLM requests in 2024 and showed that choosing per request among these options, rather than always discarding, improved throughput substantially<span class="cite"><a href="#r-infercept">[3]</a></span>.</p>
+<p>The choice can be made from costs. Let the KV occupy \(m_{\text{kv}}\) bytes, holding a byte of HBM cost \(\varpi_{\text{hbm}}\) per second (the replica's price divided by its KV capacity), and the tool's expected duration be \(t_{\text{tool}}\). Holding costs \(\varpi_{\text{hbm}}m_{\text{kv}}t_{\text{tool}}\). Recomputing costs the prefill of the context, \(c_{\text{in}}\) per token times the context length (§10.4), plus extra latency. Offloading costs a much smaller rate \(\varpi_{\text{host}}m_{\text{kv}}t_{\text{tool}}\) for host memory, plus the transfer. Figure 17.4 compares them for a 30,000-token context on Llama 3 70B.</p>
+
+<figure class="chart" id="fig-17-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Cost of handling a 30k-token context's KV (Llama 3 70B, FP8 KV ≈ 4.9 GB) while a tool runs","height":330,
+ "x":{"label":"Tool duration (seconds, log)","log":true,"min":1,"max":1000,"ticks":[1,3,10,30,100,300,1000]},
+ "y":{"label":"Dollars per pause (log)","log":true,"min":0.00004,"max":0.08,"ticks":[0.0001,0.001,0.01]},
+ "series":[
+  {"name":"Hold in HBM","color":"s2","points":[[1,0.000056],[10,0.00056],[30,0.00168],[100,0.0056],[300,0.0168],[1000,0.056]]},
+  {"name":"Discard and recompute prefill","color":"s4","points":[[1,0.0075],[1000,0.0075]],"markers":false},
+  {"name":"Offload to host memory and reload","color":"s3","points":[[1,0.000306],[10,0.000356],[30,0.000468],[100,0.00086],[300,0.00198],[1000,0.0059]]}
+ ],
+ "vlines":[{"x":134,"text":"hold = recompute at ≈ 134 s"}]}
+</script>
+<figcaption><b>Figure 17.4 — Hold briefly, offload for longer, recompute only for very long pauses.</b> Holding costs grow with the pause at the HBM rate; recomputing costs a fixed prefill (here about $0.0075 for 30k tokens) plus latency; offloading costs a small host-memory rate plus a reload. Assumes a $20/h replica with 489 GB of KV capacity and host memory ten times cheaper per byte.</figcaption>
+</figure>
+
+<p>Figure 17.4's three regimes are general. For short tool calls (a few seconds), holding is cheapest and gives the lowest latency. For calls of tens of seconds to minutes, offloading to host memory wins: the KV of a 30,000-token context reloads in about 0.2 s over PCIe, much faster than re-prefilling it, and host memory is cheap. For very long pauses—a human approval that may take hours—even host memory is not free, and discarding the KV and recomputing it later (with the conversation kept durably as text, §17.7) is simplest. An engine or platform that knows the expected tool duration—from the tool's type and history—can choose automatically, and the orchestrator can help by telling the engine that a call will resume after a tool, rather than letting it treat the request as finished.</p>
+
+<details class="drill">
+<summary>Drill 17.1 — When to recompute</summary>
+<p>Using Figure 17.4's assumptions (HBM KV cost \(5.6\times10^{-5}\) dollars per second for this 4.9 GB context, prefill cost $0.25 per million tokens), at what tool duration does holding the KV in HBM cost the same as recomputing 30,000 tokens? What does the answer become for a 120,000-token context, and why?</p>
+<p><em>Solution.</em> Recompute: \(30{,}000\times0.25\times10^{-6}=\$0.0075\). Break-even: \(0.0075/5.6\times10^{-5}\approx134\) s. For 120,000 tokens, the KV is four times larger, so the holding cost rate is four times higher, but the recompute cost is also four times higher (in this linear model), so the break-even is the same 134 s. In reality the recompute cost grows faster than linearly for long contexts (attention is quadratic in prefill, Vol. I §3.8), so long contexts favour holding or offloading for longer; and recompute adds latency that grows with length, which the user feels directly.</p>
+</details>
+
+<h2 id="s17-5">17.5 Scheduling programs, not requests</h2>
+<p>The schedulers of Vol. I Chapter 11 treat each request independently: first come, first served, or with priorities and fairness across tenants. For agent traffic this is the wrong unit. An agent's value is the completion time of the whole program, which is the sum of its model calls' latencies plus its tool times, and a scheduler that ignores the program structure makes systematically poor choices. A long-running program's twentieth call waits behind a burst of short chat requests, although delaying it delays a task that has already consumed a great deal of service; or, under first-come-first-served, one very long program's calls repeatedly block many short programs, inflating their completion times, the classic convoy effect.</p>
+<p>Program-aware schedulers address this by giving the engine knowledge of programs. Parrot (2024) introduced <em>semantic variables</em> that let applications expose the data dependencies between LLM calls, so the system can schedule a program's calls together, batch calls that share prefixes, and optimise end-to-end latency rather than per-request latency<span class="cite"><a href="#r-parrot">[4]</a></span>. Autellix (2025) treats each agent program as a unit and schedules its calls by the program's cumulative service so far, a form of the <em>least-attained-service</em> policy from queueing theory, which, when program lengths are heavy-tailed and unknown in advance, favours programs that have consumed little service and lets short programs finish quickly without starving long ones; it reported large reductions in program completion time over per-request scheduling<span class="cite"><a href="#r-autellix">[5]</a></span>. Figure 17.5 illustrates the difference.</p>
+
+<figure class="diagram" id="fig-17-5">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Per-request versus program-aware scheduling of agent calls">
+<text x="20" y="24" class="t-sm t-b">Per-request FCFS: a long program's calls interleave with and delay short programs</text>
+<g>
+<rect x="20" y="36" width="60" height="26" rx="3" class="bx2"/><text x="50" y="53" text-anchor="middle" class="t-xs">A1</text>
+<rect x="80" y="36" width="40" height="26" rx="3" class="bx3"/><text x="100" y="53" text-anchor="middle" class="t-xs">B1</text>
+<rect x="120" y="36" width="60" height="26" rx="3" class="bx2"/><text x="150" y="53" text-anchor="middle" class="t-xs">A2</text>
+<rect x="180" y="36" width="40" height="26" rx="3" class="bx4"/><text x="200" y="53" text-anchor="middle" class="t-xs">C1</text>
+<rect x="220" y="36" width="60" height="26" rx="3" class="bx2"/><text x="250" y="53" text-anchor="middle" class="t-xs">A3</text>
+<rect x="280" y="36" width="40" height="26" rx="3" class="bx3"/><text x="300" y="53" text-anchor="middle" class="t-xs">B2 ✓</text>
+<rect x="320" y="36" width="60" height="26" rx="3" class="bx2"/><text x="350" y="53" text-anchor="middle" class="t-xs">A4</text>
+<rect x="380" y="36" width="40" height="26" rx="3" class="bx4"/><text x="400" y="53" text-anchor="middle" class="t-xs">C2 ✓</text>
+<rect x="420" y="36" width="60" height="26" rx="3" class="bx2"/><text x="450" y="53" text-anchor="middle" class="t-xs">A5 …</text>
+</g>
+<text x="20" y="84" class="t-xs">Short programs B and C finish late because each of their calls queues behind long program A's calls.</text>
+<text x="20" y="124" class="t-sm t-b">Program-aware (least attained service): programs that have used little service go first</text>
+<g>
+<rect x="20" y="136" width="40" height="26" rx="3" class="bx3"/><text x="40" y="153" text-anchor="middle" class="t-xs">B1</text>
+<rect x="60" y="136" width="40" height="26" rx="3" class="bx4"/><text x="80" y="153" text-anchor="middle" class="t-xs">C1</text>
+<rect x="100" y="136" width="60" height="26" rx="3" class="bx2"/><text x="130" y="153" text-anchor="middle" class="t-xs">A1</text>
+<rect x="160" y="136" width="40" height="26" rx="3" class="bx3"/><text x="180" y="153" text-anchor="middle" class="t-xs">B2 ✓</text>
+<rect x="200" y="136" width="40" height="26" rx="3" class="bx4"/><text x="220" y="153" text-anchor="middle" class="t-xs">C2 ✓</text>
+<rect x="240" y="136" width="60" height="26" rx="3" class="bx2"/><text x="270" y="153" text-anchor="middle" class="t-xs">A2</text>
+<rect x="300" y="136" width="60" height="26" rx="3" class="bx2"/><text x="330" y="153" text-anchor="middle" class="t-xs">A3</text>
+<rect x="360" y="136" width="60" height="26" rx="3" class="bx2"/><text x="390" y="153" text-anchor="middle" class="t-xs">A4</text>
+<rect x="420" y="136" width="60" height="26" rx="3" class="bx2"/><text x="450" y="153" text-anchor="middle" class="t-xs">A5 …</text>
+</g>
+<text x="20" y="184" class="t-xs">B and C finish early; A finishes at about the same time as before. Mean completion time falls; A is not starved because its</text>
+<text x="20" y="200" class="t-xs">priority is relative to other programs' attained service, and the prefix cache keeps A's calls cheap when it runs.</text>
+<rect x="520" y="30" width="185" height="130" rx="8" class="bx"/>
+<text x="612" y="52" text-anchor="middle" class="t-xs t-b">Program-aware also means</text>
+<text x="530" y="74" class="t-xs">• session affinity for caches</text>
+<text x="530" y="92" class="t-xs">• batch sibling calls that</text>
+<text x="530" y="106" class="t-xs">  share a prefix</text>
+<text x="530" y="124" class="t-xs">• keep KV across tool calls</text>
+<text x="530" y="142" class="t-xs">• per-program budgets</text>
+</svg>
+<figcaption><b>Figure 17.5 — Scheduling by program rather than by request.</b> Each block is one model call; letters are programs. Ordering calls by their program's attained service lets short programs complete quickly while long ones still progress.</figcaption>
+</figure>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — why least attained service helps heavy-tailed jobs</div>
+<p>When job sizes are unknown in advance but drawn from a distribution with a <em>decreasing hazard rate</em>—as heavy-tailed distributions such as the Pareto and many lognormals have—a job that has already received a lot of service is likely to need a lot more. Least-attained-service scheduling (also called foreground–background) always serves the job that has received the least service so far, so new and short jobs overtake old, long ones. For decreasing-hazard-rate size distributions it minimises the mean response time among policies that do not know sizes, a classical result of queueing theory; for increasing hazard rates it is a poor choice. Agent programs, whose numbers of steps vary from a handful to hundreds with a long tail, fit the favourable case, which is why program-level attained service is a good scheduling key for agent traffic.</p>
+</div>
+
+<h2 id="s17-6">17.6 What agent loops cost, and how long they take</h2>
+<p>An agent task's cost and latency are sums over its steps, and it is worth computing them for a realistic case before deciding how to optimise.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the cost of a coding-agent task</div>
+<p><strong>Task.</strong> A coding agent fixes a bug in 40 steps. It starts with 4,000 tokens of instructions and tool definitions; each step the model writes about 300 tokens (reasoning and a tool call) and the tool returns about 1,200 tokens (file contents, test output). The model is a 70B-class model priced at $0.60 per million uncached input tokens, $0.15 per million cached, and $2.40 per million output tokens (Atlas's list prices, §10.6).</p>
+<p><strong>Without prefix caching.</strong> Prefill tokens: about 1.33 million (Figure 17.2), costing about $0.80; output: \(40\times300=12{,}000\) tokens, about $0.03. Total about $0.83.</p>
+<p><strong>With prefix caching.</strong> Uncached input: about 62,500 tokens, $0.04; cached input: about 1.27 million tokens, $0.19; output $0.03. Total about $0.26, a third of the cost—and on a self-hosted fleet, where cached tokens cost the provider almost nothing (§10.4), the compute falls twentyfold.</p>
+<p><strong>Latency.</strong> Model time per step: prefill of 1,500 new tokens (about 60 ms) plus 300 output tokens at 30 ms each (9 s): about 9 s per step, 6 minutes of model time in total. Tool time: file reads in milliseconds, test runs perhaps 20 s each for 10 of the steps: about 3–4 minutes. The task takes about 10 minutes, dominated by decoding the model's output.</p>
+<p><strong>Levers.</strong> Fewer output tokens per step (concise tool calls, less verbose reasoning), parallel tool calls, a faster or smaller model for routine steps (routing, Vol. I §27.6), speculative decoding for decode-heavy steps (Vol. I Chapter 20), and caching—in that order of effect for this task.</p>
+</div>
+
+<p>The example generalises in three ways. First, for long agent tasks, the <em>cached input</em> dominates token counts and the <em>output</em> dominates latency, so prefix caching is the cost lever and decode speed is the latency lever. Second, agent tasks are where speculative decoding and smaller specialised models pay off most, because their outputs are often formulaic (tool-call syntax, repeated code) and draft models predict them well. Third, because tasks run for minutes and consume dollars rather than fractions of a cent, they need <strong>budgets</strong>: limits on steps, tokens, tool calls and wall-clock time per task, enforced by the orchestrator, so that a confused agent looping on a failing test cannot run up an unbounded bill (the "denial of wallet" of §14.8, self-inflicted). Rate limits stated per request (Chapter 11) do not capture this; agent platforms limit per task and per user per day as well.</p>
+
+<h2 id="s17-7">17.7 Reliability of multi-step workflows</h2>
+<p>A task that requires every one of \(n_{\text{step}}\) steps to succeed, each independently with probability \(p_{\text{step}}\), succeeds with probability \(p_{\text{step}}^{\,n_{\text{step}}}\), and that number falls fast. Figure 17.6 shows it: at 99% per step, a 50-step task succeeds 61% of the time; at 95%, under 8%. "Steps" here include infrastructure failures—a timeout from a tool, a dropped connection, a rate-limit rejection, a crashed sandbox—as well as the model's own mistakes.</p>
+
+<figure class="chart" id="fig-17-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Probability a multi-step task completes, against number of steps","height":320,
+ "x":{"label":"Steps in the task","min":1,"max":50,"ticks":[1,10,20,30,40,50]},
+ "y":{"label":"Task success probability","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"p = 0.99 per step","color":"s3","points":[[1,0.99],[10,0.904],[20,0.818],[30,0.74],[40,0.669],[50,0.605]]},
+  {"name":"p = 0.98","color":"s1","points":[[1,0.98],[10,0.817],[20,0.668],[30,0.545],[40,0.446],[50,0.364]]},
+  {"name":"p = 0.95","color":"s2","points":[[1,0.95],[10,0.599],[20,0.358],[30,0.215],[40,0.129],[50,0.077]]},
+  {"name":"p = 0.95 with one retry of transient failures","color":"s5","dash":true,"points":[[1,0.9975],[10,0.975],[20,0.951],[30,0.928],[40,0.905],[50,0.882]]}
+ ]}
+</script>
+<figcaption><b>Figure 17.6 — Reliability compounds over steps.</b> Per-step success \(p_{\text{step}}\) gives task success \(p_{\text{step}}^{\,n_{\text{step}}}\). If failures are transient and a step can be retried once, per-step success becomes \(1-(1-p_{\text{step}})^2\) and long tasks become feasible; the dashed curve assumes all failures are transient.</figcaption>
+</figure>
+
+<p>Figure 17.6 says that agent infrastructure must be engineered for reliability across steps, and the tools for that come from distributed systems. <strong>Retries</strong> of transient failures—tool timeouts, rate limits, dropped streams—turn a 95% step into a 99.75% one, provided the retried actions are <strong>idempotent</strong>: a tool call that creates a ticket or sends an email must carry an idempotency key (§11.7) so that retrying it does not do it twice. <strong>Durable execution</strong> records the workflow's state—the conversation so far, the results of completed tool calls, the sandbox's files—after every step in a durable store, so that a crash of the orchestrator, a replica or a sandbox resumes the task from its last completed step rather than from the beginning; workflow engines built for this pattern (in the style of Temporal) are increasingly used to run agents. <strong>Timeouts and budgets</strong> stop tasks that are not converging. <strong>Checkpoints for humans</strong>—asking the user to approve an action, or to clarify an ambiguity—both catch errors and bound the damage of injected instructions. And <strong>tracing</strong> every step, with its inputs, outputs, latency and cost, makes failures diagnosable; an agent trace is the equivalent of a distributed-systems trace with a model call at each span.</p>
+
+<details class="drill">
+<summary>Drill 17.2 — How much do retries buy?</summary>
+<p>A 40-step task fails at each step with probability 2%. Three quarters of these failures are transient (timeouts, rate limits, dropped streams) and succeed if retried; the rest are permanent (the model takes a wrong action). What is the task's success probability with no retries, and with one retry of every transient failure? What bounds any further improvement from retries?</p>
+<p><em>Solution.</em> Without retries: \(0.98^{40}\approx0.446\). With one retry, a step fails permanently with probability 0.005, or transiently twice with probability \(0.015\times0.015\approx0.0002\); per-step success is about 0.9948, and \(0.9948^{40}\approx0.81\). Even unlimited retries cannot exceed \(0.995^{40}\approx0.82\), the ceiling set by permanent failures. Beyond that point the levers are not infrastructural—better models, verification steps, human checkpoints—which is why measuring the split between transient and permanent failures is the first step in any agent reliability review.</p>
+</details>
+
+<figure class="diagram" id="fig-17-7">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Durable execution of an agent workflow">
+<defs><marker id="a177" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="40" width="90" height="50" rx="7" class="bx3"/><text x="60" y="62" text-anchor="middle" class="t-xs t-b">step 1</text><text x="60" y="78" text-anchor="middle" class="t-xs">model + tool</text>
+<rect x="125" y="40" width="90" height="50" rx="7" class="bx3"/><text x="170" y="62" text-anchor="middle" class="t-xs t-b">step 2</text><text x="170" y="78" text-anchor="middle" class="t-xs">model + tool</text>
+<rect x="235" y="40" width="90" height="50" rx="7" class="bx2"/><text x="280" y="62" text-anchor="middle" class="t-xs t-b">step 3 ✗</text><text x="280" y="78" text-anchor="middle" class="t-xs">replica crash</text>
+<rect x="345" y="40" width="110" height="50" rx="7" class="bx4"/><text x="400" y="62" text-anchor="middle" class="t-xs t-b">resume step 3</text><text x="400" y="78" text-anchor="middle" class="t-xs">from checkpoint 2</text>
+<rect x="475" y="40" width="90" height="50" rx="7" class="bx3"/><text x="520" y="62" text-anchor="middle" class="t-xs t-b">step 4</text><text x="520" y="78" text-anchor="middle" class="t-xs">needs approval</text>
+<rect x="585" y="40" width="120" height="50" rx="7" class="bx5"/><text x="645" y="62" text-anchor="middle" class="t-xs t-b">human approves</text><text x="645" y="78" text-anchor="middle" class="t-xs">(hours later)</text>
+<line x1="105" y1="65" x2="123" y2="65" class="ln" marker-end="url(#a177)"/><line x1="215" y1="65" x2="233" y2="65" class="ln" marker-end="url(#a177)"/><line x1="325" y1="65" x2="343" y2="65" class="ln" marker-end="url(#a177)"/><line x1="455" y1="65" x2="473" y2="65" class="ln" marker-end="url(#a177)"/><line x1="565" y1="65" x2="583" y2="65" class="ln" marker-end="url(#a177)"/>
+<rect x="15" y="130" width="690" height="40" rx="8" class="bx"/><text x="360" y="155" text-anchor="middle" class="t-xs t-b">durable store: conversation, completed tool results (with idempotency keys), sandbox snapshot, budget used</text>
+<line x1="60" y1="90" x2="60" y2="128" class="ln ln-acc" stroke-dasharray="4 3"/><line x1="170" y1="90" x2="170" y2="128" class="ln ln-acc" stroke-dasharray="4 3"/><line x1="400" y1="128" x2="400" y2="92" class="ln ln-s3" marker-end="url(#a177)"/><line x1="520" y1="90" x2="520" y2="128" class="ln ln-acc" stroke-dasharray="4 3"/>
+<text x="360" y="200" text-anchor="middle" class="t-xs">Every completed step is recorded; failures resume from the last record; long human waits release GPU and sandbox resources entirely.</text>
+</svg>
+<figcaption><b>Figure 17.7 — Durable execution.</b> Recording each completed step lets a task survive crashes and long pauses: a failed step resumes from the last checkpoint, and a wait for human approval holds no GPUs, KV or sandboxes, only a record.</figcaption>
+</figure>
+
+<p>Figure 17.7 shows how durable execution also solves the long-pause case of §17.4: when a task waits hours for a human, its KV is discarded, its sandbox snapshotted, and its state kept as a record; when the approval arrives, the orchestrator resumes, the engine re-prefills (cheaply, from the prefix cache if it is still warm, otherwise at a modest one-time cost), and the task continues. Reliability, cost and resource efficiency all improve together.</p>
+
+<h2 id="s17-8">17.8 Agent platforms as infrastructure</h2>
+<p>An organisation that runs agents at scale ends up operating a platform with components from every chapter of this volume: an LLM serving fleet with session affinity, prefix caching and KV policies tuned for tool pauses (Chapters 8 and 10); a sandbox fleet with strong isolation, network policy and snapshotting (Chapters 6, 7 and 14); tool gateways with delegated authorisation, rate limits and audit (Chapters 11 and 14); a durable orchestration layer with budgets, retries and checkpoints (Chapter 13); observability that traces programs, not just requests; and cost attribution per task and per user (Chapter 10). Security deserves the last word: an agent with tools is the system in which prompt injection (§14.7) turns into real actions, so least privilege, confirmation of side effects, egress control and audit are not optional features but the conditions under which agents can be deployed at all. The models decide what to do; the infrastructure decides what they are able to do.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Agents, retrieval and multimodal inputs all widen what flows into and out of a model—and with it the scope for harmful content: injected instructions in retrieved documents, requests for dangerous information, outputs that violate policy, images and audio that must be screened. Every major LLM service therefore runs a second set of models alongside its main ones: classifiers that inspect inputs and outputs and decide what to allow. Where do these guard models run, how do they keep up with streaming output, what do they cost in latency and compute, and how should their thresholds be set when harmful content is rare? Chapter 18 develops the infrastructure of guardrails and moderation.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>An agent task is a program of model calls and tool calls with a growing context: total prefill without caching is \(n_{\text{step}}n_0+\tfrac12n_{\text{step}}(n_{\text{step}}-1)n_\Delta\) (quadratic), with prefix caching \(n_0+(n_{\text{step}}-1)n_\Delta\) (linear)—≈ 20× fewer tokens at 40 steps. Keep contexts append-only and calls on the same replica.</li>
+<li>Tool calls are structured outputs; MCP (2024) standardises tools, resources and prompts over JSON-RPC; tool servers need delegated per-user authorisation, rate limits, timeouts, latency budgets and audit.</li>
+<li>Model-generated code runs in sandboxes: containers (shared kernel), gVisor (user-space kernel), Firecracker microVMs (≈ 125 ms boot, ≈ 5 MiB overhead), plus resource limits, no-egress networking, scoped files, no credentials and lifecycle management; sandbox fleets are large CPU/memory fleets with overcommitment and snapshots.</li>
+<li>While a tool runs, hold KV in HBM for short pauses, offload to host memory for tens of seconds to minutes, and discard and recompute for very long pauses; break-even with recompute ≈ prefill cost ÷ HBM holding rate.</li>
+<li>Per-request schedulers mistreat programs; program-aware scheduling (Parrot's semantic variables, Autellix's least attained service) cuts completion times; LAS is optimal-ish for decreasing-hazard (heavy-tailed) program lengths.</li>
+<li>A 40-step coding task costs ≈ $0.83 without caching and ≈ $0.26 with it at Atlas prices; output decode dominates latency; levers are caching, concise outputs, parallel tools, smaller or speculative models; enforce per-task budgets.</li>
+<li>Task success \(p_{\text{step}}^{\,n_{\text{step}}}\) decays fast; retries with idempotency, durable execution with per-step checkpoints, timeouts, human checkpoints and tracing make long workflows reliable.</li>
+<li>Agent platforms combine serving, sandboxes, tool gateways, durable orchestration, observability, cost attribution and security; infrastructure bounds what agents can do.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci17-mcq-01" data-topic="§17.1 Programs">
+<p class="q">Without prefix caching, total prefill work of an agent task grows with the number of steps:</p>
+<ol class="opts"><li>Logarithmically</li><li>Linearly</li><li data-correct>Quadratically</li><li>Exponentially</li></ol>
+<div class="explain">Each step re-processes a context that grows linearly.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-02" data-topic="§17.1 Programs">
+<p class="q">With \(n_0=4{,}000\) and \(n_\Delta=1{,}500\), how many tokens does a 40-step task prefill with prefix caching?</p>
+<ol class="opts"><li>4,000</li><li data-correct>62,500</li><li>1.33 million</li><li>60,000</li></ol>
+<div class="explain">\(4000+39\times1500\).</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-03" data-topic="§17.1 Programs">
+<p class="q">Which practices preserve prefix-cache hits across an agent's steps? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Session affinity: send a task's calls to the same replica</li><li data-correct>Append-only contexts (no timestamps or reordering at the top)</li><li data-correct>Keeping or offloading KV across tool calls</li><li>Shuffling tool descriptions each step</li></ol>
+<div class="explain">Any change near the start of the context invalidates the cache.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-04" data-topic="§17.2 Tools">
+<p class="q">How do engines guarantee syntactically valid tool calls?</p>
+<ol class="opts"><li>By retrying until valid</li><li data-correct>Grammar-constrained decoding against the declared schema</li><li>By post-processing text</li><li>They cannot</li></ol>
+<div class="explain">See Vol. I §4.6.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-05" data-topic="§17.2 Tools">
+<p class="q">The Model Context Protocol standardises:</p>
+<ol class="opts"><li>Model weights formats</li><li data-correct>How agent applications access tools, resources and prompts exposed by servers</li><li>GPU drivers</li><li>Tokenisers</li></ol>
+<div class="explain">Published in November 2024; JSON-RPC over stdio or HTTP.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-06" data-topic="§17.2 Tools">
+<p class="q">Why must tool servers authorise on behalf of the end user rather than the agent?</p>
+<ol class="opts"><li>For billing</li><li data-correct>The agent should have exactly the user's permissions and no more, limiting damage from mistakes or injection</li><li>Agents cannot authenticate</li><li>It is faster</li></ol>
+<div class="explain">Delegated, scoped tokens per tool and user.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-07" data-topic="§17.2 Tools">
+<p class="q">Why do parallel tool calls matter?</p>
+<ol class="opts"><li>They reduce tokens</li><li data-correct>Independent calls run concurrently, cutting wall-clock time of a step</li><li>They avoid sandboxes</li><li>They improve caching</li></ol>
+<div class="explain">E.g. searching several sources at once.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-08" data-topic="§17.3 Sandboxes">
+<p class="q">Why are plain containers weak sandboxes for hostile code?</p>
+<ol class="opts"><li>They are slow</li><li data-correct>They share the host kernel; one kernel vulnerability can allow escape</li><li>They cannot limit memory</li><li>They need GPUs</li></ol>
+<div class="explain">gVisor or microVMs add a boundary.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-09" data-topic="§17.3 Sandboxes">
+<p class="q">gVisor isolates code by:</p>
+<ol class="opts"><li>Running a full VM</li><li data-correct>Intercepting system calls in a user-space kernel that passes only a narrow set to the host</li><li>Encrypting memory</li><li>Using MIG</li></ol>
+<div class="explain">Smaller attack surface, some syscall overhead.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-10" data-topic="§17.3 Sandboxes">
+<p class="q">Firecracker microVMs boot in roughly:</p>
+<ol class="opts"><li>12 ms</li><li data-correct>125 ms</li><li>12 s</li><li>2 min</li></ol>
+<div class="explain">With about 5 MiB overhead; snapshots restore faster.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-11" data-topic="§17.3 Sandboxes">
+<p class="q">Which policies belong in an agent code sandbox? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>No network egress by default (or allow-list)</li><li data-correct>CPU, memory, disk and time limits</li><li data-correct>No credentials beyond the task's needs</li><li>Access to the host's Docker socket</li></ol>
+<div class="explain">The Docker socket would give host control.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-12" data-topic="§17.3 Sandboxes">
+<p class="q">In the sandbox worked example, why can CPU be overcommitted about four-fold?</p>
+<ol class="opts"><li>Sandboxes need no CPU</li><li data-correct>Sandboxes are busy about 20% of the time with largely uncorrelated bursts</li><li>Firecracker doubles CPUs</li><li>Agents are idle</li></ol>
+<div class="explain">The statistical multiplexing argument of §2.4.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-13" data-topic="§17.4 KV policy">
+<p class="q">For a tool call of about one second, the best KV policy is usually:</p>
+<ol class="opts"><li>Discard and recompute</li><li data-correct>Hold in HBM</li><li>Offload to SSD</li><li>Send to another region</li></ol>
+<div class="explain">Holding briefly is cheapest and fastest.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-14" data-topic="§17.4 KV policy">
+<p class="q">For a pause of a few minutes, Figure 17.4 favours:</p>
+<ol class="opts"><li>Holding in HBM</li><li data-correct>Offloading to host memory and reloading</li><li>Recomputing</li><li>Ending the task</li></ol>
+<div class="explain">Reloading 4.9 GB over PCIe takes about 0.2 s.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-15" data-topic="§17.4 KV policy">
+<p class="q">The break-even pause between holding and recomputing equals:</p>
+<ol class="opts"><li>The tool's timeout</li><li data-correct>Recompute cost divided by the HBM holding cost rate</li><li>The TPOT</li><li>The context length</li></ol>
+<div class="explain">About 134 s in the example.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-16" data-topic="§17.4 KV policy">
+<p class="q">How can the orchestrator help the engine choose a KV policy?</p>
+<ol class="opts"><li>By sending more tokens</li><li data-correct>By signalling that the call will resume after a tool, and its expected duration</li><li>By disabling caching</li><li>By using a different model</li></ol>
+<div class="explain">Otherwise the engine treats the request as finished.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-17" data-topic="§17.5 Scheduling">
+<p class="q">Why do per-request schedulers mistreat agent programs?</p>
+<ol class="opts"><li>Agents use different models</li><li data-correct>They ignore that a program's completion is the sum of its calls, causing convoy effects and poor end-to-end latency</li><li>They cannot batch</li><li>They block tools</li></ol>
+<div class="explain">The program, not the request, is the unit of value.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-18" data-topic="§17.5 Scheduling">
+<p class="q">Least-attained-service scheduling serves first:</p>
+<ol class="opts"><li>The oldest program</li><li data-correct>The program that has received the least service so far</li><li>The largest program</li><li>Random programs</li></ol>
+<div class="explain">Good for heavy-tailed (decreasing hazard) sizes.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-19" data-topic="§17.5 Scheduling">
+<p class="q">Parrot's "semantic variables" let the system:</p>
+<ol class="opts"><li>Encrypt prompts</li><li data-correct>See data dependencies between LLM calls and optimise programs end to end</li><li>Compress KV</li><li>Route regions</li></ol>
+<div class="explain">Applications expose program structure to the serving system.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-20" data-topic="§17.6 Cost">
+<p class="q">In the coding-agent example, what dominated task latency?</p>
+<ol class="opts"><li>Prefill</li><li>Sandbox start</li><li data-correct>Decoding the model's output tokens</li><li>Network</li></ol>
+<div class="explain">About 9 s per step of output at 30 ms per token.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-21" data-topic="§17.6 Cost">
+<p class="q">With prefix caching at Atlas prices, the 40-step task cost fell from about $0.83 to about:</p>
+<ol class="opts"><li>$0.80</li><li>$0.50</li><li data-correct>$0.26</li><li>$0.03</li></ol>
+<div class="explain">Cached input is billed at a quarter of uncached.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-22" data-topic="§17.6 Cost">
+<p class="q">Why do agent platforms enforce per-task budgets?</p>
+<ol class="opts"><li>To reduce caching</li><li data-correct>A looping agent could otherwise consume unbounded steps, tokens and money</li><li>Regulations</li><li>To improve quality</li></ol>
+<div class="explain">Per-request rate limits do not capture task-level cost.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-23" data-topic="§17.6 Cost">
+<p class="q">Why does speculative decoding pay off particularly well for agents?</p>
+<ol class="opts"><li>Agents use small vocabularies</li><li data-correct>Agent outputs (tool-call syntax, repeated code) are formulaic, so draft acceptance is high, and decode dominates latency</li><li>It reduces prefill</li><li>It is required by MCP</li></ol>
+<div class="explain">See Vol. I Chapter 20.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-24" data-topic="§17.7 Reliability">
+<p class="q">With 98% per-step success, a 30-step task succeeds about:</p>
+<ol class="opts"><li>98%</li><li>74%</li><li data-correct>55%</li><li>20%</li></ol>
+<div class="explain">\(0.98^{30}\approx0.545\).</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-25" data-topic="§17.7 Reliability">
+<p class="q">Why must retried tool actions be idempotent?</p>
+<ol class="opts"><li>For speed</li><li data-correct>Otherwise a retry might perform a side effect twice (two tickets, two emails, two payments)</li><li>To save tokens</li><li>For caching</li></ol>
+<div class="explain">Use idempotency keys.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-26" data-topic="§17.7 Reliability">
+<p class="q">Durable execution means:</p>
+<ol class="opts"><li>Running on reserved GPUs</li><li data-correct>Recording each completed step durably so failures resume from the last checkpoint</li><li>Never failing</li><li>Using longer timeouts</li></ol>
+<div class="explain">It also lets long human waits release resources.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-27" data-topic="§17.7 Reliability">
+<p class="q">One retry of transient failures changes per-step success from 0.95 to:</p>
+<ol class="opts"><li>0.95</li><li>0.975</li><li data-correct>0.9975</li><li>1.0</li></ol>
+<div class="explain">\(1-0.05^2\), if failures are transient and independent.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-28" data-topic="§17.8 Platforms">
+<p class="q">Which components make up an agent platform? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>LLM serving with session affinity and KV policies</li><li data-correct>Sandbox fleet with isolation and egress control</li><li data-correct>Durable orchestration with budgets and retries</li><li data-correct>Tool gateways with delegated auth and audit</li></ol>
+<div class="explain">Plus observability and cost attribution.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-29" data-topic="§17.8 Platforms">
+<p class="q">"The models decide what to do; the infrastructure decides what they are able to do" refers to:</p>
+<ol class="opts"><li>Model routing</li><li data-correct>Least privilege, confirmations, sandboxes and egress limits bounding agent actions</li><li>GPU allocation</li><li>Pricing</li></ol>
+<div class="explain">Prompt injection becomes real action through tools.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-30" data-topic="§17.4 KV policy">
+<p class="q">For a human approval that may take hours, the best handling of KV is usually:</p>
+<ol class="opts"><li>Hold in HBM</li><li>Offload to host memory indefinitely</li><li data-correct>Discard it, keep the conversation durably, and recompute on resume</li><li>Replicate it to all regions</li></ol>
+<div class="explain">Long pauses should hold no GPU resources.</div>
+</div>
+
+<div class="mcq" data-id="ci17-mcq-31" data-topic="§17.1 Programs">
+<p class="q">The ReAct pattern alternates:</p>
+<ol class="opts"><li>Training and inference</li><li data-correct>Reasoning steps and actions (tool calls) with observations appended to context</li><li>Prefill and decode</li><li>Retrieval and reranking</li></ol>
+<div class="explain">Yao et al. (2022).</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci17-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Why does an agent's cost grow quadratically with steps, and how do you fix it?</summary>
+<div class="answer">
+<p>Each step appends model output and tool results, so step i's context is n₀ + (i−1)n_Δ. Re-prefilling the full context each step gives total prefill n n₀ + ½ n(n−1) n_Δ, quadratic in n. Prefix caching reuses the KV of the unchanged prefix, so only the new n_Δ tokens are prefilled: n₀ + (n−1) n_Δ, linear. Make it work: append-only contexts (no timestamps or reordering near the top), session affinity to the same replica, keep or offload KV during tool calls, and use cached-input pricing. For a 40-step task this is ~20× fewer prefill tokens.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is MCP and what infrastructure does a tool server need?</summary>
+<div class="answer">
+<p>The Model Context Protocol (Anthropic, 2024) is a client–server JSON-RPC protocol through which agent applications discover and call tools, read resources and use prompt templates from servers, over stdio locally or HTTP with streaming remotely. A tool server is a service: it needs user-delegated authorisation (OAuth scopes per user and tool), input validation, rate limits and timeouts, latency budgets, idempotency for side-effecting tools, audit logging, and the security controls of least privilege and confirmation for dangerous actions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-03">
+<summary><span class="lvl warm">Warm-up</span> How would you run model-generated code safely?</summary>
+<div class="answer">
+<p>In a sandbox with a strong boundary: gVisor or Firecracker microVMs (not plain containers sharing the host kernel), created per task or session from snapshots for fast start; resource limits (CPU, memory, disk, processes, wall time); no network egress by default or an allow-list (package mirrors, approved APIs); scoped filesystem with only task files; no credentials; separate from model-serving and control-plane networks; destroy after use; monitor for abuse (crypto mining, scanning); audit executed code and outputs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-04">
+<summary><span class="lvl core">Core</span> What should the engine do with a sequence's KV cache while a tool runs?</summary>
+<div class="answer">
+<p>Choose by expected pause: hold in HBM for short pauses (cost ∝ HBM rate × bytes × time, best latency); offload to host memory (or SSD) for tens of seconds to minutes and reload (0.2 s for ~5 GB over PCIe, cheap memory); discard and recompute for long pauses (fixed prefill cost plus latency). Break-even hold vs recompute ≈ recompute cost / HBM holding rate (~134 s in the 70B example). The orchestrator should tell the engine that a call will resume and how long the tool usually takes; engines (InferCept-style) can then decide per request; prefix caching across replicas or hierarchical KV stores make recompute rarely needed.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-05">
+<summary><span class="lvl core">Core</span> Estimate the cost and latency of a 40-step coding-agent task.</summary>
+<div class="answer">
+<p>n₀ = 4,000 tokens, each step adds 300 output + 1,200 tool tokens. Without caching: ~1.33M prefill tokens (~$0.80 at $0.60/M) + 12k output ($0.03) ≈ $0.83. With caching: 62.5k uncached ($0.04) + ~1.27M cached ($0.19 at $0.15/M) + output $0.03 ≈ $0.26. Latency: per step ~60 ms prefill + 300 tokens × 30 ms ≈ 9 s, ~6 min of model time; tools (tests) a few minutes: ~10 min total, decode-dominated. Levers: caching (cost), shorter outputs, parallel tools, smaller/specialised models for routine steps, speculative decoding (latency), budgets.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-06">
+<summary><span class="lvl core">Core</span> Why does a 40-step workflow fail so often, and how do you make it reliable?</summary>
+<div class="answer">
+<p>Success compounds: p^n; at 98% per step, 40 steps succeed ~45%. Failures include model errors and infrastructure faults (tool timeouts, rate limits, dropped streams, crashed sandboxes or replicas). Fixes: retries for transient faults with idempotency keys for side effects (95% → 99.75% per step); durable execution recording each completed step so crashes resume rather than restart; timeouts and budgets; validation of tool outputs and structured outputs; human checkpoints for risky actions; better models or verification steps for model errors; tracing every step for diagnosis.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-07">
+<summary><span class="lvl core">Core</span> Compare containers, gVisor and Firecracker for agent sandboxes.</summary>
+<div class="answer">
+<p>Containers: namespaces/cgroups/seccomp on a shared host kernel; millisecond start, negligible overhead; boundary is the kernel's syscall surface—too weak for hostile code. gVisor: user-space kernel intercepts and implements syscalls, passing a narrow set to the host; ~100 ms start, syscall-heavy workloads slower; much smaller attack surface. Firecracker: minimal KVM-based microVM with its own guest kernel; ~125 ms boot, ~5 MiB overhead, snapshots for faster restore; hardware-enforced boundary; used by Lambda and agent code-execution services. Choose microVMs or gVisor for untrusted code at scale; containers only inside a VM per tenant.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> Explain program-aware scheduling for agent workloads and why least attained service helps.</summary>
+<div class="answer">
+<p>Per-request schedulers optimise each call; agent value is program completion time = Σ calls + tools. FCFS creates convoys where long programs' calls delay many short programs. Program-aware schedulers track programs: Parrot exposes inter-call dependencies (semantic variables) to co-schedule and share prefixes; Autellix prioritises calls by their program's cumulative attained service. For heavy-tailed program lengths with decreasing hazard rates (long programs likely to continue), least-attained-service minimises mean response among size-oblivious policies, so short programs finish fast while long ones still progress (relative priority, no starvation if combined with ageing). Combine with session affinity and KV retention across tool calls.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> How do agents change capacity planning for an LLM fleet?</summary>
+<div class="answer">
+<p>Token mix shifts to very long, mostly cached contexts and many output tokens per task; prefill per step is small if caching works but KV residency per session is large and long-lived (contexts of 50–200k tokens held across tool pauses), so KV capacity and offload bandwidth become binding rather than FLOPs; session affinity reduces routing flexibility; bursts of parallel tool calls and sibling calls share prefixes. Plan in sessions × context size × residency time for KV, output tokens for decode, and uncached deltas for prefill; add host-memory/SSD KV tiers; sandbox and tool fleets as separate capacity; budgets per task to bound tail usage; forecast tasks, not requests.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-10">
+<summary><span class="lvl design">Design</span> Design the infrastructure for a coding agent serving 50,000 concurrent sessions.</summary>
+<div class="answer">
+<p>LLM tier: 70B-class model (or mix with a smaller model for routine steps) with session-affine routing, append-only context discipline, prefix caching, hierarchical KV (HBM → host → SSD) with tool-duration-aware policies, speculative decoding; capacity from sessions × KV size and output tokens. Sandbox fleet: Firecracker microVMs from snapshots, ~50k live, CPU overcommit with idle snapshotting, cached package mirrors, no egress except allow-list, per-task filesystem (repo checkout), resource limits. Tools via MCP servers (repo, CI, issue tracker) with delegated auth. Durable orchestrator with per-step checkpoints, retries with idempotency, budgets (steps, tokens, time), human approval for pushes. Tracing and cost per task. Security reviews for injection paths (README instructions, issue text).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-11">
+<summary><span class="lvl design">Design</span> A customer-service agent can issue refunds. How do you make that safe?</summary>
+<div class="answer">
+<p>Least privilege: refund tool scoped to the authenticated customer's orders, with amount limits per refund and per day; policy checks in the tool (eligibility rules) not in the prompt; confirmation step (customer confirms; human approval above thresholds); idempotency keys so retries cannot double-refund; separation of trusted instructions from untrusted content (order notes, emails) to resist injection; rate limits per customer and agent; anomaly detection on refund patterns; full audit trail with reasoning traces; durable workflow with resumable steps; red-team tests with injected instructions; fallback to human agent.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-12">
+<summary><span class="lvl core">Core</span> How do you prevent runaway agent costs?</summary>
+<div class="answer">
+<p>Per-task budgets on steps, tokens (input, output), tool calls and wall-clock time enforced by the orchestrator; per-user daily limits; detection of loops (repeated identical tool calls, no progress); cheaper models for routine steps; caching discipline; alerts on cost per task distribution; clear termination with partial results; pricing that passes costs to users for long tasks; dashboards of cost per task by agent type. Treat it as self-inflicted denial of wallet.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-13">
+<summary><span class="lvl deep">Deep-dive</span> What is durable execution and why does it suit agents?</summary>
+<div class="answer">
+<p>A workflow engine records each step's inputs and outputs durably (event log); on failure or restart, it replays from the log, skipping completed steps (whose results are recorded) and resuming at the failed one; side-effecting steps carry idempotency keys. For agents: crashes of orchestrator, model replica or sandbox resume mid-task instead of restarting 40 steps; long waits (human approval, slow tools) hold no GPUs or sandboxes—just a record; retries and timeouts are policy; traces come for free. Requirements: deterministic orchestration logic around nondeterministic model calls (record model outputs), state size management (conversation and file snapshots), and versioning of workflows.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-14">
+<summary><span class="lvl core">Core</span> How should tools be exposed to agents across a large company?</summary>
+<div class="answer">
+<p>Wrap internal systems as MCP (or equivalent) servers maintained by owning teams; central registry of tools with descriptions, schemas, owners, risk levels; gateway enforcing user-delegated auth, scopes, rate limits and audit; classify tools by side effects (read-only vs write vs irreversible) with confirmation policies; latency SLOs per tool; versioned schemas; sandboxed execution for code tools; monitoring of tool errors and agent misuse; documentation that is also model-readable (good descriptions improve tool selection).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> When is it better to discard and recompute KV than to offload it?</summary>
+<div class="answer">
+<p>When the pause is long enough that even cheap storage costs more than recompute (hours), when offload bandwidth or capacity is the bottleneck (many sessions pausing at once), when the context will be heavily modified anyway (summarisation), when the session may resume on a different replica or region (recompute there from durable text, or fetch from a shared KV store if available), or in confidential-computing environments where host transfers are expensive (§14.2). Recompute latency matters: for long contexts it can be seconds; prefix caching across replicas and shared KV stores (Mooncake-style) narrow the gap.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci17-qa-16">
+<summary><span class="lvl warm">Warm-up</span> How does serving agent traffic differ from serving chat traffic?</summary>
+<div class="answer">
+<p>Unit of work is a program of many dependent calls; contexts grow and are heavily cached; calls pause for tools whose latency the engine doesn't control, so KV residency and offload policies matter; end-to-end task latency and cost matter more than per-call TTFT; outputs (tool calls, code) are formulaic and decode-heavy; untrusted code needs sandboxes; reliability compounds over steps; budgets are needed per task; security risk rises because outputs become actions. Infrastructure responds with session affinity, KV tiers, program-aware scheduling, sandboxes, tool gateways and durable orchestration.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-react">S. Yao et al. ReAct: Synergizing Reasoning and Acting in Language Models. <em>ICLR</em>, 2023. <a href="https://arxiv.org/abs/2210.03629">arXiv:2210.03629</a>.</li>
+<li id="r-firecracker">A. Agache et al. Firecracker: Lightweight Virtualization for Serverless Applications. <em>NSDI</em>, 2020.</li>
+<li id="r-infercept">R. Abhyankar et al. InferCept: Efficient Intercept Support for Augmented Large Language Model Inference. <em>ICML</em>, 2024. <a href="https://arxiv.org/abs/2402.01869">arXiv:2402.01869</a>.</li>
+<li id="r-parrot">C. Lin et al. Parrot: Efficient Serving of LLM-based Applications with Semantic Variable. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2405.19888">arXiv:2405.19888</a>.</li>
+<li id="r-autellix">M. Luo et al. Autellix: An Efficient Serving Engine for LLM Agents as General Programs. 2025. <a href="https://arxiv.org/abs/2502.13965">arXiv:2502.13965</a>.</li>
+<li>T. Schick et al. Toolformer: Language Models Can Teach Themselves to Use Tools. 2023. <a href="https://arxiv.org/abs/2302.04761">arXiv:2302.04761</a>.</li>
+<li>Anthropic. Model Context Protocol specification, 2024–2025. <a href="https://modelcontextprotocol.io">modelcontextprotocol.io</a>.</li>
+<li>E. G. Young et al. The True Cost of Containing: A gVisor Case Study. <em>HotCloud</em>, 2019.</li>
+<li>L. Zheng et al. SGLang: Efficient Execution of Structured Language Model Programs. 2023. <a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a>.</li>
+<li>M. Harchol-Balter. <em>Performance Modeling and Design of Computer Systems: Queueing Theory in Action</em> (chapters on LAS/FB scheduling). Cambridge University Press, 2013.</li>
+<li>M. Zaharia et al. The Shift from Models to Compound AI Systems. Berkeley AI Research blog, 2024.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>
