@@ -282,5 +282,5 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(R\), \(c_r\), \(c_o\) | committed capacity (GPUs); committed and on-demand prices per GPU-hour |
 | \(p_{\text{na}}\), \(c_{\text{short}}\), \(c_{\text{idle}}\), \(c_{\text{over}}\) | probability on-demand is unavailable; cost of a GPU-hour of shortfall; value of lending an idle GPU-hour; cost of an unused GPU-hour |
 | \(\ell_q\), \(q\) | pinball loss; forecast quantile |
-| \(\lambda_p\), \(L\) (as a job length, Ch. 9 only) | preemption rate per hour; uninterrupted work a job needs (elsewhere \(L\) is layers) |
+| \(\lambda_p\), \(L_{\text{job}}\) | preemption rate per hour; uninterrupted work a job needs (hours) |
 | \(w\), \(t_{\text{node}}\), \(\dot\lambda\) | warm-pool size (GPUs; elsewhere \(w\) is the attention window); node provisioning time; demand growth rate |

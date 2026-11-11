@@ -167,7 +167,7 @@ C(R)=c_rT_{\text{per}}R+c_o\int_0^{T_{\text{per}}}\max\bigl(D(\tau)-R,0\bigr)\,d
 
 <h2 id="s9-5">9.5 Spot capacity and preemption</h2>
 <p>Spot capacity is the cheapest GPU time available, and for some workloads it is ideal. Its defining property is that it can be taken away: when the provider needs the capacity for on-demand or reserved customers, it sends a short notice and terminates the instance. Whether a workload can use spot depends on what an interruption costs it, and that can be computed.</p>
-<p>Consider first a batch job that needs \(L\) hours of uninterrupted work and makes no checkpoints, on capacity that is reclaimed as a Poisson process with rate \(\lambda_p\) per hour. Each interruption loses all progress and forces a restart. The expected total time to completion is a classical result:</p>
+<p>Consider first a batch job that needs \(L_{\text{job}}\) hours of uninterrupted work and makes no checkpoints, on capacity that is reclaimed as a Poisson process with rate \(\lambda_p\) per hour. Each interruption loses all progress and forces a restart. The expected total time to completion is a classical result:</p>
 \[
 \mathbb E[T_{\text{done}}]=\frac{e^{\lambda_pL}-1}{\lambda_p},
 \]
@@ -177,11 +177,11 @@ C(R)=c_rT_{\text{per}}R+c_o\int_0^{T_{\text{per}}}\max\bigl(D(\tau)-R,0\bigr)\,d
 <div class="chart-root"></div>
 <script type="application/json" class="chart-spec">
 {"title":"Slowdown of a job on preemptible capacity, against expected interruptions per job","height":320,
- "x":{"label":"Expected interruptions during the job, λ_p L","min":0,"max":3.1,"ticks":[0,0.5,1,1.5,2,2.5,3]},
+ "x":{"label":"Expected interruptions during the job, λ_p L_job","min":0,"max":3.1,"ticks":[0,0.5,1,1.5,2,2.5,3]},
  "y":{"label":"Completion time / ideal time","min":1,"max":6.5,"ticks":[1,2,3,4,5,6]},
  "series":[
   {"name":"No checkpoints: (e^x − 1)/x","color":"s2","points":[[0.1,1.052],[0.25,1.136],[0.5,1.297],[1,1.718],[1.5,2.32],[2,3.19],[2.5,4.47],[3,6.36]]},
-  {"name":"Checkpoint every L/10","color":"s3","points":[[0.1,1.005],[0.25,1.013],[0.5,1.025],[1,1.052],[1.5,1.079],[2,1.107],[2.5,1.136],[3,1.166]]}
+  {"name":"Checkpoint every L_job/10","color":"s3","points":[[0.1,1.005],[0.25,1.013],[0.5,1.025],[1,1.052],[1.5,1.079],[2,1.107],[2.5,1.136],[3,1.166]]}
  ]}
 </script>
 <figcaption><b>Figure 9.4 — Checkpoints make spot capacity usable.</b> Without checkpoints, the expected completion time grows exponentially with the number of interruptions per attempt; with ten checkpoints per job, the slowdown stays below 20% even at three interruptions per job's length.</figcaption>
@@ -365,8 +365,8 @@ C(R)=c_rT_{\text{per}}R+c_o\int_0^{T_{\text{per}}}\max\bigl(D(\tau)-R,0\bigr)\,d
 </div>
 
 <div class="mcq" data-id="ci09-mcq-16" data-topic="§9.5 Spot">
-<p class="q">A job of length \(L\) with no checkpoints on capacity reclaimed at rate \(\lambda_p\) has expected completion time:</p>
-<ol class="opts"><li>\(L\)</li><li>\(L(1+\lambda_p)\)</li><li data-correct>\((e^{\lambda_pL}-1)/\lambda_p\)</li><li>\(L/\lambda_p\)</li></ol>
+<p class="q">A job of length \(L_{\text{job}}\) with no checkpoints on capacity reclaimed at rate \(\lambda_p\) has expected completion time:</p>
+<ol class="opts"><li>\(L_{\text{job}}\)</li><li>\(L_{\text{job}}(1+\lambda_p)\)</li><li data-correct>\((e^{\lambda_pL}-1)/\lambda_p\)</li><li>\(L_{\text{job}}/\lambda_p\)</li></ol>
 <div class="explain">Slowdown grows exponentially in \(\lambda_pL\).</div>
 </div>
 
@@ -503,7 +503,7 @@ C(R)=c_rT_{\text{per}}R+c_o\int_0^{T_{\text{per}}}\max\bigl(D(\tau)-R,0\bigr)\,d
 <details class="qa" data-id="ci09-qa-06">
 <summary><span class="lvl core">Core</span> Derive the expected completion time of a job on preemptible capacity without checkpoints.</summary>
 <div class="answer">
-<p>Let \(E\) be the expected time to complete \(L\) hours of uninterrupted work, interruptions Poisson with rate \(\lambda\). Condition on the first interruption time \(X\sim\text{Exp}(\lambda)\): if \(X\ge L\) we finish at \(L\); otherwise we lose \(X\) and restart, so \(E=\mathbb E[\min(X,L)]+\Pr(X<L)E\). \(\mathbb E[\min(X,L)]=(1-e^{-\lambda L})/\lambda\), \(\Pr(X<L)=1-e^{-\lambda L}\). So \(E\,e^{-\lambda L}=(1-e^{-\lambda L})/\lambda\), giving \(E=(e^{\lambda L}-1)/\lambda\). Slowdown \((e^x-1)/x\) with \(x=\lambda L\): 1.3× at 0.5, 1.7× at 1, 6.4× at 3. With checkpoints every \(\tau\), apply per segment: \(\approx1+\lambda\tau/2\). Lesson: checkpoint frequently relative to the interruption rate.</p>
+<p>Let \(E\) be the expected time to complete \(L_{\text{job}}\) hours of uninterrupted work, interruptions Poisson with rate \(\lambda\). Condition on the first interruption time \(X\sim\text{Exp}(\lambda)\): if \(X\ge L_{\text{job}}\) we finish at \(L_{\text{job}}\); otherwise we lose \(X\) and restart, so \(E=\mathbb E[\min(X,L_{\text{job}})]+\Pr(X<L_{\text{job}})E\). \(\mathbb E[\min(X,L_{\text{job}})]=(1-e^{-\lambda L_{\text{job}}})/\lambda\), \(\Pr(X<L_{\text{job}})=1-e^{-\lambda L_{\text{job}}}\). So \(E\,e^{-\lambda L_{\text{job}}}=(1-e^{-\lambda L_{\text{job}}})/\lambda\), giving \(E=(e^{\lambda L_{\text{job}}}-1)/\lambda\). Slowdown \((e^x-1)/x\) with \(x=\lambda L_{\text{job}}\): 1.3× at 0.5, 1.7× at 1, 6.4× at 3. With checkpoints every \(\tau\), apply per segment: \(\approx1+\lambda\tau/2\). Lesson: checkpoint frequently relative to the interruption rate.</p>
 </div>
 </details>
 
