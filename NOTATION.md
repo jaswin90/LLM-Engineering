@@ -261,5 +261,5 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(\lambda_f\) | failure rate of one node (or device), per hour |
 | \(g\) | (Ch. 6–7 only, as a count) nodes in a multi-node replica group; elsewhere \(g\) is the GQA group size |
 | \(t_{\text{rec}}\) | recovery time of a failed replica |
-| \(S\), \(R\) | generation time of a request; residual (remaining) time of an in-flight request |
+| \(\Gamma\), \(\Gamma_{\text{res}}\) | generation time of a request; residual (remaining) time of an in-flight request (not \(S\), the attention scores) |
 | \(n_b\), \(t_{\text{drain}}\) | replicas replaced per rollout batch; time to drain a replica |
