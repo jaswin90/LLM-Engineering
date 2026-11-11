@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 12 · Multi-Region Serving and Disaster Recovery — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 12 of Cloud AI Infrastructure: why LLM services run in several regions; steering traffic with DNS, anycast and edge proxies; assigning demand to regions as an optimisation; follow-the-sun capacity pooling; data residency and sovereignty; state that must follow users (prefix caches, conversations, files, adapters); active-active and active-passive failover, RTO and RPO; capacity for regional failure; and disaster-recovery testing.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci12" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part IV · The Global Request Path — Chapter 12</div>
+<h1 id="top">Multi-Region Serving and Disaster Recovery</h1>
+<p class="lede">A service with users on every continent, legal obligations about where their data may go, GPU capacity scattered across whichever regions have it, and a need to survive the loss of an entire region runs in several regions at once. This chapter explains how traffic is steered among regions, how to decide which region serves which users, how much capacity follow-the-sun pooling saves and residency rules cost, which state must follow a user when traffic moves, and how to design, size and test failover for an LLM service.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 11 followed a request into one region. A global service has to answer a prior question for every request: <em>which</em> region? The answer balances latency (users want nearby servers), capacity (the nearest region may be full or may lack the right GPUs), cost (power and GPU prices vary by region), law (some data may be processed only in some jurisdictions) and reliability (a region can fail). For classical web services, the latency term usually dominates and regions are chosen for proximity. For LLM services, Chapter 2 showed that tens of milliseconds of network delay are small next to seconds of generation, so capacity, cost and law weigh more—and that changes the architecture.</p>
+<p>Multi-region design is also where reliability engineering meets geography. Regions do fail: cloud providers have had region-wide incidents lasting hours, caused by power events, network misconfigurations and failures of internal control-plane services on which everything else depended. A service that runs in one region is only as available as that region; one that runs in several must decide how much capacity to hold in reserve, which state to replicate, and how to move traffic when a region degrades. Interviewers ask exactly this: "design a multi-region LLM API", "what happens to prefix caches when you fail over?", "how much extra capacity do you need to survive losing a region?", "a customer's data must stay in the EU—what changes?".</p>
+<p>We start with why services go multi-region (§12.1) and how traffic is steered (§12.2). We formulate region selection as an optimisation and quantify follow-the-sun pooling (§12.3), then add data-residency constraints (§12.4). We examine the state that must follow users (§12.5), failover architectures and their recovery objectives (§12.6), capacity for regional failure (§12.7), and how to test it all (§12.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>List the reasons for multi-region serving and the trade-offs among latency, capacity, cost, residency and reliability.</li>
+<li>Explain DNS-based global load balancing, anycast and edge proxies, and their failure and convergence behaviour.</li>
+<li>Formulate the assignment of demand to regions as a linear programme, and quantify the capacity saved by pooling demand across time zones.</li>
+<li>Describe data-residency and sovereignty constraints and how they restrict routing, caching, logging and model customisation.</li>
+<li>Identify the state an LLM service holds (prefix caches, conversations, files, vector stores, adapters) and design its replication, including the cost of losing caches on failover.</li>
+<li>Compare active-active, active-passive and pilot-light designs by RTO, RPO and cost, and size capacity to survive a regional failure.</li>
+</ol>
+<p class="small muted">Uses: Chapters 1, 2, 5, 7, 9 and 11 of this volume; Vol. I Chapter 10 (prefix caching) and §27.2 (cache-affine routing).</p>
+</div>
+
+<h2 id="s12-1">12.1 Why more than one region</h2>
+<p>Five forces push an LLM service into several regions, and they pull in different directions. <strong>Latency</strong>: a user in Singapore talking to a region in Virginia pays about 200 ms of round trip per exchange; for chat this is tolerable, for voice and many-step agents it is not (§2.7). <strong>Capacity</strong>: GPUs, especially the newest, are available in some regions and not others, quotas are per region, and no single region may offer enough capacity for a large fleet (Chapter 9). <strong>Cost</strong>: GPU prices, power prices and the carbon intensity of electricity differ by region, so moving latency-tolerant work to cheaper regions saves money. <strong>Residency</strong>: laws and contracts may require that some customers' prompts, outputs and stored data be processed and kept in particular jurisdictions (§12.4). <strong>Reliability</strong>: a region is a failure domain (Chapter 1), and surviving its loss requires capacity elsewhere.</p>
+<p>The forces conflict. Latency argues for many regions near users; capacity and cost argue for few, large regions where power and GPUs are plentiful; residency argues for regions in particular countries regardless of their capacity; reliability argues for at least two or three regions, each able to absorb another's load. A typical large LLM service ends up with a small number of large GPU regions carrying most of the work, a larger number of smaller regions for residency-bound and latency-sensitive traffic, and a global edge that terminates connections near users and carries requests over the provider's backbone. Figure 12.1 sketches the arrangement for Atlas.</p>
+
+<figure class="diagram" id="fig-12-1">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="Global architecture of a multi-region LLM service">
+<defs><marker id="a121" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="20" width="690" height="48" rx="10" class="bx4"/>
+<text x="360" y="40" text-anchor="middle" class="t-sm t-b">Global edge: anycast IPs, TLS termination at ≈ 100 points of presence, global traffic manager</text>
+<text x="360" y="58" text-anchor="middle" class="t-xs">health, capacity, latency and residency policy decide each request's region</text>
+<rect x="15" y="110" width="160" height="110" rx="10" class="bx2"/><text x="95" y="132" text-anchor="middle" class="t-xs t-b">US-East (large)</text><text x="95" y="150" text-anchor="middle" class="t-xs">all tiers, H100/GB200</text><text x="95" y="166" text-anchor="middle" class="t-xs">≈ 45% of capacity</text><text x="95" y="182" text-anchor="middle" class="t-xs">batch + training share</text>
+<rect x="190" y="110" width="160" height="110" rx="10" class="bx2"/><text x="270" y="132" text-anchor="middle" class="t-xs t-b">US-West (large)</text><text x="270" y="150" text-anchor="middle" class="t-xs">all tiers</text><text x="270" y="166" text-anchor="middle" class="t-xs">≈ 25%</text><text x="270" y="182" text-anchor="middle" class="t-xs">failover for US-East</text>
+<rect x="365" y="110" width="160" height="110" rx="10" class="bx3"/><text x="445" y="132" text-anchor="middle" class="t-xs t-b">EU (two regions)</text><text x="445" y="150" text-anchor="middle" class="t-xs">EU-resident tenants</text><text x="445" y="166" text-anchor="middle" class="t-xs">≈ 20%</text><text x="445" y="182" text-anchor="middle" class="t-xs">fail over within EU only</text>
+<rect x="540" y="110" width="165" height="110" rx="10" class="bx5"/><text x="622" y="132" text-anchor="middle" class="t-xs t-b">Asia-Pacific</text><text x="622" y="150" text-anchor="middle" class="t-xs">latency-sensitive tiers,</text><text x="622" y="166" text-anchor="middle" class="t-xs">resident tenants ≈ 10%</text><text x="622" y="182" text-anchor="middle" class="t-xs">spills to US at night</text>
+<line x1="95" y1="68" x2="95" y2="108" class="ln" marker-end="url(#a121)"/><line x1="270" y1="68" x2="270" y2="108" class="ln" marker-end="url(#a121)"/><line x1="445" y1="68" x2="445" y2="108" class="ln" marker-end="url(#a121)"/><line x1="622" y1="68" x2="622" y2="108" class="ln" marker-end="url(#a121)"/>
+<rect x="15" y="238" width="690" height="32" rx="8" class="bx"/>
+<text x="360" y="258" text-anchor="middle" class="t-xs">Global control plane (model registry, config, quotas, billing) replicated across regions; no request path depends on one region's control plane.</text>
+</svg>
+<figcaption><b>Figure 12.1 — Atlas across regions.</b> A global edge terminates connections near users and a traffic manager assigns each request to a region; large GPU regions carry most work, residency-bound regions serve their tenants and fail over only within their jurisdiction, and the control plane is replicated so that no region is a single point of failure.</figcaption>
+</figure>
+
+<h2 id="s12-2">12.2 Steering traffic between regions</h2>
+<p>Three mechanisms steer users to regions, often in combination. <strong>DNS-based global load balancing</strong> answers the query for the API's host name with an address in the region chosen for the querying client, using the location of the client's DNS resolver, measured latencies, region health and configured weights. It is simple and universal, but it is coarse and slow: the decision is made per resolver rather than per user, and answers are cached by resolvers and clients for their time-to-live, so a change takes at least a TTL—often much longer, because some resolvers ignore short TTLs—to take effect. DNS is therefore good for steady-state placement and poor for fast failover.</p>
+<p><strong>Anycast</strong> announces the same IP address from many locations through the internet's routing protocol, BGP, so that each user's packets go to the "nearest" location in routing terms. Failover is faster—withdrawing an announcement redirects traffic within seconds to minutes as routes converge—and it absorbs denial-of-service attacks by spreading them. But BGP chooses routes by policy and path length, not by latency or load, so anycast alone cannot balance load or respect residency.</p>
+<p>The common modern design combines anycast with <strong>edge proxies</strong>: anycast brings each user's connection to a nearby point of presence, where a proxy terminates TLS (§11.1) and forwards the request over the provider's private backbone to a region chosen per request by a <strong>global traffic manager</strong> using live data on each region's health, capacity and queue depths, the request's latency sensitivity, and the tenant's residency policy. Per-request steering at the edge reacts in seconds, can split a single user's traffic between regions, and can move load away from a region that is degraded but not dead—the most common situation in practice.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — why "nearest" in BGP is not nearest in latency</div>
+<p>The internet is a graph of autonomous systems (networks run by one organisation) joined by peering and transit links. BGP lets each system announce which address prefixes it can reach and through which sequence of systems; each router chooses among announced routes by a lexicographic order of policies—business relationships first, then shortest AS-path length, then tie-breakers—not by measured delay. Two paths with the same AS-path length can differ by tens of milliseconds, and a policy preference can send traffic across an ocean when a nearby path exists. Anycast therefore gives a map from users to sites that is roughly, but not reliably, latency-minimising, and that can change when any network on the path changes its policy. Measurement-driven steering at the application layer corrects for this by observing actual latencies and choosing destinations explicitly.</p>
+</div>
+
+<h2 id="s12-3">12.3 Which region should serve which users?</h2>
+<p>Suppose demand originates in client areas \(i\) (cities, countries or edge sites) at rates \(\lambda_i\), and can be served in regions \(j\) with capacity \(C_j\) (in requests per second at the target utilisation, or better, in GPU-equivalents of prefill and decode work), cost \(c_j\) per unit of work, and round-trip latency \(\ell_{ij}\) between area and region. Let \(x_{ij}\) be the rate of demand from \(i\) served in \(j\), and let \(\mathcal A_i\) be the set of regions allowed for area \(i\)'s traffic (by residency or contract). The placement that minimises cost plus a monetised latency penalty \(\omega_\ell\) per millisecond solves the linear programme</p>
+\[
+\min_{x\ge0}\ \sum_{i,j}x_{ij}\bigl(c_j+\omega_\ell\,\ell_{ij}\bigr)\quad\text{s.t.}\quad\sum_jx_{ij}=\lambda_i,\quad\sum_ix_{ij}\le C_j,\quad x_{ij}=0\ \text{for}\ j\notin\mathcal A_i .
+\]
+<p>The programme is a transportation problem, a classical special case of linear programming whose solutions are integral and efficiently computable, and its dual variables are informative: the shadow price of region \(j\)'s capacity constraint says how much the objective would fall with one more unit of capacity there, which is exactly what a capacity planner wants to know (Chapter 9). In practice a traffic manager solves a version of it every few seconds with current demand, capacity and latencies, and writes the solution as routing weights for the edges.</p>
+<p>The programme's most important feature for LLMs is the size of \(\omega_\ell\). For a web page, a 100 ms penalty is significant; for an LLM response that takes 10 s, a 100 ms change in the first byte is a 1% change in total time, and users barely notice. So for most text traffic the latency term is small relative to cost and capacity, and the optimum sends traffic across continents when a distant region has spare capacity or cheaper GPUs. The exception is latency-critical traffic—voice, real-time agents, code completion—for which \(\omega_\ell\) is large, and that traffic stays near users. A traffic manager therefore distinguishes classes of traffic with different latency weights.</p>
+<p>The payoff of letting text traffic travel is <strong>follow-the-sun pooling</strong>. Each continent's demand follows its own working day, so the regions' peaks fall at different times. If each region must provision for its own peak, total capacity is the sum of the regional peaks; if demand can be served anywhere, total capacity need only cover the peak of the global sum, which is much flatter. Figure 12.2 shows this for Atlas, with demand split 45% Americas, 35% Europe and 20% Asia-Pacific, each following a daily cycle with a peak 60% above its mean, at peaks 8 hours apart.</p>
+
+<figure class="chart" id="fig-12-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Follow-the-sun: regional demand and global total over a day (fraction of global mean)","height":330,
+ "x":{"label":"Hour (UTC)","min":0,"max":24,"ticks":[0,4,8,12,16,20,24]},
+ "y":{"label":"Demand (fraction of global mean)","min":0,"max":1.2,"ticks":[0,0.2,0.4,0.6,0.8,1,1.2]},
+ "series":[
+  {"name":"Asia-Pacific (20%)","color":"s5","points":[[0,0.26],[2,0.304],[4,0.32],[6,0.304],[8,0.26],[10,0.2],[12,0.14],[14,0.096],[16,0.08],[18,0.096],[20,0.14],[22,0.2],[24,0.26]]},
+  {"name":"Europe (35%)","color":"s3","points":[[0,0.14],[2,0.168],[4,0.245],[6,0.35],[8,0.455],[10,0.532],[12,0.56],[14,0.532],[16,0.455],[18,0.35],[20,0.245],[22,0.168],[24,0.14]]},
+  {"name":"Americas (45%)","color":"s2","points":[[0,0.585],[2,0.45],[4,0.315],[6,0.216],[8,0.18],[10,0.216],[12,0.315],[14,0.45],[16,0.585],[18,0.684],[20,0.72],[22,0.684],[24,0.585]]},
+  {"name":"Global total","color":"s1","points":[[0,0.985],[2,0.922],[4,0.88],[6,0.87],[8,0.895],[10,0.948],[12,1.015],[14,1.078],[16,1.12],[18,1.13],[20,1.105],[22,1.052],[24,0.985]]}
+ ],
+ "hlines":[{"y":1.13,"text":"global peak 1.13"}]}
+</script>
+<figcaption><b>Figure 12.2 — Pooling across time zones flattens demand.</b> Each region's demand peaks at 1.6 times its mean, so provisioning every region for its own peak needs 1.6 times global mean demand in total; the global total peaks at only 1.13. Pooling saves about 29% of capacity, if traffic may move between regions.</figcaption>
+</figure>
+
+<p>Figure 12.2 quantifies an advantage that only global services enjoy. If each region served only its own users, Atlas would need capacity equal to 1.6 times its global mean demand (the sum of the regional peaks); with full pooling it needs 1.13 times, a saving of 29%—comparable to everything a good engine optimisation can deliver. The saving can be derived in closed form: if region \(k\) has weight \(w_k\) and demand \(w_k(1+a_{\text{d}}\cos(2\pi(\tau-\phi_k)/24))\), the global total is \(1+a_{\text{d}}\,|\sum_kw_ke^{2\pi i\phi_k/24}|\cos(\cdot)\), so its peak-to-mean ratio is \(1+a_{\text{d}}|\sum_kw_ke^{2\pi i\phi_k/24}|\); with three equal regions eight hours apart the sum vanishes and global demand is flat. Real demand is lumpier, and weekends and holidays differ by country, but the effect is large. Two caveats limit it: latency-critical traffic cannot travel, and residency rules forbid some traffic from travelling at all.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — routing Atlas's evening peak</div>
+<p><strong>Situation.</strong> At 19:00 UTC, the Americas are at their peak and need 1,450 GPU-equivalents of 70B capacity; US regions hold 1,250 at target utilisation. Europe is past its peak, using 650 of its 900; Asia-Pacific uses 180 of 400.</p>
+<p><strong>Without pooling.</strong> The US regions are short by 200 GPU-equivalents: either they run hot (latency rises sharply, §11.6), or they buy on-demand capacity at several times the price (if available, Chapter 9), or they shed load.</p>
+<p><strong>With pooling.</strong> The traffic manager sends 200 units of latency-tolerant US chat traffic to Europe (about 80 ms extra round trip, under 1% of a 10 s response) and keeps voice, agents and code completion in the US. Europe rises to 850 of 900. No traffic from EU-resident tenants moves; no US traffic covered by US-only residency contracts moves.</p>
+<p><strong>Cost.</strong> Cross-region transfer of request and response bytes is negligible (§4.8). The lost prefix-cache hits for moved conversations raise prefill for that traffic (§12.5), which the European capacity must absorb—so the traffic manager prefers to move <em>new</em> conversations, whose caches do not yet exist, rather than continuing ones.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 12.2 — A small transportation problem</summary>
+<p>Two client areas, Americas (demand 1,000 units) and Europe (600), can be served in US (capacity 900, cost 1.0 per unit) or EU (capacity 900, cost 1.2). Round trips: Americas–US 30 ms, Americas–EU 110 ms, Europe–EU 20 ms, Europe–US 100 ms. Latency costs \(\omega_\ell=0.001\) per unit per ms for chat. What is the optimal assignment? What changes if 300 units of European demand are EU-resident?</p>
+<p><em>Solution.</em> Per-unit total costs: Am→US \(1.0+0.03=1.03\); Am→EU \(1.2+0.11=1.31\); Eu→EU \(1.2+0.02=1.22\); Eu→US \(1.0+0.10=1.10\). Total demand 1,600 against 1,800 capacity. The US is cheaper for both areas, so fill it first with the area that gains most from it: Americas saves 0.28 per unit by using the US instead of the EU, Europe saves 0.12, so the US takes 900 units of Americas demand; the remaining 100 Americas units and all 600 European units go to the EU (700 of 900). Cost: \(900\times1.03+100\times1.31+600\times1.22=927+131+732=1{,}790\). With 300 European units resident, nothing changes, since all European demand is already served in the EU. If instead the US had spare capacity (say 1,300), the optimum would move 300 non-resident European units to the US (saving 0.12 each) and keep the resident 300 in the EU—the residency constraint then costs \(300\times0.12=36\).</p>
+</details>
+
+<h2 id="s12-4">12.4 Data residency and sovereignty</h2>
+<p>Many customers—governments, banks, healthcare providers, and companies subject to data-protection law—require that their data be processed and stored within particular jurisdictions. The legal landscape is complex and changes, and engineers should rely on their organisation's lawyers rather than on any textbook, but its broad shape matters for architecture. The European Union's General Data Protection Regulation restricts transfers of personal data outside the European Economic Area unless specific safeguards apply; sector rules such as health-data and financial-services regulations impose their own controls; several countries require certain categories of data to remain within their borders; and governments increasingly ask for <em>sovereign</em> clouds whose operations, staff and encryption keys are also under local control. Cloud providers responded with region-scoped services, data-boundary commitments and sovereign offerings, and LLM API providers with regional endpoints and data-residency options.</p>
+<p>For an LLM service, residency is broader than "which region runs the model". A request's data appears in many places: the prompt and response in transit and in the engine's memory; the <strong>KV cache</strong> and prefix cache, which are a derived representation of the prompt; <strong>logs and traces</strong>, which may contain prompts or excerpts; <strong>conversation state</strong> and uploaded files stored for multi-turn use; <strong>vector stores</strong> built from customer documents (Chapter 16); <strong>fine-tuned models and adapters</strong> trained on customer data; <strong>evaluation and abuse-monitoring</strong> pipelines that sample traffic; and <strong>backups</strong>. A residency commitment must cover all of them. Figure 12.3 shows the boundary for an EU-resident tenant.</p>
+
+<figure class="diagram" id="fig-12-3">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Residency boundary for an EU-resident tenant">
+<rect x="15" y="20" width="450" height="235" rx="12" class="bx3"/>
+<text x="240" y="42" text-anchor="middle" class="t-sm t-b">EU boundary (two EU regions)</text>
+<rect x="35" y="58" width="130" height="40" rx="6" class="bx"/><text x="100" y="82" text-anchor="middle" class="t-xs">EU edge + gateway</text>
+<rect x="180" y="58" width="130" height="40" rx="6" class="bx"/><text x="245" y="76" text-anchor="middle" class="t-xs">engines, KV and</text><text x="245" y="90" text-anchor="middle" class="t-xs">prefix caches</text>
+<rect x="325" y="58" width="125" height="40" rx="6" class="bx"/><text x="387" y="76" text-anchor="middle" class="t-xs">conversations,</text><text x="387" y="90" text-anchor="middle" class="t-xs">files, vector stores</text>
+<rect x="35" y="110" width="130" height="40" rx="6" class="bx"/><text x="100" y="128" text-anchor="middle" class="t-xs">logs, traces with</text><text x="100" y="142" text-anchor="middle" class="t-xs">prompt content</text>
+<rect x="180" y="110" width="130" height="40" rx="6" class="bx"/><text x="245" y="128" text-anchor="middle" class="t-xs">fine-tunes and</text><text x="245" y="142" text-anchor="middle" class="t-xs">adapters</text>
+<rect x="325" y="110" width="125" height="40" rx="6" class="bx"/><text x="387" y="128" text-anchor="middle" class="t-xs">abuse monitoring,</text><text x="387" y="142" text-anchor="middle" class="t-xs">eval samples</text>
+<rect x="35" y="162" width="415" height="34" rx="6" class="bx4"/><text x="242" y="183" text-anchor="middle" class="t-xs">backups and failover replicas: only to the other EU region</text>
+<rect x="35" y="206" width="415" height="34" rx="6" class="bx2"/><text x="242" y="227" text-anchor="middle" class="t-xs">encryption keys held in EU key management (optionally customer-managed)</text>
+<rect x="490" y="60" width="215" height="150" rx="12" class="bx"/>
+<text x="597" y="82" text-anchor="middle" class="t-sm t-b">May leave the boundary</text>
+<text x="505" y="106" class="t-xs">• aggregate usage counts for billing</text>
+<text x="505" y="124" class="t-xs">• content-free metrics (latency,</text>
+<text x="505" y="138" class="t-xs">  tokens, errors)</text>
+<text x="505" y="156" class="t-xs">• model weights (not customer data)</text>
+<text x="505" y="174" class="t-xs">• control-plane configuration</text>
+<text x="505" y="196" class="t-xs">(subject to legal review)</text>
+</svg>
+<figcaption><b>Figure 12.3 — What a residency commitment must cover.</b> Every artefact derived from the tenant's content—caches, logs, conversations, fine-tunes, monitoring samples, backups—stays within the boundary, and failover goes only to another region inside it. Content-free telemetry and the control plane may be global.</figcaption>
+</figure>
+
+<p>Residency has two engineering costs. The first is <em>capacity</em>: a residency-bound tenant's traffic cannot join follow-the-sun pooling, so its region must be provisioned for its own peak, plus a failover reserve that must also lie inside the boundary. If the EU tier's peak is 1.6 times its mean and it must survive the loss of one of its two regions, it needs \(1.6\times2=3.2\) times its mean demand in installed capacity, against about 1.13 times for pooled global traffic with spare capacity shared across many regions—nearly three times as much per unit of demand. Providers recover some of this by sharing residency-bound capacity with non-resident traffic that happens to originate inside the boundary and by lending its troughs to resident batch work. The second cost is <em>complexity</em>: every component in Figure 12.3 must know a tenant's residency and enforce it, the global traffic manager must never route resident traffic out, and logging, monitoring and support processes must avoid copying content across the boundary. Residency is therefore best designed in as a tenant attribute that flows with every request, not retrofitted.</p>
+
+<h2 id="s12-5">12.5 State that must follow users</h2>
+<p>A stateless service can move requests between regions freely. An LLM service is less stateless than it looks, and the state it holds determines what happens when traffic moves. Table 12.1 lists the main kinds.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 12.1 — State held by an LLM service and what moving traffic does to it</caption>
+<thead><tr><th>State</th><th>Where it lives</th><th>If traffic moves to another region</th><th>Typical treatment</th></tr></thead>
+<tbody>
+<tr><td>Prefix / KV caches</td><td>engine HBM, host memory, KV stores</td><td>lost: prefill rises for moved traffic</td><td>soft state; rebuild; move new sessions first</td></tr>
+<tr><td>Conversation state, threads</td><td>regional database</td><td>must be available or the conversation breaks</td><td>replicate asynchronously; route sessions home</td></tr>
+<tr><td>Uploaded files, vector stores</td><td>object storage, vector DB</td><td>retrieval fails or is slow</td><td>replicate; residency-scoped</td></tr>
+<tr><td>Fine-tunes, LoRA adapters</td><td>registry, node caches</td><td>cold start or unavailable</td><td>replicate to every serving region in the boundary</td></tr>
+<tr><td>Rate-limit and quota counters</td><td>gateway stores</td><td>limits reset or double-count</td><td>per-region shares; global ledger for quotas</td></tr>
+<tr><td>Batch jobs in progress</td><td>job store, outputs</td><td>restart or resume</td><td>checkpointed outputs in replicated storage</td></tr>
+</tbody></table></div>
+
+<p>Figure 12.4 shows the arrangement that most multi-region LLM services adopt for this state. Each user or conversation has a <em>home region</em>, recorded in a small global directory or encoded in the conversation's identifier, and requests are routed home whenever the home region is healthy, so that its caches, conversation state and files are local. Durable state is replicated asynchronously to a <em>partner</em> region inside the same residency boundary. When the home region fails, the traffic manager sends the conversation to the partner, which has a copy of its durable state—missing at most the last few seconds—but none of its soft state, so the first turn after failover pays a full prefill. When the home recovers, conversations either return or are re-homed, depending on how much traffic has accumulated at the partner.</p>
+
+<figure class="diagram" id="fig-12-4">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Home regions, partner replication and failover of session state">
+<defs><marker id="a124" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="20" width="150" height="50" rx="8" class="bx"/><text x="90" y="42" text-anchor="middle" class="t-xs t-b">client</text><text x="90" y="58" text-anchor="middle" class="t-xs">conversation c, home A</text>
+<rect x="215" y="20" width="160" height="50" rx="8" class="bx4"/><text x="295" y="42" text-anchor="middle" class="t-xs t-b">traffic manager</text><text x="295" y="58" text-anchor="middle" class="t-xs">route home unless unhealthy</text>
+<rect x="430" y="10" width="275" height="105" rx="10" class="bx3"/>
+<text x="567" y="30" text-anchor="middle" class="t-xs t-b">home region A</text>
+<text x="445" y="50" class="t-xs">durable: thread, files, adapters</text>
+<text x="445" y="68" class="t-xs">soft: prefix/KV cache of c</text>
+<text x="445" y="86" class="t-xs">quota counters (regional share)</text>
+<rect x="430" y="140" width="275" height="95" rx="10" class="bx2"/>
+<text x="567" y="160" text-anchor="middle" class="t-xs t-b">partner region B (same boundary)</text>
+<text x="445" y="180" class="t-xs">durable: async replica (RPO seconds)</text>
+<text x="445" y="198" class="t-xs">soft: none for c → first turn full prefill</text>
+<text x="445" y="216" class="t-xs">serves c only if A is unhealthy</text>
+<line x1="165" y1="45" x2="213" y2="45" class="ln" marker-end="url(#a124)"/>
+<line x1="375" y1="40" x2="428" y2="40" class="ln ln-s3" marker-end="url(#a124)"/>
+<line x1="375" y1="55" x2="428" y2="175" class="ln ln-s2" stroke-dasharray="5 4" marker-end="url(#a124)"/>
+<line x1="600" y1="115" x2="600" y2="138" class="ln ln-acc" marker-end="url(#a124)"/>
+<text x="610" y="131" class="t-xs t-acc">async replication</text>
+<text x="300" y="130" text-anchor="middle" class="t-xs t-s2">on failover</text>
+</svg>
+<figcaption><b>Figure 12.4 — Session homing with partner replication.</b> Conversations are served in their home region, where their caches and state are local; durable state is replicated to a partner in the same residency boundary, which takes over—without the soft state—if the home fails.</figcaption>
+</figure>
+
+<p>The most interesting entry is the first, because it is unique to LLMs and its cost is easy to underestimate. A prefix cache is soft state: losing it never makes an answer wrong, only slower and more expensive. But Atlas's traffic depends on it heavily: 60% of input tokens are cache hits (Chapter 1). When a region fails and its continuing conversations move elsewhere, every one of them arrives at a replica that has never seen its history, and its whole prompt must be prefilled. The receiving region therefore faces not only the moved demand but an inflated version of it.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the cache cost of failing over</div>
+<p><strong>Setup.</strong> US-East fails at 15:00 UTC while serving 1,500 requests/s of Atlas's 70B tier; US-West absorbs them. Normally each request has 2,000 input tokens with 60% cached, so 800 uncached; after failover, continuing conversations find no cache in US-West.</p>
+<p><strong>Prefill demand of the moved traffic.</strong> In the first minutes, essentially all 2,000 tokens per request must be prefilled: \(1500\times2000=3\times10^{6}\) tokens/s instead of \(1500\times800=1.2\times10^{6}\), two and a half times as much. At 25,000 prefill tokens/s per replica, that is 120 replica-equivalents of prefill instead of 48.</p>
+<p><strong>Recovery.</strong> As conversations take their next turns, US-West's caches fill; with a typical turn interval of a minute or two, the hit rate recovers over several minutes, and the excess prefill decays roughly exponentially with that time constant.</p>
+<p><strong>Design consequences.</strong> Failover capacity must include a prefill surge allowance (here about 70 extra replica-equivalents for a few minutes), or the receiving region's TTFT will spike exactly when it is most stressed; disaggregated prefill pools that can borrow decode capacity help; replicating hot prefix caches across regions (for example, shared system prompts) removes part of the surge, at the cost of cross-region bandwidth.</p>
+</div>
+
+<p>Durable state needs replication with explicit guarantees, and two numbers describe them. The <strong>recovery point objective</strong> (RPO) is how much recent data may be lost in a disaster—the replication lag of asynchronous copies. The <strong>recovery time objective</strong> (RTO) is how long the service may be unavailable before it recovers. Conversation threads and uploaded files are typically replicated asynchronously between regions, giving an RPO of seconds to minutes: a region failure may lose the last turn of a conversation, which the client can resend. Synchronous cross-region replication would give an RPO of zero at the price of adding a cross-region round trip to every write, which is rarely worth it for conversation state. Configuration, model registries and quotas are small and change slowly, and can be replicated strongly. What must <em>not</em> happen is that durable state for a region lives only in that region, because then the region's failure becomes data loss.</p>
+
+<h2 id="s12-6">12.6 Failover architectures and recovery objectives</h2>
+<p>Disaster-recovery designs are conventionally arranged by how much capacity is kept running in the standby location, and therefore by their RTO and cost. Figure 12.5 compares the three main patterns.</p>
+
+<figure class="diagram" id="fig-12-5">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Active-active, active-passive and pilot-light designs">
+<rect x="10" y="20" width="225" height="225" rx="10" class="bx"/>
+<text x="122" y="42" text-anchor="middle" class="t-sm t-b">Active-active</text>
+<rect x="30" y="56" width="85" height="60" rx="6" class="bx3"/><text x="72" y="82" text-anchor="middle" class="t-xs t-b">region A</text><text x="72" y="98" text-anchor="middle" class="t-xs">serving 50%</text>
+<rect x="130" y="56" width="85" height="60" rx="6" class="bx3"/><text x="172" y="82" text-anchor="middle" class="t-xs t-b">region B</text><text x="172" y="98" text-anchor="middle" class="t-xs">serving 50%</text>
+<text x="122" y="140" text-anchor="middle" class="t-xs">both serve; each sized to absorb</text>
+<text x="122" y="156" text-anchor="middle" class="t-xs">the other's share</text>
+<text x="122" y="182" text-anchor="middle" class="t-xs t-b">RTO: seconds–minutes</text>
+<text x="122" y="198" text-anchor="middle" class="t-xs">RPO: replication lag</text>
+<text x="122" y="214" text-anchor="middle" class="t-xs">cost: spare in every region</text>
+<rect x="248" y="20" width="225" height="225" rx="10" class="bx"/>
+<text x="360" y="42" text-anchor="middle" class="t-sm t-b">Active-passive (warm)</text>
+<rect x="268" y="56" width="85" height="60" rx="6" class="bx3"/><text x="310" y="82" text-anchor="middle" class="t-xs t-b">region A</text><text x="310" y="98" text-anchor="middle" class="t-xs">serving 100%</text>
+<rect x="368" y="56" width="85" height="60" rx="6" class="bx4"/><text x="410" y="82" text-anchor="middle" class="t-xs t-b">region B</text><text x="410" y="98" text-anchor="middle" class="t-xs">warm, scaled down</text>
+<text x="360" y="140" text-anchor="middle" class="t-xs">standby runs a minimal fleet;</text>
+<text x="360" y="156" text-anchor="middle" class="t-xs">scales up on failover</text>
+<text x="360" y="182" text-anchor="middle" class="t-xs t-b">RTO: minutes–hour</text>
+<text x="360" y="198" text-anchor="middle" class="t-xs">RPO: replication lag</text>
+<text x="360" y="214" text-anchor="middle" class="t-xs">risk: no GPUs when needed</text>
+<rect x="486" y="20" width="225" height="225" rx="10" class="bx"/>
+<text x="598" y="42" text-anchor="middle" class="t-sm t-b">Pilot light / backup only</text>
+<rect x="506" y="56" width="85" height="60" rx="6" class="bx3"/><text x="548" y="82" text-anchor="middle" class="t-xs t-b">region A</text><text x="548" y="98" text-anchor="middle" class="t-xs">serving 100%</text>
+<rect x="606" y="56" width="85" height="60" rx="6" class="bx2"/><text x="648" y="82" text-anchor="middle" class="t-xs t-b">region B</text><text x="648" y="98" text-anchor="middle" class="t-xs">data + images only</text>
+<text x="598" y="140" text-anchor="middle" class="t-xs">replicated data and artefacts;</text>
+<text x="598" y="156" text-anchor="middle" class="t-xs">fleet built on demand</text>
+<text x="598" y="182" text-anchor="middle" class="t-xs t-b">RTO: hours or more</text>
+<text x="598" y="198" text-anchor="middle" class="t-xs">RPO: backup interval</text>
+<text x="598" y="214" text-anchor="middle" class="t-xs">cheap; slow; GPU risk</text>
+</svg>
+<figcaption><b>Figure 12.5 — Three disaster-recovery patterns.</b> Moving right lowers standby cost and lengthens recovery. For GPU services, standby designs carry an extra risk: the GPUs needed to scale up the standby may not be obtainable during a regional disaster, when everyone else is also failing over.</figcaption>
+</figure>
+
+<p>For an interactive LLM service, Figure 12.5's middle and right patterns carry a risk that ordinary services do not face: capacity. Scaling up a standby region requires GPUs, and during a large regional outage every affected customer of the cloud is trying to obtain GPUs in the neighbouring regions at the same moment. A standby plan that depends on on-demand GPUs is a plan that may fail exactly when it is needed (Chapter 9). Active-active designs avoid this by holding the failover capacity <em>running</em>—serving traffic in normal operation—which is static stability (§1.7) applied at the regional level. The cost of that spare capacity is the subject of the next section; it can be reduced by lending it to preemptible work (Chapter 7) that is evicted when failover traffic arrives.</p>
+<p>Within a region, the same logic of failure domains applies at a finer grain, and many large services adopt a <strong>cell-based architecture</strong>. A region is divided into several independent <em>cells</em>, each a complete copy of the serving stack—gateways, routers, replicas, caches, state stores—serving a fixed subset of tenants, assigned by a thin routing layer. A bug, a bad configuration push, a poisonous request or a noisy tenant can then damage only its cell, not the region; changes are rolled out cell by cell (Chapter 13); and each cell's size can be chosen so that its loss is absorbed by the others. Cells cost some efficiency, since capacity is pooled within a cell rather than across the region, but for services whose availability matters more than the last few percent of utilisation, the bounded blast radius is worth it. For LLM serving, cells also bound the reach of shared caches, which is useful for isolation (Chapter 14).</p>
+<p>Failover also needs a <em>decision</em>, and the decision has its own failure modes. Automatic failover reacts quickly but can be fooled: a monitoring outage, a network partition between the monitor and a healthy region, or a brief degradation can trigger an unnecessary evacuation, which itself causes load spikes and cache losses elsewhere. Manual failover is slower but deliberate. A common compromise is automatic <em>load shifting</em>—the traffic manager moves load away from a region whose health and latency metrics degrade, proportionally and reversibly—combined with a human decision for a full evacuation. Equally important is that failover must not depend on the failed region: a traffic manager, DNS zone, identity service or configuration store anchored in one region turns that region's failure into a global one. Several widely reported cloud outages, including a long us-east-1 incident in October 2025 that began with DNS resolution failures for an internal database service, affected services far outside the failing region because global functions depended on it.</p>
+
+<h2 id="s12-7">12.7 Capacity to survive a regional failure</h2>
+<p>How much spare capacity does surviving the loss of a region require? The calculation mirrors the zone-spreading argument of §7.4. If a service's demand is spread evenly across \(n_{\text{reg}}\) regions and must still be served at the target utilisation after any one region is lost, each surviving region must be able to carry \(1/(n_{\text{reg}}-1)\) of the demand, so total installed capacity must be \(n_{\text{reg}}/(n_{\text{reg}}-1)\) times what the demand needs. If, during a failover, the service may run hotter—at 90% utilisation instead of its normal 75%, accepting worse tail latency for the duration—the factor shrinks by \(0.75/0.9\). Figure 12.6 plots both.</p>
+
+<figure class="chart" id="fig-12-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Installed capacity needed to survive the loss of one region, relative to demand","height":320,
+ "x":{"label":"Number of regions sharing the load","min":2,"max":8,"ticks":[2,3,4,5,6,7,8]},
+ "y":{"label":"Capacity / demand at target utilisation","min":0.9,"max":2.1,"ticks":[1,1.25,1.5,1.75,2]},
+ "series":[
+  {"name":"Keep 75% utilisation after failover: n/(n−1)","color":"s2","points":[[2,2.0],[3,1.5],[4,1.333],[5,1.25],[6,1.2],[8,1.143]]},
+  {"name":"Run at 90% during failover","color":"s3","points":[[2,1.667],[3,1.25],[4,1.111],[5,1.042],[6,1.0],[8,1.0]]}
+ ],
+ "hlines":[{"y":1,"text":"no redundancy"}]}
+</script>
+<figcaption><b>Figure 12.6 — More regions make regional redundancy cheap.</b> With two regions, surviving one loss doubles capacity; with five, it adds 25%; if the service tolerates higher utilisation during a failover, five regions need almost no dedicated spare. Uneven region sizes require the largest region's share as spare.</figcaption>
+</figure>
+
+<p>Figure 12.6 explains why large services run in several regions rather than two: the spare capacity for regional failure falls from 100% to tens of percent. Three refinements matter in practice. Regions are not equal: if one region carries 45% of the traffic, as US-East does for Atlas, the others must absorb 45%, so the spare required is set by the largest region, which argues for keeping regions similar in size. Residency boundaries partition the problem: the EU's two regions must cover each other without help from outside, so they need the expensive two-region factor regardless of how many regions exist globally. And the prefix-cache surge of §12.5 adds a transient on top: for some minutes after failover, the receiving regions need more prefill capacity than the steady-state calculation suggests. A realistic plan combines spread across several similar regions, a tolerance for running hot during failovers, lending of spare capacity to preemptible work, and graceful degradation (Chapter 9) for the cases the spare cannot cover.</p>
+
+<details class="drill">
+<summary>Drill 12.1 — Regional spare for Atlas</summary>
+<p>Atlas's 70B tier needs 2,500 GPUs of capacity at peak at 75% utilisation (Chapter 1), spread as US-East 45%, US-West 25%, EU 20% (two regions, residency-bound) and Asia-Pacific 10%. Non-EU traffic may fail over among the non-EU regions; EU traffic only within the EU. During failovers, utilisation may rise to 90%. How much installed capacity does each group need to survive the loss of any one region?</p>
+<p><em>Solution.</em> Non-EU demand: 80% of 2,500 = 2,000 GPUs at 75%. Losing US-East (the largest, 1,125) leaves US-West and Asia-Pacific, which must carry 2,000 GPU-equivalents of demand at 90%, i.e. \(2000\times0.75/0.9\approx1{,}667\) GPUs installed between them, plus their own regions must already hold what they normally serve. If installed capacity is proportional to normal share, total non-EU installed \(X\) must satisfy \(X\times(0.35/0.80)\ge1{,}667\), so \(X\ge3{,}810\): about 1.9 times the demand, because one region is so large. Rebalancing to US-East 35%, US-West 30%, Asia 15% lowers the requirement to \(X\times(0.45/0.8)\ge1{,}667\), \(X\approx2{,}960\), about 1.48 times. EU: 500 GPUs of demand across two regions; each must carry all of it at 90%: \(500\times0.75/0.9\approx417\) GPUs per region, 833 installed, 1.67 times. Lesson: region sizes and residency boundaries dominate the cost of regional redundancy.</p>
+</details>
+
+<h2 id="s12-8">12.8 Testing disaster recovery</h2>
+<p>A failover design that has never been exercised is a hypothesis. Experience across the industry is consistent: the first real regional failover of an untested design uncovers dependencies nobody knew about—a configuration service anchored in the failed region, a cache that cannot warm fast enough, quotas in the receiving region that block scale-up, a runbook that refers to a dashboard hosted in the failed region. Mature organisations therefore test disaster recovery deliberately and regularly. <strong>Game days</strong> rehearse a failure scenario with the people who would respond, in a staging environment or in production at low risk. <strong>Region evacuation drills</strong> move all traffic out of a production region for an hour, under controlled conditions, and measure whether the others absorb it within SLO. <strong>Chaos engineering</strong>, popularised by Netflix's Chaos Monkey (2011), injects failures continuously—killing instances, adding latency, partitioning networks—so that resilience is tested every day rather than discovered during an incident.</p>
+<p>For LLM services, drills should measure the quantities this chapter introduced: how quickly the traffic manager shifts load, how far TTFT rises in the receiving regions during the prefix-cache surge, whether reserved GPU capacity and quotas suffice, whether residency constraints are respected during the move (EU traffic stays in the EU), how long durable state takes to become available, and whether the control plane remains fully functional. The results feed back into capacity planning (Chapter 9) and into the reliability practice of the next chapter, which treats failures of all sizes, from one GPU to one region.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We now know how to steer traffic among regions, how to place demand with latency, cost, capacity and residency in view, how much follow-the-sun pooling saves, what state must move with users and how failover is designed and sized. A regional outage, though, is a rare and dramatic event. Most failures are small and constant: a GPU's memory develops errors, a node falls off the network, a software rollout introduces a regression, a dependency slows down. At the scale of thousands of GPUs these happen every day. How should reliability be defined and measured for an LLM service, how often do GPUs actually fail, how are failures detected and contained, and how are changes rolled out safely? Chapter 13 develops reliability engineering for AI services.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Multi-region serving balances latency, capacity, cost, residency and reliability; LLM text traffic tolerates tens of milliseconds, so capacity, cost and law weigh more than for web traffic.</li>
+<li>Traffic steering: DNS global load balancing (coarse, slowed by caching), anycast (fast but BGP picks routes by policy, not latency), and anycast plus edge proxies with a global traffic manager choosing regions per request.</li>
+<li>Region assignment is a transportation linear programme minimising cost plus a latency penalty subject to capacity and residency; dual prices value capacity per region. Latency weights differ by traffic class.</li>
+<li>Follow-the-sun pooling: global peak-to-mean \(=1+a_{\text{d}}|\sum_kw_ke^{2\pi i\phi_k/24}|\); for Atlas, 1.13 versus 1.6 for per-region peaks, about 29% less capacity.</li>
+<li>Residency covers prompts, KV and prefix caches, logs, conversations, files, vector stores, fine-tunes, monitoring samples and backups; resident traffic cannot pool and must fail over within its boundary, raising capacity needs.</li>
+<li>LLM services hold state: prefix caches (soft, but losing them on failover multiplies prefill, ≈ 2.5× for Atlas), conversations and files (replicate with an RPO), adapters, quotas, batch progress.</li>
+<li>Active-active (running spare, RTO seconds–minutes), active-passive (scale up standby, GPU-availability risk), pilot light (rebuild, hours). Failover must not depend on the failed region; prefer automatic load shifting plus deliberate evacuation.</li>
+<li>Spare to survive one region's loss: \(n_{\text{reg}}/(n_{\text{reg}}-1)\), reduced by tolerating higher utilisation during failover; largest-region share and residency boundaries dominate; add the cache surge.</li>
+<li>Test DR with game days, evacuation drills and chaos engineering, measuring shift speed, TTFT surge, capacity, residency compliance and control-plane independence.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci12-mcq-01" data-topic="§12.1 Why regions">
+<p class="q">Why does latency weigh less in region choice for LLM chat than for web pages?</p>
+<ol class="opts"><li>LLM requests are encrypted</li><li data-correct>Responses take seconds to generate, so tens of milliseconds of network delay are a small fraction</li><li>LLMs do not use TCP</li><li>Users cannot perceive latency</li></ol>
+<div class="explain">Voice, agents and code completion are exceptions.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-02" data-topic="§12.1 Why regions">
+<p class="q">Which forces push an LLM service into multiple regions? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>GPU capacity and quotas per region</li><li data-correct>Data residency</li><li data-correct>Surviving regional failures</li><li>Smaller model weights</li></ol>
+<div class="explain">Latency and cost are the other two.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-03" data-topic="§12.2 Steering">
+<p class="q">Why is DNS-based load balancing poor for fast failover?</p>
+<ol class="opts"><li>DNS is encrypted</li><li data-correct>Answers are cached by resolvers and clients for at least the TTL, often longer</li><li>DNS cannot return different addresses</li><li>DNS uses UDP</li></ol>
+<div class="explain">Good for steady-state placement, slow to change.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-04" data-topic="§12.2 Steering">
+<p class="q">Anycast routes each user to:</p>
+<ol class="opts"><li>The lowest-latency site, always</li><li data-correct>The site chosen by BGP policy and AS-path length, which is roughly but not reliably nearest</li><li>A random site</li><li>The least-loaded site</li></ol>
+<div class="explain">BGP does not measure delay or load.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-05" data-topic="§12.2 Steering">
+<p class="q">The advantage of anycast plus edge proxies with a global traffic manager is:</p>
+<ol class="opts"><li>No TLS needed</li><li data-correct>Per-request region choice using live health, capacity, latency and residency, reacting in seconds</li><li>Lower GPU cost</li><li>No backbone needed</li></ol>
+<div class="explain">It can also shift load away from a degraded but alive region.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-06" data-topic="§12.3 Assignment">
+<p class="q">The region-assignment problem with capacities and per-unit costs is a:</p>
+<ol class="opts"><li>Travelling salesman problem</li><li data-correct>Transportation linear programme</li><li>Knapsack problem</li><li>Graph colouring problem</li></ol>
+<div class="explain">Efficiently solvable; duals price capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-07" data-topic="§12.3 Assignment">
+<p class="q">What does the dual variable of a region's capacity constraint tell a planner?</p>
+<ol class="opts"><li>The region's latency</li><li data-correct>How much the objective would improve with one more unit of capacity there</li><li>The number of users</li><li>The residency rules</li></ol>
+<div class="explain">A shadow price for capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-08" data-topic="§12.3 Pooling">
+<p class="q">In Figure 12.2, the global peak is about 1.13 times mean demand, while regional peaks sum to 1.6. Pooling saves about:</p>
+<ol class="opts"><li>5%</li><li>13%</li><li data-correct>29%</li><li>60%</li></ol>
+<div class="explain">\(1-1.13/1.6\).</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-09" data-topic="§12.3 Pooling">
+<p class="q">Three equal regions with sinusoidal demand peaking 8 hours apart give a global total that is:</p>
+<ol class="opts"><li>Peakier</li><li data-correct>Flat</li><li>Zero</li><li>Twice as peaky</li></ol>
+<div class="explain">The phasors at 120° sum to zero.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-10" data-topic="§12.3 Pooling">
+<p class="q">Which traffic should not be pooled across continents? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Real-time voice</li><li data-correct>Residency-bound tenants' requests</li><li data-correct>Many-step agent loops with sequential calls</li><li>Latency-tolerant chat from non-resident users</li></ol>
+<div class="explain">Latency-tolerant, unrestricted chat is the pooled traffic.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-11" data-topic="§12.3 Pooling">
+<p class="q">When shifting US traffic to Europe at peak, why prefer moving new conversations?</p>
+<ol class="opts"><li>They are shorter</li><li data-correct>Their prefix caches do not exist yet, so moving them loses no cache hits</li><li>They pay more</li><li>They are encrypted differently</li></ol>
+<div class="explain">Continuing conversations would arrive with no cache.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-12" data-topic="§12.4 Residency">
+<p class="q">Which artefacts fall under a residency commitment? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>KV and prefix caches</li><li data-correct>Logs containing prompts</li><li data-correct>Fine-tunes trained on customer data</li><li>Base model weights</li></ol>
+<div class="explain">Base weights are not customer data.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-13" data-topic="§12.4 Residency">
+<p class="q">An EU tier with peak 1.6× mean that must survive losing one of its two regions needs installed capacity of about:</p>
+<ol class="opts"><li>1.13× mean</li><li>1.6× mean</li><li data-correct>3.2× mean</li><li>6.4× mean</li></ol>
+<div class="explain">\(1.6\times2\), with no pooling across the boundary.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-14" data-topic="§12.4 Residency">
+<p class="q">Why should residency be a tenant attribute that flows with every request?</p>
+<ol class="opts"><li>For billing only</li><li data-correct>Every component (routing, caching, logging, monitoring, failover) must enforce it consistently</li><li>It reduces latency</li><li>It is optional</li></ol>
+<div class="explain">Retrofitting it is error-prone.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-15" data-topic="§12.5 State">
+<p class="q">Prefix caches are "soft state" because:</p>
+<ol class="opts"><li>They are small</li><li data-correct>Losing them makes answers slower and costlier but never wrong</li><li>They are on disk</li><li>They are replicated</li></ol>
+<div class="explain">Their loss shows up as a prefill surge.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-16" data-topic="§12.5 State">
+<p class="q">After a failover with 60% of input tokens previously cached, the moved traffic's prefill demand rises by about:</p>
+<ol class="opts"><li>1.2×</li><li data-correct>2.5×</li><li>6×</li><li>10×</li></ol>
+<div class="explain">From 800 to 2,000 uncached tokens per request.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-17" data-topic="§12.5 State">
+<p class="q">RPO measures:</p>
+<ol class="opts"><li>Time to recover service</li><li data-correct>How much recent data may be lost in a disaster</li><li>Requests per operation</li><li>Region proximity</li></ol>
+<div class="explain">Asynchronous replication lag sets it.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-18" data-topic="§12.5 State">
+<p class="q">Why is synchronous cross-region replication rarely used for conversation state?</p>
+<ol class="opts"><li>It loses data</li><li data-correct>It adds a cross-region round trip to every write, while losing the last turn is tolerable</li><li>It is illegal</li><li>It increases RPO</li></ol>
+<div class="explain">Asynchronous replication gives RPO of seconds.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-19" data-topic="§12.6 Failover">
+<p class="q">Why are active-passive designs riskier for GPU services than for CPU services?</p>
+<ol class="opts"><li>GPUs are slower</li><li data-correct>Scaling up the standby needs GPUs that may be unobtainable when everyone fails over at once</li><li>GPUs cannot run in standby</li><li>Passive regions lack networks</li></ol>
+<div class="explain">Active-active keeps failover capacity running (static stability).</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-20" data-topic="§12.6 Failover">
+<p class="q">Which design has the shortest RTO?</p>
+<ol class="opts"><li data-correct>Active-active</li><li>Active-passive</li><li>Pilot light</li><li>Backups only</li></ol>
+<div class="explain">Capacity is already serving.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-21" data-topic="§12.6 Failover">
+<p class="q">A risk of fully automatic regional evacuation is:</p>
+<ol class="opts"><li>It is too slow</li><li data-correct>Monitoring failures or partitions can trigger unnecessary evacuations that cause load spikes and cache losses</li><li>It requires DNS</li><li>It cannot move traffic</li></ol>
+<div class="explain">Combine automatic load shifting with deliberate evacuation.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-22" data-topic="§12.6 Failover">
+<p class="q">Why must failover not depend on the failed region?</p>
+<ol class="opts"><li>For cost</li><li data-correct>Global services anchored in one region (DNS, identity, config, traffic manager) turn its failure into a global outage</li><li>Regulators require it</li><li>It reduces latency</li></ol>
+<div class="explain">Several major outages spread this way.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-23" data-topic="§12.7 Capacity">
+<p class="q">With demand spread evenly over 4 regions, surviving one loss at the same utilisation needs capacity of:</p>
+<ol class="opts"><li>1.0×</li><li>1.25×</li><li data-correct>1.33×</li><li>2.0×</li></ol>
+<div class="explain">\(n/(n-1)=4/3\).</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-24" data-topic="§12.7 Capacity">
+<p class="q">Allowing utilisation to rise from 75% to 90% during failover multiplies the required capacity by:</p>
+<ol class="opts"><li>1.2</li><li data-correct>0.83</li><li>0.75</li><li>0.9</li></ol>
+<div class="explain">\(0.75/0.9\).</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-25" data-topic="§12.7 Capacity">
+<p class="q">Why does an uneven distribution of traffic across regions increase spare-capacity needs?</p>
+<ol class="opts"><li>Large regions are slower</li><li data-correct>The others must absorb the largest region's share, which sets the spare</li><li>Small regions cost more</li><li>It does not</li></ol>
+<div class="explain">Keep regions similar in size where possible.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-26" data-topic="§12.7 Capacity">
+<p class="q">In Drill 12.1, rebalancing non-EU regions from 45/25/10 to 35/30/15 reduced required non-EU capacity from about 1.9× to about:</p>
+<ol class="opts"><li>1.0×</li><li data-correct>1.5×</li><li>1.7×</li><li>2.5×</li></ol>
+<div class="explain">The largest share fell from 45% to 35% of the non-EU 80%.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-27" data-topic="§12.8 Testing">
+<p class="q">What do region evacuation drills reveal that design reviews often miss? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Hidden dependencies on the evacuated region</li><li data-correct>Quotas or capacity that block scale-up</li><li data-correct>The size of the prefix-cache surge</li><li>The model's perplexity</li></ol>
+<div class="explain">Untested failover designs are hypotheses.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-28" data-topic="§12.8 Testing">
+<p class="q">Chaos engineering differs from game days mainly in that it:</p>
+<ol class="opts"><li>Only runs in staging</li><li data-correct>Injects failures continuously in production so resilience is tested routinely</li><li>Avoids production</li><li>Only tests networks</li></ol>
+<div class="explain">Popularised by Netflix's Chaos Monkey.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-29" data-topic="§12.3 Pooling">
+<p class="q">For regional weights \(w_k\) and peak hours \(\phi_k\), the global peak-to-mean ratio of sinusoidal demand with amplitude \(a_{\text{d}}\) is:</p>
+<ol class="opts"><li>\(1+a_{\text{d}}\)</li><li data-correct>\(1+a_{\text{d}}\left|\sum_kw_ke^{2\pi i\phi_k/24}\right|\)</li><li>\(1+a_{\text{d}}\sum_kw_k\)</li><li>\(a\)</li></ol>
+<div class="explain">Sum of phase-shifted sinusoids.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-30" data-topic="§12.5 State">
+<p class="q">Which state should be replicated to every serving region inside a tenant's boundary?</p>
+<ol class="opts"><li>KV cache blocks of every request</li><li data-correct>The tenant's fine-tunes and adapters</li><li>Raw GPU memory</li><li>TLS sessions</li></ol>
+<div class="explain">Otherwise failover meets cold starts or unavailability.</div>
+</div>
+
+<div class="mcq" data-id="ci12-mcq-31" data-topic="§12.2 Steering">
+<p class="q">Which component typically decides per request which region serves it?</p>
+<ol class="opts"><li>The engine</li><li>BGP</li><li data-correct>A global traffic manager feeding edge proxies</li><li>The client's operating system</li></ol>
+<div class="explain">Using live health, capacity, latency and residency.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci12-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Compare DNS-based global load balancing with anycast.</summary>
+<div class="answer">
+<p>DNS GSLB returns region-specific addresses per resolver based on location, latency, health and weights; universal and simple, but coarse (per resolver, not user) and slow to change (TTL caching, resolvers that ignore TTLs). Anycast announces the same IP from many sites via BGP; users reach a routing-nearest site; failover in seconds to minutes as routes converge; absorbs DDoS; but BGP picks routes by policy and AS-path length, not latency or load, and cannot express residency. Modern designs use anycast to edge proxies plus a global traffic manager that chooses the region per request.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Define RTO and RPO and give values appropriate to an LLM chat service.</summary>
+<div class="answer">
+<p>RTO (recovery time objective): maximum acceptable time the service is unavailable after a disaster. RPO (recovery point objective): maximum acceptable data loss, as time of recent writes lost. For an LLM chat API, active-active serving gives RTO of seconds to a few minutes (time to shift traffic and absorb the cache surge); conversation threads and files replicated asynchronously give RPO of seconds to a minute (the last turn may need resending); configuration and registries replicated strongly (near-zero RPO). Billing and usage records may need stronger guarantees.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What does a data-residency requirement change in an LLM service?</summary>
+<div class="answer">
+<p>All content-derived artefacts must stay in the boundary: request processing, KV and prefix caches, logs and traces with content, conversation state and files, vector stores, fine-tunes and adapters, monitoring and evaluation samples, backups, failover targets, and ideally encryption keys. Routing must never send resident traffic out (traffic manager policy), failover only within the boundary, support access controlled. Capacity rises because resident traffic can't pool globally and must cover its own peak plus in-boundary failover. Implement residency as a tenant attribute enforced everywhere; involve legal review.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-04">
+<summary><span class="lvl core">Core</span> How much capacity does follow-the-sun pooling save? Derive it.</summary>
+<div class="answer">
+<p>Model region \(k\) demand as \(w_k(1+a_{\text{d}}\cos(2\pi(\tau-\phi_k)/24))\). Without pooling, capacity is the sum of regional peaks: \((1+a_{\text{d}})\sum w_k=1+a_{\text{d}}\). With pooling, capacity is the global peak: the sum is \(1+a_{\text{d}}\,\mathrm{Re}[e^{2\pi i\tau/24}\sum_kw_ke^{-2\pi i\phi_k/24}]\), peaking at \(1+a_{\text{d}}|\sum_kw_ke^{2\pi i\phi_k/24}|\). For Atlas (45/35/20, peaks 8 h apart, a = 0.6): magnitude ≈ 0.22, global peak ≈ 1.13 vs 1.6, saving ≈ 29%. Equal thirds 8 h apart: flat. Limits: only latency-tolerant, non-resident traffic pools; weekends/holidays differ; cache losses when moving continuing sessions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-05">
+<summary><span class="lvl core">Core</span> What happens to prefix caches when you fail a region over, and how do you plan for it?</summary>
+<div class="answer">
+<p>Caches are local soft state; continuing conversations moved to another region arrive with no cached history, so their whole prompts must be prefilled—with 60% hit rates, prefill demand for moved traffic rises ~2.5× until caches rebuild over the next turns (minutes). The receiving region needs a prefill surge allowance on top of steady-state failover capacity, or TTFT spikes. Mitigate: disaggregated prefill pools that can borrow capacity, prefer moving new sessions during load shifting, replicate hot shared prefixes (system prompts) across regions, admission control and graceful degradation during the surge, and measure the surge in drills.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-06">
+<summary><span class="lvl core">Core</span> How much spare capacity do we need to survive a regional failure?</summary>
+<div class="answer">
+<p>For \(n\) equal regions keeping target utilisation, installed capacity = \(n/(n-1)\) × demand: 2× for two, 1.5× for three, 1.25× for five. Allowing higher utilisation during failover (75% → 90%) multiplies by 0.83. Uneven regions: spare is set by the largest region's share. Residency boundaries partition: an EU pair needs the two-region factor regardless of global footprint. Add the transient prefix-cache surge. Reduce cost by spreading over more similar regions, lending spare to preemptible work, and graceful degradation for residual shortfalls.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-07">
+<summary><span class="lvl core">Core</span> Formulate region selection as an optimisation problem.</summary>
+<div class="answer">
+<p>Variables \(x_{ij}\) = demand from area \(i\) served in region \(j\). Minimise \(\sum x_{ij}(c_j+\omega_\ell\ell_{ij})\) (cost plus monetised latency) subject to \(\sum_jx_{ij}=\lambda_i\) (serve all demand), \(\sum_ix_{ij}\le C_j\) (capacity at target utilisation), \(x_{ij}=0\) outside allowed sets (residency, contracts). A transportation LP, solved every few seconds by the traffic manager with live demand, capacity and latency; outputs routing weights. Separate classes with different \(\omega_\ell\) (voice high, chat low). Dual prices of capacity constraints feed capacity planning. Add cache-affinity terms (cost of moving continuing sessions) and hysteresis to avoid flapping.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-08">
+<summary><span class="lvl core">Core</span> Active-active or active-passive for an LLM API? Justify.</summary>
+<div class="answer">
+<p>Active-active for interactive serving: failover capacity is running and warm (weights loaded, caches partially warm, quotas proven), RTO seconds–minutes, no dependency on obtaining GPUs during a disaster when everyone else is also scrambling; spare can be lent to preemptible work. Active-passive saves standby cost but risks being unable to scale the standby (GPU scarcity, quotas, cold starts of many minutes), so RTO and success are uncertain. Pilot light is acceptable only for low-priority services or batch. Within residency boundaries with only two regions, active-active is still preferred but costs the full 2× factor.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Design the global traffic manager for Atlas.</summary>
+<div class="answer">
+<p>Inputs every few seconds: per-region health (error rates, TTFT/TPOT percentiles), capacity (spare GPU-equivalents per tier, queue depths), demand by area and class, measured edge-to-region latencies, tenant residency and contracts. Solve per-tier, per-class transportation LPs (or greedy heuristics) with latency weights by class, cache-affinity cost for continuing sessions, and residency constraints; apply hysteresis and rate limits on weight changes to avoid oscillation. Output weights to edge proxies; sessions sticky to their home region unless moved. Degradation: proportional load shedding away from unhealthy regions; full evacuation requires human confirmation. Replicated across regions with static stability (edges keep last weights if the manager is unavailable). Observability and drills.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Which LLM-service state needs replication, with what guarantees?</summary>
+<div class="answer">
+<p>Model registry and configuration: small, critical—strongly consistent replication across regions. Model weights and adapters: replicate artefacts to all serving regions within each boundary ahead of need (Chapter 5). Conversation threads, uploaded files: asynchronous replication with seconds-level RPO, residency-scoped; route sessions to a home region. Vector stores: replicated indexes or rebuildable from replicated documents (Chapter 16). Quotas and billing: per-region counters with a global ledger; billing records durable (stronger guarantees). Prefix/KV caches: soft—don't replicate generally, but optionally replicate hot shared prefixes. Batch outputs: checkpointed to replicated storage. Logs: residency-scoped, possibly content-redacted for global aggregation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why do regional outages often spread globally, and how do you prevent it?</summary>
+<div class="answer">
+<p>Hidden dependencies on a single region: global DNS zones, identity/auth services, configuration stores, control-plane APIs, container registries, monitoring and dashboards, or internal services whose primary lives in one region; when it fails, every region that calls it fails or cannot change configuration (e.g. cannot scale up to absorb traffic). Prevent: inventory dependencies per region (including transitively), replicate control-plane services across regions with static stability (data planes keep working with last-known state), avoid control-plane calls on the request path, run regional evacuation drills that also cut off the region's control-plane services, and design failover tooling that runs outside the failing region.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-12">
+<summary><span class="lvl design">Design</span> Design a multi-region LLM API serving US, EU and Asia users with EU residency for some tenants.</summary>
+<div class="answer">
+<p>Regions: two US, two EU, one or two APAC, similar sizes where possible. Edge: anycast PoPs with TLS, edge proxies, global traffic manager with residency-aware LP routing; EU-resident tenants pinned to EU regions; latency classes. Each region: gateway, routers, model pools for all tiers (some heavy tiers only in large regions), local caches. State: conversations/files replicated asynchronously within boundary; adapters replicated to all serving regions in boundary; registry/config globally replicated. Capacity: active-active with n/(n−1) spare, EU pair with 2× within-boundary spare (lent to EU batch), surge allowance for cache losses. Failover: automatic load shifting, human-confirmed evacuations, no single-region control-plane dependencies. Residency enforcement in logs, monitoring, support. Drills quarterly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-13">
+<summary><span class="lvl design">Design</span> A region has spare GPUs but higher latency for most users. When do you route traffic there?</summary>
+<div class="answer">
+<p>When the monetised latency penalty is smaller than the cost saving or capacity relief: for latency-tolerant chat and batch, an extra 50–150 ms RTT is under 1–2% of response time—route freely, especially at local peaks (follow-the-sun) or when local capacity is short; prefer new sessions to avoid cache losses. For voice, real-time agents, code completion and many-round-trip workflows, keep local. Respect residency. Account for egress (small) and cross-region dependencies (vector stores, files—may need local replicas or must stay home). Encode in per-class latency weights in the traffic manager's optimisation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-14">
+<summary><span class="lvl core">Core</span> How would you run a region-evacuation drill for an LLM service?</summary>
+<div class="answer">
+<p>Pick a low-risk window; announce; define success criteria (SLO maintained in receiving regions, residency respected, shift time, surge size). Gradually shift traffic out via the traffic manager, then full evacuation; also simulate loss of the region's control-plane services. Measure: time to shift, TTFT/TPOT percentiles and errors in receivers, prefill surge from cache loss, autoscaler behaviour and quota limits, GPU capacity headroom, state availability (conversations, files, adapters), dashboards and runbooks reachable. Restore gradually. Postmortem with action items into capacity plans and dependency fixes. Repeat regularly, rotating regions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> How do residency constraints change the economics of multi-region capacity?</summary>
+<div class="answer">
+<p>Resident traffic cannot join global pooling (lose the ~29% follow-the-sun saving), must be provisioned for its own peak, and must fail over within its boundary, often only two regions (factor 2 instead of n/(n−1) with many regions). Together this can mean ~3× installed capacity per unit of demand versus ~1.1–1.3× for pooled traffic. Mitigations: share resident regions' capacity with non-resident traffic originating locally, lend troughs to resident batch work, offer residency as a priced tier reflecting its cost, add a third in-boundary region if demand justifies it (factor 1.5), and use graceful degradation within the boundary for rare failures.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci12-qa-16">
+<summary><span class="lvl warm">Warm-up</span> Why do large services run in several regions rather than two?</summary>
+<div class="answer">
+<p>Spare capacity to survive one region's loss is n/(n−1): 100% extra with two regions, 50% with three, 25% with five. More regions also improve latency for more users, reduce correlated risk, and give access to more GPU capacity and quotas. Costs: more operational complexity, replication, and capacity fragmentation (each region needs minimum footprints per model). Most large services settle on several similar-sized regions plus residency-specific ones.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li>Y. Rekhter, T. Li, S. Hares. A Border Gateway Protocol 4 (BGP-4). RFC 4271, 2006.</li>
+<li>T. Flach et al. Reducing Web Latency: the Virtue of Gentle Aggression. <em>SIGCOMM</em>, 2013.</li>
+<li>K.-K. Yap et al. Taking the Edge off with Espresso: Scale, Reliability and Programmability for Global Internet Peering. <em>SIGCOMM</em>, 2017.</li>
+<li>B. Schlinker et al. Engineering Egress with Edge Fabric: Steering Oceans of Content to the World. <em>SIGCOMM</em>, 2017.</li>
+<li>F. L. Hitchcock. The Distribution of a Product from Several Sources to Numerous Localities. <em>Journal of Mathematics and Physics</em> 20, 1941 (the transportation problem).</li>
+<li>European Union. Regulation (EU) 2016/679 (General Data Protection Regulation), Chapter V: transfers of personal data to third countries.</li>
+<li>B. Weiss, M. Furr. Static stability using Availability Zones. <em>The Amazon Builders' Library</em>, 2020.</li>
+<li>A. Basiri et al. Chaos Engineering. <em>IEEE Software</em> 33(3), 2016.</li>
+<li>B. Beyer et al. (eds.). <em>Site Reliability Engineering</em>, chapters on data integrity and disaster recovery. O'Reilly, 2016.</li>
+<li>A. Qureshi et al. Cutting the Electric Bill for Internet-Scale Systems. <em>SIGCOMM</em>, 2009 (geographic load balancing for cost).</li>
+<li>Amazon Web Services. Post-event summaries of regional service events, including the us-east-1 event of October 2025.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

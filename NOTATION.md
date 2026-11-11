@@ -302,3 +302,11 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(\mu\), \(t_{\text{dl}}\) | service rate of a queue; request deadline |
 | \(\Delta\) (Ch. 11 only) | synchronisation interval of distributed rate limiters |
 | \(p\), \(k\) (Ch. 11 only) | probability an attempt fails; maximum retries |
+
+## Multi-region (Vol. II Ch. 12)
+| Symbol | Meaning |
+|---|---|
+| \(\lambda_i\), \(x_{ij}\), \(C_j\), \(c_j\), \(\ell_{ij}\) | demand of client area \(i\); demand from \(i\) served in region \(j\); capacity and unit cost of region \(j\); round-trip latency |
+| \(\omega_\ell\), \(\mathcal A_i\) | monetised latency weight per ms; regions allowed for area \(i\) |
+| \(w_k\), \(\phi_k\), \(a_{\text{d}}\) | region \(k\)'s share of demand, hour of its daily peak, daily amplitude |
+| \(n_{\text{reg}}\) | number of regions sharing a load |
