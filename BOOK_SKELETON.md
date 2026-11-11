@@ -315,7 +315,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 10 | The Economics of Inference | ✅ v1 |
 | 11 | The Front Door: Gateways, Streaming and Rate Limits | ✅ v1 |
 | 12 | Multi-Region Serving and Disaster Recovery | ✅ v1 |
-| 13 | Reliability Engineering for AI Services | ⏳ |
+| 13 | Reliability Engineering for AI Services | ✅ v1 |
 | 14 | Security, Isolation and Multi-Tenancy | ⏳ |
 | 15 | Serving Multimodal Models | ⏳ |
 | 16 | Embeddings, Retrieval and Vector Search at Scale | ⏳ |

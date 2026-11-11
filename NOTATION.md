@@ -310,3 +310,10 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(\omega_\ell\), \(\mathcal A_i\) | monetised latency weight per ms; regions allowed for area \(i\) |
 | \(w_k\), \(\phi_k\), \(a_{\text{d}}\) | region \(k\)'s share of demand, hour of its daily peak, daily amplitude |
 | \(n_{\text{reg}}\) | number of regions sharing a load |
+
+## Reliability (Vol. II Ch. 13)
+| Symbol | Meaning |
+|---|---|
+| \(\mathcal A\), MTBF, MTTR | availability; mean time between failures; mean time to repair |
+| \(\epsilon_{\text{SLO}}\), \(T_{\text{win}}\), \(\varrho_b\) | error budget (allowed bad fraction); SLO window; burn rate (not the importance ratio \(\varrho_t\)) |
+| \(e_0\), \(e_1\), \(n\) (Ch. 13 only) | baseline and regressed error rates; canary requests needed |

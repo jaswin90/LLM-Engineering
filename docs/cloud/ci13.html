@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 13 · Reliability Engineering for AI Services — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 13 of Cloud AI Infrastructure: SLIs, SLOs and error budgets for LLM services; availability mathematics for series, parallel and k-of-n systems; how GPUs fail and how often at fleet scale; silent data corruption; layered health checking, quarantine and automated remediation; safe change with progressive rollouts and statistical canaries; graceful degradation; and incident response and postmortems.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci13" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part IV · The Global Request Path — Chapter 13</div>
+<h1 id="top">Reliability Engineering for AI Services</h1>
+<p class="lede">At the scale of thousands of GPUs, something is always broken: a GPU's memory develops errors, a node drops off the network, a kernel upgrade introduces a numerical bug, a configuration push misroutes traffic. Reliability engineering is the discipline of defining what "working" means, measuring it, designing systems that keep working while parts fail, changing them without breaking them, and learning from the failures that get through. This chapter develops it for LLM services, from error budgets and availability algebra to GPU failure rates, silent data corruption, health checking, progressive rollout and incident response.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Previous chapters touched reliability repeatedly: failure domains (§1.2), redundancy in power (§2.4), group failure of multi-node replicas (§6.6), spare capacity for zone and regional failure (§7.4, §12.7), and the cost of slow recovery (§5.8). This chapter gathers those threads into a practice. Its first lesson is that reliability is not an absolute: a service that never fails is impossibly expensive, so the question is how reliable it should be, measured how, and paid for how. Its second lesson is that most outages are caused not by hardware but by change—deployments, configuration pushes, model rollouts—so safe change is the core of the discipline. Its third lesson is specific to AI: an LLM service can fail by being <em>wrong</em> without being down—a numerical bug, a silently corrupting GPU or a bad model version can produce plausible but incorrect output for hours before anyone notices.</p>
+<p>Site-reliability engineering, as developed at Google and described in its widely read books, is the standard vocabulary for these questions, and infrastructure interviews use it: "define SLOs for an LLM API", "how many GPU failures a day should a 10,000-GPU fleet expect?", "how would you detect a GPU that silently corrupts results?", "design a rollout process that catches a 0.05% error-rate regression", "walk me through how you would run an incident". This chapter answers them.</p>
+<p>We begin with service-level indicators, objectives and error budgets (§13.1), then the algebra of availability (§13.2). We look at how GPUs fail and how often (§13.3), how failures are detected and contained (§13.4), how changes are rolled out safely (§13.5), how a service degrades gracefully under stress (§13.6), and how incidents are run and learned from (§13.7). We close with failure modes specific to LLMs (§13.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Define SLIs and SLOs for an LLM service, including latency and quality indicators, and use error budgets and burn-rate alerts.</li>
+<li>Compute the availability of series, parallel and k-of-n systems and relate availability to MTBF and MTTR.</li>
+<li>Estimate GPU failure rates and their consequences for fleets and multi-GPU replicas, using published data.</li>
+<li>Design layered health checks, including golden-prompt checks for silent data corruption, and an automated remediation pipeline.</li>
+<li>Design progressive rollouts with statistically sound canaries, and compute the traffic needed to detect a regression.</li>
+<li>Apply graceful degradation and run incidents and blameless postmortems.</li>
+</ol>
+<p class="small muted">Uses: Chapters 1, 5, 6, 7, 8, 11 and 12 of this volume; Vol. I §4.7 (determinism) and Chapter 28 (observability).</p>
+</div>
+
+<h2 id="s13-1">13.1 Defining reliability: SLIs, SLOs and error budgets</h2>
+<p>Reliability begins with measurement. A <strong>service-level indicator</strong> (SLI) is a quantity that measures some aspect of the service as users experience it, usually expressed as the fraction of good events: the fraction of requests that succeed, the fraction whose time to first token is below 500 ms, the fraction of streamed responses whose time per output token is below 50 ms. A <strong>service-level objective</strong> (SLO) is a target for an SLI over a window: "99.9% of requests succeed over each rolling 30 days". A <strong>service-level agreement</strong> (SLA) is a contractual promise, usually looser than the internal SLO, with financial consequences if broken. The distinction matters: SLOs are engineering targets that the team chooses and can change; SLAs are commitments to customers.</p>
+<p>For an LLM service, a good set of SLIs covers four aspects. <em>Availability</em>: the fraction of requests that complete without a server-side error (excluding errors that are the client's fault, such as invalid requests, and counting rate-limit rejections according to policy). <em>Responsiveness</em>: the fraction of requests whose TTFT meets a threshold that depends on prompt length (a 100,000-token prompt cannot have the same TTFT target as a 100-token one, so thresholds are often per length bucket). <em>Streaming smoothness</em>: the fraction of responses whose TPOT, or whose longest gap between tokens, meets a threshold. <em>Completeness</em>: the fraction of streams that end normally rather than being cut off. Quality—whether the answers are good—is harder to make an SLI, but proxies such as refusal rates, empty or truncated responses, and the outcome of automatic checks on sampled outputs can be tracked (§13.8).</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — error budgets and burn rates</div>
+<p>An SLO of \(1-\epsilon_{\text{SLO}}\) over a window of length \(T_{\text{win}}\) allows a fraction \(\epsilon_{\text{SLO}}\) of bad events: the <em>error budget</em>. At 99.9% over 30 days, the budget is 0.1% of requests, equivalent to about 43 minutes of total outage. The <em>burn rate</em> \(\varrho_b\) is the ratio of the current bad-event rate to the budgeted rate \(\epsilon_{\text{SLO}}\): at \(\varrho_b=1\) the budget is exhausted exactly at the end of the window; at \(\varrho_b=14.4\) it is exhausted in \(30/14.4\approx2\) days, and one hour at that rate consumes 2% of a month's budget. Alerting on burn rate over two windows—page if the burn rate exceeds 14.4 over both the last hour and the last five minutes, open a ticket if it exceeds 1 over three days—detects fast and slow problems while ignoring brief noise, a scheme described in Google's SRE workbook. The error budget also converts reliability into a resource: while budget remains, the team may spend it on risky changes; when it is exhausted, changes slow down until reliability recovers.</p>
+</div>
+
+<p>Choosing SLO values is an economic decision. Each additional "nine" of availability costs roughly ten times as much as the last—more redundancy, more spare capacity, slower and more careful change—and users cannot distinguish a service that is 99.99% available from one that is 99.999% available if their own network and devices fail more often than either. For LLM APIs, availability SLOs between 99.9% and 99.99% are typical, latency SLOs are stated at the 95th or 99th percentile, and the hardest commitments are reserved for enterprise tiers that pay for dedicated or provisioned capacity. Figure 13.1 shows how these pieces relate.</p>
+
+<figure class="diagram" id="fig-13-1">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="From SLIs to SLOs, error budgets and policies">
+<defs><marker id="a131" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="40" width="150" height="110" rx="8" class="bx"/><text x="90" y="62" text-anchor="middle" class="t-xs t-b">SLIs (measured)</text><text x="90" y="82" text-anchor="middle" class="t-xs">success fraction</text><text x="90" y="98" text-anchor="middle" class="t-xs">TTFT ≤ target (per length)</text><text x="90" y="114" text-anchor="middle" class="t-xs">TPOT / max gap ≤ target</text><text x="90" y="130" text-anchor="middle" class="t-xs">streams completed</text>
+<rect x="195" y="40" width="150" height="110" rx="8" class="bx4"/><text x="270" y="62" text-anchor="middle" class="t-xs t-b">SLOs (targets)</text><text x="270" y="82" text-anchor="middle" class="t-xs">99.9% success / 30 d</text><text x="270" y="98" text-anchor="middle" class="t-xs">95% TTFT ≤ 1 s</text><text x="270" y="114" text-anchor="middle" class="t-xs">99% TPOT ≤ 60 ms</text><text x="270" y="130" text-anchor="middle" class="t-xs">per tier and model</text>
+<rect x="375" y="40" width="150" height="110" rx="8" class="bx2"/><text x="450" y="62" text-anchor="middle" class="t-xs t-b">error budget</text><text x="450" y="82" text-anchor="middle" class="t-xs">0.1% of requests</text><text x="450" y="98" text-anchor="middle" class="t-xs">≈ 43 min / month</text><text x="450" y="114" text-anchor="middle" class="t-xs">burn-rate alerts</text><text x="450" y="130" text-anchor="middle" class="t-xs">(1 h &amp; 5 min windows)</text>
+<rect x="555" y="40" width="150" height="110" rx="8" class="bx3"/><text x="630" y="62" text-anchor="middle" class="t-xs t-b">policy</text><text x="630" y="82" text-anchor="middle" class="t-xs">budget left: ship</text><text x="630" y="98" text-anchor="middle" class="t-xs">budget gone: freeze</text><text x="630" y="114" text-anchor="middle" class="t-xs">risky changes, fix</text><text x="630" y="130" text-anchor="middle" class="t-xs">reliability first</text>
+<line x1="165" y1="95" x2="193" y2="95" class="ln" marker-end="url(#a131)"/><line x1="345" y1="95" x2="373" y2="95" class="ln" marker-end="url(#a131)"/><line x1="525" y1="95" x2="553" y2="95" class="ln" marker-end="url(#a131)"/>
+<rect x="15" y="170" width="690" height="44" rx="8" class="bx5"/>
+<text x="360" y="190" text-anchor="middle" class="t-xs">SLA (contract) is looser than the SLO and carries credits; the SLO is the engineering target with room before the SLA is breached.</text>
+<text x="360" y="206" text-anchor="middle" class="t-xs">Example values are illustrative; thresholds should depend on prompt length and tier.</text>
+</svg>
+<figcaption><b>Figure 13.1 — From measurement to policy.</b> SLIs measure user-visible behaviour; SLOs set targets; the error budget is the allowed shortfall; the policy decides how fast to change the system depending on how much budget remains.</figcaption>
+</figure>
+
+<div class="box example">
+<div class="box-title">Worked example — what an incident costs Atlas's error budget</div>
+<p><strong>SLOs.</strong> Atlas's enterprise tier promises 99.95% request success over 30 days; its standard tier 99.9%. At an average of 5,600 requests/s (Chapter 1), a month has about \(1.45\times10^{10}\) requests; the enterprise tier carries 20% of them, \(2.9\times10^{9}\), so its budget is \(0.0005\times2.9\times10^{9}\approx1.45\) million failed requests.</p>
+<p><strong>Incident.</strong> A bad configuration push sends 30% of enterprise traffic in one region (which carries 40% of enterprise traffic) to replicas without the right adapter, failing those requests for 25 minutes before rollback. Enterprise traffic is about 1,100 requests/s on average, so failures are \(1100\times0.4\times0.3\times1500\approx198{,}000\) requests.</p>
+<p><strong>Budget consumed.</strong> About 14% of the month's enterprise budget in one incident. The burn rate during it was \(0.4\times0.3/0.0005=240\)—a page within a minute or two under the multiwindow rule—so the 25 minutes were mostly diagnosis and rollback time.</p>
+<p><strong>What would have helped.</strong> A canary in one cell would have limited the failure to a few percent of the region's traffic; automatic rollback on a burn-rate spike would have cut 25 minutes to five. Either alone would have reduced the cost to under 1% of the budget.</p>
+</div>
+
+<h2 id="s13-2">13.2 The algebra of availability</h2>
+<p>A service is built from components, and its availability follows from theirs by a few rules that every infrastructure engineer should be able to apply in their head. The <strong>availability</strong> of a component that fails on average every MTBF (mean time between failures) and takes MTTR (mean time to repair) to recover is the fraction of time it is up:</p>
+\[
+\mathcal A=\frac{\text{MTBF}}{\text{MTBF}+\text{MTTR}}\approx1-\frac{\text{MTTR}}{\text{MTBF}} .
+\]
+<p>The formula's second form is the useful one: unavailability is the ratio of repair time to time between failures, so halving the time to recover is exactly as valuable as halving the failure rate—and usually much cheaper. That is why the cold-start engineering of Chapter 5 and the automated remediation of §13.4 are reliability work.</p>
+<p>Components combine in three patterns. In <strong>series</strong>, every component must work, as for the gateway, router and engine on a request's path; if failures are independent, availabilities multiply, \(\mathcal A=\prod_i\mathcal A_i\), and unavailabilities approximately add. In <strong>parallel</strong>, any one of several redundant components suffices, so unavailabilities multiply: \(\mathcal A=1-\prod_i(1-\mathcal A_i)\). In <strong>k-of-n</strong>, at least \(k\) of \(n\) identical components must work—a pool that needs 20 of its 22 replicas to meet its SLO—and the availability is a binomial tail,</p>
+\[
+\mathcal A_{k\text{-of-}n}=\sum_{j=k}^{n}\binom{n}{j}\mathcal A_1^{\,j}(1-\mathcal A_1)^{n-j} .
+\]
+
+<div class="box example">
+<div class="box-title">Worked example — the availability of Atlas's request path</div>
+<p><strong>Series.</strong> A request passes the edge, the regional load balancer, the gateway, the authentication cache, the rate-limit store, the router and a replica pool—seven components. If each were 99.95% available and independent, the path would be \(0.9995^7\approx99.65\%\) available: about 2.5 hours of outage a month, well below a 99.9% SLO.</p>
+<p><strong>Parallel within each.</strong> Each component is in fact replicated: if each has two independent instances of 99.95%, each component is \(1-0.0005^2=99.999975\%\) available, and the path about 99.9998%. The weakest link becomes whatever is <em>not</em> replicated or whose replicas fail together—a shared configuration, a single rate-limit store, a common software bug.</p>
+<p><strong>k-of-n for the pool.</strong> The 70B tier needs 233 replicas at full use and runs about 311 (Chapter 1), so it meets its throughput SLO with up to 78 replicas missing; with each replica 99.9% available, the chance that more than 78 are simultaneously down is astronomically small. The pool's real risk is correlated loss—a rack, a zone, a bad rollout—not independent failures.</p>
+<p><strong>Lesson.</strong> Independent failures are easy to engineer away with redundancy; correlated failures, and components on the path that cannot be made redundant, set the achievable availability.</p>
+</div>
+
+<p>Figure 13.2 plots the series rule as downtime per month against the number of components on the request path, with and without redundancy within each. Its message is the one Dean and Barroso made about latency tails (§11.1), applied to failures: every dependency on the path spends some of the budget, so dependencies must be few, replicated and independent.</p>
+
+<figure class="chart" id="fig-13-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Expected downtime per month of a request path, components 99.95% available each","height":320,
+ "x":{"label":"Components in series on the request path","min":1,"max":10,"ticks":[1,2,4,6,8,10]},
+ "y":{"label":"Minutes of downtime per month (log)","log":true,"min":0.005,"max":300,"ticks":[0.01,0.1,1,10,100]},
+ "series":[
+  {"name":"Each component single","color":"s2","points":[[1,21.9],[2,43.8],[4,87.6],[6,131.3],[8,175],[10,219]]},
+  {"name":"Each component duplicated (independent)","color":"s3","points":[[1,0.011],[2,0.022],[4,0.044],[6,0.066],[8,0.088],[10,0.11]]}
+ ],
+ "hlines":[{"y":43.8,"text":"99.9% SLO budget"},{"y":4.38,"text":"99.99%"}]}
+</script>
+<figcaption><b>Figure 13.2 — Dependencies spend the error budget.</b> Ten unreplicated components at 99.95% each exhaust five 99.9% budgets a month; duplicating each one (with independent failures) reduces downtime to seconds. In practice, correlated failures and shared dependencies sit between the two lines.</figcaption>
+</figure>
+
+<h2 id="s13-3">13.3 How GPUs fail, and how often</h2>
+<p>The best public data on GPU failures at scale comes from large training runs, where every interruption is recorded. The Llama 3 paper reported that during a 54-day snapshot of pre-training on 16,384 H100 GPUs there were 466 job interruptions, of which 47 were planned (maintenance) and 419 unexpected, and that about 78% of the unexpected ones were attributed to confirmed or suspected hardware problems<span class="cite"><a href="#r-llama3">[1]</a></span>. The largest categories were faulty GPUs (about 30% of unexpected interruptions), GPU HBM3 memory (about 17%), software bugs (about 13%), network switches and cables (about 8%) and host maintenance (about 8%), with smaller shares for GPU SRAM, GPU system processors, NICs, silent data corruption and thermal problems.</p>
+<p>From these numbers we can estimate a failure rate for planning. 419 unexpected interruptions over \(16{,}384\times54\times24\approx2.1\times10^{7}\) GPU-hours is about \(2\times10^{-5}\) interruptions per GPU-hour, a mean time between interruptions of roughly 50,000 hours, or about six years, per GPU. That sounds reassuring until it is multiplied by a fleet: Figure 13.3 shows the expected number of interruptions per day as a function of fleet size. Atlas's 4,000 GPUs should expect about two per day; a 100,000-GPU fleet, about 50.</p>
+
+<figure class="chart" id="fig-13-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Expected GPU-caused interruptions per day against fleet size","height":320,
+ "x":{"label":"GPUs in the fleet (log)","log":true,"min":800,"max":120000,"ticks":[1000,4000,16384,100000]},
+ "y":{"label":"Interruptions per day (log)","log":true,"min":0.3,"max":200,"ticks":[0.5,1,2,5,10,20,50,100]},
+ "series":[
+  {"name":"Llama 3 rate (≈ 2×10⁻⁵ per GPU-hour)","color":"s1","points":[[1000,0.47],[4000,1.9],[16384,7.8],[100000,47.3]]},
+  {"name":"3× (new fleet in burn-in, or harsher conditions)","color":"s2","points":[[1000,1.42],[4000,5.7],[16384,23.3],[100000,142]]}
+ ]}
+</script>
+<figcaption><b>Figure 13.3 — At fleet scale, failure is a daily event.</b> Rates are derived from the Llama 3 training report (419 unexpected interruptions in 54 days on 16,384 H100s). New hardware often fails more in its first months ("infant mortality"), and inference fleets that change configuration more often may see more software-caused interruptions.</figcaption>
+</figure>
+
+<p>The rate is not constant over a GPU's life. Electronics follow a "bathtub curve": a period of elevated <em>infant mortality</em> in the first weeks or months, as manufacturing defects reveal themselves under load; a long flat period of random failures; and a rising <em>wear-out</em> phase late in life. For accelerators, infant mortality is significant—new clusters routinely run burn-in workloads for days before accepting production traffic, and operators often report several times the steady-state failure rate in a new fleet's first months, which is why Figure 13.3 shows a second, higher line. Memory degradation also accumulates: HBM rows that have produced correctable errors are more likely to produce uncorrectable ones, which is why drivers remap failing rows and why rising correctable-error counts are a useful early warning to drain a GPU before it fails during a request.</p>
+<p>For inference, what matters is not only how often GPUs fail but what each failure takes with it. A failed GPU in a tensor-parallel group takes down its whole replica: eight GPUs for a TP8 70B replica, 32 or more for a multi-node DeepSeek-V3 replica (§6.6). The number of replica outages equals the number of GPU failures, but each removes a larger share of capacity for larger replicas, and its in-flight requests fail. The time a GPU spends out of service, from detection through draining, diagnosis, repair or replacement and validation, ranges from minutes (a reset that clears a transient error) to days (a hardware replacement that needs a technician and a part); at a mean of, say, 24 hours, a 4,000-GPU fleet has about two GPUs—and therefore up to two replicas' worth of capacity—out of service at any moment, which the spare capacity \(s_{\text{spare}}\) of Chapter 1 must cover.</p>
+<p>The GPU driver reports many faults through <strong>Xid</strong> error codes in the kernel log, and a fleet's health agent watches them (§6.5): uncorrectable ECC errors in HBM, row-remapping events that indicate degrading memory, a GPU that has "fallen off the bus" and stopped responding on PCIe, NVLink errors, and errors that usually indicate an application bug rather than hardware. Some faults are clear-cut and require replacing the part; others are transient and clear with a reset; and a small, important class produces no error at all.</p>
+<p>That class is <strong>silent data corruption</strong> (SDC): hardware that computes wrong answers without reporting an error, because a marginal transistor flips a bit under particular conditions of voltage, temperature and workload. Studies of large CPU fleets by Meta and Google in 2021 found that SDC-producing processors occurred at a rate of about one in a thousand machines—far higher than assumed—and that they were hard to detect because the corruption was data- and condition-dependent<span class="cite"><a href="#r-sdc">[2]</a></span><span class="cite"><a href="#r-cores">[3]</a></span>. Accelerators are subject to the same physics, and the Llama 3 report lists silent data corruption among its interruption causes. For training, SDC shows up as loss spikes or divergence. For inference it is more insidious: a corrupting GPU produces tokens that are slightly or badly wrong, the response is still well-formed, and no error is raised. Detecting it requires checking answers, which is the subject of the next section.</p>
+
+<details class="drill">
+<summary>Drill 13.1 — Spare capacity for GPU failures</summary>
+<p>Atlas's 70B tier runs 311 TP8 replicas (2,488 GPUs) at peak. Using the Llama 3 interruption rate and a mean time out of service of 12 hours per failed GPU, how many replicas are down on average, and how many spare replicas keep the tier at full capacity 99.9% of the time? What changes if each replica were a 32-GPU group?</p>
+<p><em>Solution.</em> GPU failures per hour: \(2488\times2\times10^{-5}\approx0.05\); each removes one replica for 12 h, so on average \(0.05\times12\approx0.6\) replicas are down. With failures independent, the number down is approximately Poisson with mean 0.6, and \(\Pr(\le3\text{ down})\approx0.9966\), \(\Pr(\le4)\approx0.9996\): four spare replicas (32 GPUs, 1.3%) suffice for 99.9%. With 32-GPU replicas, the same 2,488 GPUs form about 78 replicas; failures still occur at 0.05 per hour, each now removing 32 GPUs: mean 0.6 replicas down, but each is four times as much capacity, so four spare replicas are 128 GPUs (5%). Faster recovery helps both: with a 2-hour mean time out of service, the mean falls to 0.1 and one or two spares suffice.</p>
+</details>
+
+<h2 id="s13-4">13.4 Detecting and containing failures</h2>
+<p>A failure that is detected and contained quickly costs a few seconds of capacity; one that lingers costs latency, errors or wrong answers for hours. Detection works best in layers, each catching failures the others miss. <em>Process liveness</em> notices a crashed engine. <em>Engine progress</em> notices an engine that is alive but stuck—its step counter not advancing while requests queue (§6.7). <em>Hardware health</em> from DCGM and Xid codes notices memory errors, fallen GPUs, thermal throttling and NVLink faults. <em>Performance outliers</em> notice a replica whose throughput or latency is far worse than its siblings on the same hardware, which often reveals a degraded GPU, a bad NIC or a noisy neighbour. And <em>golden-prompt checks</em>—synthetic requests with known correct outputs, run periodically on every replica with greedy decoding and fixed seeds—notice replicas whose answers have changed, the only practical defence against silent data corruption and numerical bugs in inference.</p>
+<p>Golden-prompt checks deserve a closer look because they are specific to AI and easy to get wrong. A check compares a replica's output for a fixed prompt with a reference. Exact comparison works only if the engine is deterministic for that request, which requires batch-invariant kernels or running the check alone; otherwise harmless floating-point differences make outputs diverge after a few tokens (Vol. I §4.7). A more robust check compares the log-probabilities the replica assigns to a reference continuation (teacher forcing) with reference values, flagging deviations beyond a tolerance; corruption that matters produces large deviations, while benign numerical noise produces small ones. Checks should exercise every GPU of a replica (all tensor-parallel ranks participate in every forward pass, so one request covers them) and should run often enough that a corrupting GPU is caught within minutes, not days.</p>
+<p>Once a fault is detected, the response should be automatic and conservative, following a state machine like Figure 13.4. The node is <strong>cordoned</strong> (no new pods) and its replicas <strong>drained</strong> (no new requests, in-flight work finished or resumed elsewhere, §6.7). Automated <strong>diagnosis</strong> runs DCGM diagnostics, memory tests and a golden-prompt suite. Depending on the result, the node is <strong>reset</strong> (driver reload or GPU reset for transient faults), <strong>rebooted</strong> or <strong>reimaged</strong>, or sent for <strong>repair</strong> (a ticket to replace a GPU, a cable or a board). Before it returns to service it is <strong>validated</strong> with a burn-in workload. Two safeguards keep the machine from doing harm: a rate limit on how many nodes may be taken out of service at once (so that a monitoring bug cannot drain the fleet), and quarantine of nodes that fail repeatedly ("flapping"), which go to human review.</p>
+
+<figure class="diagram" id="fig-13-4">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Automated remediation state machine for GPU nodes">
+<defs><marker id="a134" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="100" width="95" height="50" rx="8" class="bx3"/><text x="62" y="122" text-anchor="middle" class="t-xs t-b">serving</text><text x="62" y="138" text-anchor="middle" class="t-xs">healthy</text>
+<rect x="135" y="100" width="105" height="50" rx="8" class="bx2"/><text x="187" y="122" text-anchor="middle" class="t-xs t-b">cordon + drain</text><text x="187" y="138" text-anchor="middle" class="t-xs">resume streams</text>
+<rect x="265" y="100" width="100" height="50" rx="8" class="bx4"/><text x="315" y="122" text-anchor="middle" class="t-xs t-b">diagnose</text><text x="315" y="138" text-anchor="middle" class="t-xs">DCGM, golden</text>
+<rect x="395" y="20" width="110" height="44" rx="8" class="bx"/><text x="450" y="47" text-anchor="middle" class="t-xs">reset / reboot</text>
+<rect x="395" y="103" width="110" height="44" rx="8" class="bx"/><text x="450" y="130" text-anchor="middle" class="t-xs">reimage</text>
+<rect x="395" y="186" width="110" height="44" rx="8" class="bx5"/><text x="450" y="206" text-anchor="middle" class="t-xs">repair ticket</text><text x="450" y="220" text-anchor="middle" class="t-xs">(replace part)</text>
+<rect x="535" y="100" width="90" height="50" rx="8" class="bx4"/><text x="580" y="122" text-anchor="middle" class="t-xs t-b">validate</text><text x="580" y="138" text-anchor="middle" class="t-xs">burn-in</text>
+<rect x="640" y="186" width="70" height="44" rx="8" class="bx2"/><text x="675" y="206" text-anchor="middle" class="t-xs">quarantine</text><text x="675" y="220" text-anchor="middle" class="t-xs">(human)</text>
+<line x1="110" y1="125" x2="133" y2="125" class="ln" marker-end="url(#a134)"/><line x1="240" y1="125" x2="263" y2="125" class="ln" marker-end="url(#a134)"/>
+<line x1="365" y1="115" x2="393" y2="45" class="ln" marker-end="url(#a134)"/><line x1="365" y1="125" x2="393" y2="125" class="ln" marker-end="url(#a134)"/><line x1="365" y1="135" x2="393" y2="205" class="ln" marker-end="url(#a134)"/>
+<line x1="505" y1="45" x2="545" y2="100" class="ln" marker-end="url(#a134)"/><line x1="505" y1="125" x2="533" y2="125" class="ln" marker-end="url(#a134)"/><line x1="505" y1="205" x2="550" y2="152" class="ln" marker-end="url(#a134)"/>
+<path d="M580,100 C580,60 62,60 62,98" class="ln ln-s3" fill="none" marker-end="url(#a134)"/>
+<text x="300" y="72" text-anchor="middle" class="t-xs t-s3">pass: return to service</text>
+<line x1="610" y1="150" x2="650" y2="184" class="ln ln-s2" marker-end="url(#a134)"/>
+<text x="640" y="170" class="t-xs t-s2">fail again</text>
+<text x="20" y="250" class="t-xs">Safeguards: cap on nodes out of service at once; quarantine for repeat offenders; every transition logged for fleet-level failure analysis.</text>
+</svg>
+<figcaption><b>Figure 13.4 — From detection to return to service.</b> A detected fault drains the node without dropping work, diagnosis chooses the cheapest effective remedy, and validation gates the return. Rate limits and quarantine stop the automation from amplifying a monitoring error or a recurring fault.</figcaption>
+</figure>
+
+<p>Containment also means limiting the blast radius of failures that are not caught in time. The topology spread constraints of §7.4 keep a model's replicas across racks and zones; the cells of §12.6 keep a region's tenants in independent stacks; disruption budgets limit voluntary removals (§6.7); and circuit breakers in routers stop sending traffic to replicas whose error rates spike, even before health checks conclude. Each of these converts a potentially large correlated failure into a bounded one.</p>
+
+<h2 id="s13-5">13.5 Safe change</h2>
+<p>Most outages of large services are caused by change—code deployments, configuration pushes, infrastructure updates and, for AI services, model and prompt changes—rather than by hardware. The reason is simple: hardware failures are independent and handled by redundancy, while a bad change is applied everywhere it is rolled out, a perfectly correlated failure. The defence is to roll every change out <strong>progressively</strong>, observing it at each stage before it reaches more of the system, so that a bad change is caught while it affects only a small fraction. Figure 13.5 shows a typical sequence.</p>
+
+<figure class="diagram" id="fig-13-5">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Progressive rollout waves">
+<defs><marker id="a135" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="50" width="100" height="60" rx="8" class="bx"/><text x="65" y="74" text-anchor="middle" class="t-xs t-b">staging</text><text x="65" y="90" text-anchor="middle" class="t-xs">synthetic + shadow</text>
+<rect x="130" y="50" width="100" height="60" rx="8" class="bx4"/><text x="180" y="74" text-anchor="middle" class="t-xs t-b">canary</text><text x="180" y="90" text-anchor="middle" class="t-xs">1% of one cell</text>
+<rect x="245" y="50" width="100" height="60" rx="8" class="bx4"/><text x="295" y="74" text-anchor="middle" class="t-xs t-b">one cell</text><text x="295" y="90" text-anchor="middle" class="t-xs">one zone</text>
+<rect x="360" y="50" width="100" height="60" rx="8" class="bx2"/><text x="410" y="74" text-anchor="middle" class="t-xs t-b">one region</text><text x="410" y="90" text-anchor="middle" class="t-xs">smallest first</text>
+<rect x="475" y="50" width="100" height="60" rx="8" class="bx2"/><text x="525" y="74" text-anchor="middle" class="t-xs t-b">more regions</text><text x="525" y="90" text-anchor="middle" class="t-xs">one at a time</text>
+<rect x="590" y="50" width="115" height="60" rx="8" class="bx3"/><text x="647" y="74" text-anchor="middle" class="t-xs t-b">everywhere</text><text x="647" y="90" text-anchor="middle" class="t-xs">old version cached</text>
+<line x1="115" y1="80" x2="128" y2="80" class="ln" marker-end="url(#a135)"/><line x1="230" y1="80" x2="243" y2="80" class="ln" marker-end="url(#a135)"/><line x1="345" y1="80" x2="358" y2="80" class="ln" marker-end="url(#a135)"/><line x1="460" y1="80" x2="473" y2="80" class="ln" marker-end="url(#a135)"/><line x1="575" y1="80" x2="588" y2="80" class="ln" marker-end="url(#a135)"/>
+<text x="360" y="30" text-anchor="middle" class="t-xs">each wave: bake time, automated comparison with control, automatic pause and rollback on regression</text>
+<text x="360" y="140" text-anchor="middle" class="t-xs">Never two regions at once; never a change during an incident or with the error budget exhausted.</text>
+<text x="360" y="158" text-anchor="middle" class="t-xs">Configuration, feature flags, models, prompts and drivers follow the same path as code.</text>
+<rect x="15" y="175" width="690" height="40" rx="8" class="bx5"/><text x="360" y="200" text-anchor="middle" class="t-xs">Blast radius of a bad change caught at wave w ≈ fraction of traffic reached by waves 1…w during their bake times.</text>
+</svg>
+<figcaption><b>Figure 13.5 — Progressive rollout.</b> A change reaches a growing fraction of the system through waves aligned with failure domains, with bake time and automated comparison at each. The blast radius of a bad change is bounded by the wave in which it is detected.</figcaption>
+</figure>
+
+<p>Two quantitative questions govern a rollout's design: how large must a canary be, and how long must it bake, to detect a regression of a given size? Suppose the baseline error rate is \(e_0\) and a bad change raises it to \(e_1\). A canary that receives \(n\) requests expects \(ne_0\) errors if the change is good and \(ne_1\) if bad; with Poisson counts, the difference is detectable at roughly \(z\) standard deviations when \(n(e_1-e_0)\ge z\sqrt{ne_0}\), that is, when</p>
+\[
+n\ \ge\ \frac{z^2\,e_0}{(e_1-e_0)^2}.
+\]
+<p>For a large regression—error rate from 0.1% to 1%—\(n\ge3^2\times0.001/0.009^2\approx110\) requests suffice: a canary catches it in seconds. For a subtle one—0.1% to 0.15%—\(n\ge9\times0.001/0.0005^2=36{,}000\) requests are needed. At 1% of Atlas's 10,000 requests per second, the canary receives 100 requests per second and needs six minutes; at a quieter hour or a smaller canary, much longer. And the same arithmetic applies to latency and quality regressions, with variances in place of Poisson counts. The lesson is that canary size and bake time should be <em>derived</em> from the smallest regression worth catching, not chosen by habit, and that subtle regressions require either large canaries or long bakes.</p>
+
+<details class="drill">
+<summary>Drill 13.2 — Can the canary see it?</summary>
+<p>A new engine version raises the fraction of streams that end abnormally from 0.05% to 0.08% on Atlas's 70B tier (3,500 requests/s at peak). The rollout's first wave sends 2% of the tier's traffic to the new version for 15 minutes. At \(z=3\), is that enough to detect the regression at peak? At 03:00 UTC, when traffic is 40% of peak?</p>
+<p><em>Solution.</em> Needed: \(n\ge9\times0.0005/0.0003^2=50{,}000\) requests. At peak, 2% of 3,500 is 70 requests/s, so 15 minutes gives 63,000: detectable. At 40% of peak, 28 requests/s gives 25,200 in 15 minutes: not detectable; the bake must be about 30 minutes, or the canary twice as large. A rollout system should compute the required bake time from current traffic rather than use a fixed timer.</p>
+</details>
+
+<p>Changes to LLM services include several kinds that ordinary services do not have, and each needs the same discipline. <em>Model versions</em> follow the lifecycle of §8.7, with quality and cost metrics in addition to errors and latency. <em>Prompt and template changes</em>—a new system prompt, a different chat template—change behaviour and cache-hit rates (Vol. I Drill 27.3) and must be rolled out like code. <em>Kernel and driver updates</em> can change numerics, so they need golden-prompt and evaluation checks as well as performance tests. <em>Sampling-parameter defaults</em> change output lengths and therefore capacity. A change-management system that treats any of these as "just configuration" and pushes it everywhere at once has re-created the single largest cause of outages.</p>
+
+<h2 id="s13-6">13.6 Degrading gracefully</h2>
+<p>When a service cannot do everything it normally does—because capacity is short (Chapter 9), a dependency is down, or a region has failed (Chapter 12)—it should do less, deliberately, rather than fail at random. Chapter 11 developed admission control and load shedding at the front door; reliability engineering adds three patterns that apply throughout the system. <strong>Brownout</strong> disables optional, expensive features under stress: long reasoning modes, very long contexts, high-resolution image inputs, or retrieval augmentation can be turned off or capped, often for free tiers first, while core chat keeps working. <strong>Circuit breakers</strong> stop calling a dependency that is failing—a guardrail classifier, a retrieval service, a tool—after its error rate crosses a threshold, and fall back to a defined behaviour (skip, use a cached result, use a simpler local check) until it recovers, rather than letting every request wait for timeouts. <strong>Bulkheads</strong> partition resources—separate pools, queues or cells for different tenants or features—so that a surge or failure in one cannot exhaust capacity for the others.</p>
+<p>A fourth pattern addresses tail latency rather than failure. <strong>Hedged requests</strong> send a second copy of a request to another replica if the first has not responded within, say, its 95th-percentile latency, and use whichever answers first; Dean and Barroso showed that this cuts tail latency dramatically for a few percent of extra load. For LLM generation, hedging whole requests is expensive—a duplicate decode costs as much as the original—so it is used sparingly: for short requests, for the prefill phase only (cancel the slower copy at the first token), or for idempotent dependencies such as retrieval and guardrail classifiers whose cost is small relative to the generation they gate.</p>
+<p>For each pattern, the fallback behaviour must be decided in advance and must be safe. Skipping a safety classifier under load is not a safe fallback; returning an error for the affected requests may be (Chapter 18). Serving a smaller model for a premium tier may breach a contract. The right design writes each degradation mode down, with its trigger, its behaviour, its owner and its customer impact, tests it in drills, and records when it was used, so that degradation is a controlled response rather than an improvisation.</p>
+
+<h2 id="s13-7">13.7 Incidents and postmortems</h2>
+<p>However good the engineering, incidents happen, and how they are handled determines how much damage they do and whether they recur. Mature organisations run incidents with a defined structure. An <strong>on-call</strong> engineer is paged by burn-rate alerts (§13.1), confirms the impact and declares an incident with a <strong>severity</strong> that sets who is involved. An <strong>incident commander</strong> coordinates—assigning roles, keeping a timeline, deciding—while others investigate and communicate. The first priority is <strong>mitigation</strong>, not diagnosis: roll back the latest change, shift traffic away from the affected region, shed load, enable a degradation mode. Understanding why comes later. <strong>Communication</strong> to customers and internal stakeholders is regular and honest. Figure 13.6 shows the lifecycle.</p>
+
+<figure class="diagram" id="fig-13-6">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Incident lifecycle">
+<defs><marker id="a136" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="60" width="105" height="64" rx="8" class="bx2"/><text x="67" y="84" text-anchor="middle" class="t-xs t-b">detect</text><text x="67" y="100" text-anchor="middle" class="t-xs">burn-rate alert,</text><text x="67" y="114" text-anchor="middle" class="t-xs">customer report</text>
+<rect x="135" y="60" width="105" height="64" rx="8" class="bx4"/><text x="187" y="84" text-anchor="middle" class="t-xs t-b">declare</text><text x="187" y="100" text-anchor="middle" class="t-xs">severity, incident</text><text x="187" y="114" text-anchor="middle" class="t-xs">commander, roles</text>
+<rect x="255" y="60" width="105" height="64" rx="8" class="bx3"/><text x="307" y="84" text-anchor="middle" class="t-xs t-b">mitigate</text><text x="307" y="100" text-anchor="middle" class="t-xs">rollback, shift,</text><text x="307" y="114" text-anchor="middle" class="t-xs">shed, degrade</text>
+<rect x="375" y="60" width="105" height="64" rx="8" class="bx"/><text x="427" y="84" text-anchor="middle" class="t-xs t-b">resolve</text><text x="427" y="100" text-anchor="middle" class="t-xs">root cause fixed,</text><text x="427" y="114" text-anchor="middle" class="t-xs">verify SLIs</text>
+<rect x="495" y="60" width="105" height="64" rx="8" class="bx5"/><text x="547" y="84" text-anchor="middle" class="t-xs t-b">postmortem</text><text x="547" y="100" text-anchor="middle" class="t-xs">blameless, timeline,</text><text x="547" y="114" text-anchor="middle" class="t-xs">contributing causes</text>
+<rect x="615" y="60" width="95" height="64" rx="8" class="bx4"/><text x="662" y="84" text-anchor="middle" class="t-xs t-b">action items</text><text x="662" y="100" text-anchor="middle" class="t-xs">owned, tracked,</text><text x="662" y="114" text-anchor="middle" class="t-xs">prioritised</text>
+<line x1="120" y1="92" x2="133" y2="92" class="ln" marker-end="url(#a136)"/><line x1="240" y1="92" x2="253" y2="92" class="ln" marker-end="url(#a136)"/><line x1="360" y1="92" x2="373" y2="92" class="ln" marker-end="url(#a136)"/><line x1="480" y1="92" x2="493" y2="92" class="ln" marker-end="url(#a136)"/><line x1="600" y1="92" x2="613" y2="92" class="ln" marker-end="url(#a136)"/>
+<path d="M662,126 C662,180 67,180 67,126" class="ln ln-acc" fill="none" marker-end="url(#a136)"/>
+<text x="360" y="196" text-anchor="middle" class="t-xs t-acc">fixes to detection, mitigation tools, change process and architecture make the next incident smaller</text>
+<text x="360" y="40" text-anchor="middle" class="t-xs">communicate throughout: status page, customer updates, internal channel; mitigation before diagnosis</text>
+</svg>
+<figcaption><b>Figure 13.6 — The incident lifecycle.</b> Mitigation comes before full understanding; the postmortem turns the incident into improvements to detection, tooling, process and architecture.</figcaption>
+</figure>
+
+<p>After the incident, a <strong>blameless postmortem</strong> reconstructs the timeline, identifies the contributing causes—usually several, technical and organisational—and assigns owned, tracked action items. "Blameless" does not mean that nobody is responsible; it means that the analysis asks why the system allowed a reasonable person's action to cause harm, because a culture that punishes the person who made the triggering change teaches people to hide information, and the next incident is then harder to understand. The postmortem's measures of success are concrete: was detection fast enough, was mitigation available and used, how much error budget was consumed, and what would have made the impact smaller?</p>
+<p>LLM services add incident types that need their own playbooks. <em>Quality incidents</em>—a model rollout that degrades answers, a tokenizer or template bug—may not raise any error rate and are detected by evaluation monitors or user reports. <em>Safety incidents</em>—a guardrail failure, a jailbreak at scale, harmful output—involve policy and communications teams (Chapter 18). <em>Cost incidents</em>—a runaway agent loop or a pricing bug that lets a tenant consume enormous capacity—are detected by unit-cost monitors (Chapter 10). <em>Security incidents</em>—suspected data exposure across tenants—follow security response procedures (Chapter 14). Each should have an owner, a detection path and pre-written mitigation steps.</p>
+
+<h2 id="s13-8">13.8 Failure modes specific to LLM services</h2>
+<p>Three failure modes make LLM reliability different from ordinary service reliability, and each deserves an explicit design response. The first is <strong>silent wrongness</strong>: a service can be up, fast and wrong. Causes include silent data corruption on a GPU, numerical bugs introduced by kernel or driver changes (an FP8 scaling error, a mis-fused operation), tokenizer or chat-template mismatches between training and serving, quantisation that degrades a subset of tasks, and configuration errors such as a wrong RoPE scaling factor for long contexts. Because outputs remain fluent, none of these raises errors. The defences are golden-prompt checks per replica (§13.4), continuous evaluation of sampled production traffic against reference metrics, comparison of output statistics (lengths, refusal rates, token distributions) between replicas and versions, and treating any change to numerics as a model change.</p>
+<p>The second is <strong>nondeterminism</strong>. The same prompt can produce different outputs on different runs because of sampling, and even with greedy decoding because batching changes floating-point reduction orders (Vol. I §4.7). This complicates debugging ("we cannot reproduce the bad answer"), testing ("the golden prompt changed—is that a bug?") and audit. Practical responses are to record seeds, model versions, engine versions and batch context with each request's log entry; to offer deterministic or batch-invariant modes for testing and regulated uses; and to design checks that tolerate benign variation.</p>
+<p>The third is <strong>dependence on external models and tools</strong>. Many LLM applications call third-party model APIs, retrieval services and tools (Chapters 16–17), each with its own availability and rate limits. An application whose availability is the product of several external dependencies' availabilities inherits the series rule of §13.2. The responses are the familiar ones applied across organisational boundaries: redundant providers for critical models (with tested fallbacks to a second provider or a self-hosted model), circuit breakers and timeouts on every external call, and degradation modes that keep the core function working when an optional dependency is down. Reliability, then, extends to the edges of the system—and one of those edges is the boundary with adversaries, which is the subject of the next chapter.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We have defined reliability with SLIs, SLOs and error budgets, computed availability from components, estimated how often GPUs fail, designed detection, remediation, safe rollout and graceful degradation, and described how incidents are run. Throughout, failures were accidents. Some are not. An LLM service holds valuable assets—customer prompts and documents, model weights worth hundreds of millions of dollars, and GPUs that attackers would like to use—and it is shared by many tenants who must not see each other's data. What are the threats to an AI service, how are tenants isolated from one another, can a shared prefix cache leak one user's prompt to another, how are weights protected, and how is the model supply chain secured? Chapter 14 takes up security, isolation and multi-tenancy.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>SLIs measure user-visible behaviour (success, TTFT by prompt length, TPOT or max gap, completed streams, quality proxies); SLOs set targets; SLAs are looser contracts. Error budget \(=\epsilon_{\text{SLO}}\); burn rate \(\varrho_b\) drives multiwindow alerts and change policy.</li>
+<li>\(\mathcal A=\text{MTBF}/(\text{MTBF}+\text{MTTR})\approx1-\text{MTTR}/\text{MTBF}\): faster recovery is as good as fewer failures. Series multiply availabilities, parallel multiplies unavailabilities, k-of-n is a binomial tail; correlated failures and unreplicated components set real availability.</li>
+<li>Llama 3 data: 419 unexpected interruptions in 54 days on 16,384 H100s (≈ 2×10⁻⁵ per GPU-hour, ≈ 78% hardware; faulty GPUs and HBM the largest causes). A 4,000-GPU fleet sees about two a day; each takes down a whole TP or multi-node replica.</li>
+<li>Silent data corruption produces wrong answers without errors; golden-prompt checks (teacher-forced log-probabilities with tolerances) per replica are the defence.</li>
+<li>Layered detection (liveness, progress, DCGM/Xid, performance outliers, golden prompts) feeds automated remediation: cordon, drain, diagnose, reset/reimage/repair, validate, with rate limits and quarantine.</li>
+<li>Most outages come from change. Progressive rollout by failure domain with bake time and automated comparison; canary size \(n\ge z^2e_0/(e_1-e_0)^2\); models, prompts, kernels, drivers and sampling defaults are changes too.</li>
+<li>Graceful degradation: brownouts of expensive features, circuit breakers with safe fallbacks, bulkheads; decide and test fallbacks in advance.</li>
+<li>Incidents: detect, declare, mitigate first, resolve, blameless postmortem with owned actions; LLM-specific quality, safety, cost and security incident playbooks.</li>
+<li>LLM-specific failure modes: silent wrongness, nondeterminism (record seeds and versions; deterministic modes), dependence on external models and tools (redundant providers, breakers, degradation).</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci13-mcq-01" data-topic="§13.1 SLOs">
+<p class="q">What distinguishes an SLO from an SLA?</p>
+<ol class="opts"><li>Nothing</li><li data-correct>An SLO is an internal engineering target; an SLA is a looser contractual promise with consequences</li><li>SLAs are stricter</li><li>SLOs are legal documents</li></ol>
+<div class="explain">The SLO leaves room before the SLA is breached.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-02" data-topic="§13.1 SLOs">
+<p class="q">A 99.9% monthly availability SLO allows roughly how much total outage?</p>
+<ol class="opts"><li>4 minutes</li><li data-correct>43 minutes</li><li>7 hours</li><li>3 days</li></ol>
+<div class="explain">0.1% of about 43,800 minutes.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-03" data-topic="§13.1 SLOs">
+<p class="q">At a burn rate of 14.4, a 30-day error budget is exhausted in about:</p>
+<ol class="opts"><li>1 hour</li><li data-correct>2 days</li><li>14 days</li><li>30 days</li></ol>
+<div class="explain">30/14.4 ≈ 2.1 days.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-04" data-topic="§13.1 SLOs">
+<p class="q">Why should TTFT SLIs depend on prompt length?</p>
+<ol class="opts"><li>To make SLOs easier</li><li data-correct>Prefill time grows with uncached prompt length, so one threshold cannot fit 100-token and 100,000-token prompts</li><li>Users prefer long prompts</li><li>It reduces cost</li></ol>
+<div class="explain">Use per-length buckets.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-05" data-topic="§13.1 SLOs">
+<p class="q">What does an error-budget policy typically do when the budget is exhausted?</p>
+<ol class="opts"><li>Nothing</li><li data-correct>Slows or freezes risky changes and prioritises reliability work</li><li>Raises prices</li><li>Disables monitoring</li></ol>
+<div class="explain">The budget turns reliability into a resource.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-06" data-topic="§13.2 Algebra">
+<p class="q">\(\mathcal A\approx1-\text{MTTR}/\text{MTBF}\) implies that halving repair time:</p>
+<ol class="opts"><li>Has no effect</li><li data-correct>Halves unavailability, as much as halving the failure rate</li><li>Doubles availability</li><li>Matters only for hardware</li></ol>
+<div class="explain">Fast recovery is reliability work.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-07" data-topic="§13.2 Algebra">
+<p class="q">Seven independent components in series, each 99.95% available, give about:</p>
+<ol class="opts"><li>99.95%</li><li>99.9%</li><li data-correct>99.65%</li><li>96.5%</li></ol>
+<div class="explain">\(0.9995^7\).</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-08" data-topic="§13.2 Algebra">
+<p class="q">Two independent replicas, each 99.95% available, in parallel give:</p>
+<ol class="opts"><li>99.9%</li><li>99.95%</li><li data-correct>99.999975%</li><li>100%</li></ol>
+<div class="explain">\(1-0.0005^2\).</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-09" data-topic="§13.2 Algebra">
+<p class="q">The availability of "at least k of n" identical replicas is:</p>
+<ol class="opts"><li>A product of availabilities</li><li data-correct>A binomial tail sum</li><li>The minimum availability</li><li>Always 1</li></ol>
+<div class="explain">\(\sum_{j\ge k}\binom nj\mathcal A_1^j(1-\mathcal A_1)^{n-j}\).</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-10" data-topic="§13.2 Algebra">
+<p class="q">What usually limits real availability once components are replicated?</p>
+<ol class="opts"><li>Independent hardware failures</li><li data-correct>Correlated failures and unreplicated shared dependencies</li><li>The number of replicas</li><li>Network bandwidth</li></ol>
+<div class="explain">E.g. bad rollouts, shared config, common bugs.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-11" data-topic="§13.3 GPU failures">
+<p class="q">The Llama 3 report recorded roughly how many unexpected interruptions in 54 days on 16,384 GPUs?</p>
+<ol class="opts"><li>4</li><li>42</li><li data-correct>419</li><li>4,190</li></ol>
+<div class="explain">About 78% attributed to hardware.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-12" data-topic="§13.3 GPU failures">
+<p class="q">The largest categories of unexpected interruptions in that report were:</p>
+<ol class="opts"><li>Power and cooling</li><li data-correct>Faulty GPUs and GPU HBM memory</li><li>CPU failures</li><li>User errors</li></ol>
+<div class="explain">About 30% and 17% respectively.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-13" data-topic="§13.3 GPU failures">
+<p class="q">At about 2×10⁻⁵ interruptions per GPU-hour, a 4,000-GPU fleet expects roughly how many per day?</p>
+<ol class="opts"><li>0.2</li><li data-correct>2</li><li>20</li><li>200</li></ol>
+<div class="explain">\(4000\times24\times2\times10^{-5}\approx1.9\).</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-14" data-topic="§13.3 GPU failures">
+<p class="q">Why is silent data corruption especially dangerous for inference?</p>
+<ol class="opts"><li>It crashes the GPU</li><li data-correct>Outputs stay fluent and no error is raised, so wrong answers can be served for a long time</li><li>It increases latency</li><li>It only affects training</li></ol>
+<div class="explain">Detection requires checking answers.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-15" data-topic="§13.3 GPU failures">
+<p class="q">Large CPU-fleet studies in 2021 found silent-corruption-producing processors at a rate of roughly:</p>
+<ol class="opts"><li>One in a billion</li><li>One in a million</li><li data-correct>One in a thousand machines</li><li>One in ten</li></ol>
+<div class="explain">Far higher than previously assumed.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-16" data-topic="§13.3 GPU failures">
+<p class="q">A GPU failure in a TP8 replica removes:</p>
+<ol class="opts"><li>One GPU's worth of capacity</li><li data-correct>The whole 8-GPU replica</li><li>Nothing, thanks to redundancy</li><li>The whole region</li></ol>
+<div class="explain">All ranks participate in every forward pass.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-17" data-topic="§13.4 Detection">
+<p class="q">Which detection layer catches silent data corruption?</p>
+<ol class="opts"><li>Process liveness</li><li>Engine step counter</li><li>Xid error codes</li><li data-correct>Golden-prompt checks against reference outputs or log-probabilities</li></ol>
+<div class="explain">The other layers see no error.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-18" data-topic="§13.4 Detection">
+<p class="q">Why compare teacher-forced log-probabilities rather than exact generated text in golden-prompt checks?</p>
+<ol class="opts"><li>It is faster</li><li data-correct>Benign floating-point nondeterminism changes generated text but only slightly perturbs log-probabilities; real corruption produces large deviations</li><li>Text cannot be compared</li><li>Log-probabilities are encrypted</li></ol>
+<div class="explain">Tolerances separate noise from faults.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-19" data-topic="§13.4 Remediation">
+<p class="q">Which safeguards prevent automated remediation from causing harm? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>A cap on nodes taken out of service at once</li><li data-correct>Quarantine of repeatedly failing nodes for human review</li><li data-correct>Validation before return to service</li><li>Skipping the drain step</li></ol>
+<div class="explain">Draining avoids dropping in-flight work.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-20" data-topic="§13.5 Safe change">
+<p class="q">Why do changes cause most outages of large services?</p>
+<ol class="opts"><li>Engineers are careless</li><li data-correct>A bad change is applied wherever it is rolled out—a perfectly correlated failure that redundancy cannot absorb</li><li>Hardware never fails</li><li>Changes are rare</li></ol>
+<div class="explain">Progressive rollout limits the correlation.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-21" data-topic="§13.5 Safe change">
+<p class="q">To detect an error-rate rise from 0.1% to 0.15% at \(z=3\), a canary needs about:</p>
+<ol class="opts"><li>110 requests</li><li>3,600 requests</li><li data-correct>36,000 requests</li><li>3.6 million requests</li></ol>
+<div class="explain">\(9\times0.001/0.0005^2\).</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-22" data-topic="§13.5 Safe change">
+<p class="q">Why should bake time be computed from current traffic rather than fixed?</p>
+<ol class="opts"><li>For simplicity</li><li data-correct>The number of canary requests, and so detection power, falls at quiet hours</li><li>Regulations</li><li>It is cheaper</li></ol>
+<div class="explain">Drill 13.2 needed twice the bake at 40% of peak.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-23" data-topic="§13.5 Safe change">
+<p class="q">Which LLM-service changes should follow the progressive rollout path? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>System-prompt and chat-template changes</li><li data-correct>Kernel and driver updates</li><li data-correct>Default sampling parameters</li><li data-correct>Model versions</li></ol>
+<div class="explain">All change behaviour, numerics or capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-24" data-topic="§13.5 Safe change">
+<p class="q">A rule of progressive rollout is never to:</p>
+<ol class="opts"><li>Use canaries</li><li data-correct>Roll out to two regions at once</li><li>Keep the old version cached</li><li>Compare with a control</li></ol>
+<div class="explain">Regions are the largest failure domains.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-25" data-topic="§13.6 Degradation">
+<p class="q">A circuit breaker:</p>
+<ol class="opts"><li>Cuts power to racks</li><li data-correct>Stops calling a failing dependency after errors cross a threshold, using a fallback until it recovers</li><li>Encrypts traffic</li><li>Retries more</li></ol>
+<div class="explain">It prevents every request waiting on timeouts.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-26" data-topic="§13.6 Degradation">
+<p class="q">Which is an unsafe fallback under load?</p>
+<ol class="opts"><li>Disabling long reasoning for free tiers</li><li>Serving cached retrieval results</li><li data-correct>Silently skipping the safety classifier</li><li>Returning a typed overload error</li></ol>
+<div class="explain">Safety checks should fail closed or return errors (Chapter 18).</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-27" data-topic="§13.7 Incidents">
+<p class="q">During an incident, the first priority is:</p>
+<ol class="opts"><li>Finding the root cause</li><li data-correct>Mitigation: rollback, traffic shift, shedding or degradation</li><li>Writing the postmortem</li><li>Assigning blame</li></ol>
+<div class="explain">Understanding comes after impact is contained.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-28" data-topic="§13.7 Incidents">
+<p class="q">Why are postmortems blameless?</p>
+<ol class="opts"><li>Nobody is responsible</li><li data-correct>Punishing individuals teaches people to hide information; the analysis asks why the system allowed the harm</li><li>Legal reasons</li><li>To save time</li></ol>
+<div class="explain">Actions improve detection, tooling, process and architecture.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-29" data-topic="§13.8 LLM-specific">
+<p class="q">Which can cause "silent wrongness" in an LLM service? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>A chat-template mismatch</li><li data-correct>An FP8 scaling bug in a new kernel</li><li data-correct>A wrong RoPE scaling factor</li><li>A 503 error</li></ol>
+<div class="explain">Errors are visible; these are not.</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-30" data-topic="§13.8 LLM-specific">
+<p class="q">What should be logged to make a bad LLM answer reproducible?</p>
+<ol class="opts"><li>Only the timestamp</li><li data-correct>Model and engine versions, sampling seed and parameters, and batch context</li><li>The client IP only</li><li>Nothing; answers are random</li></ol>
+<div class="explain">Batching affects numerics (Vol. I §4.7).</div>
+</div>
+
+<div class="mcq" data-id="ci13-mcq-31" data-topic="§13.3 GPU failures">
+<p class="q">In Drill 13.1, with a 12-hour mean time out of service, about how many 70B replicas are down on average?</p>
+<ol class="opts"><li>0.06</li><li data-correct>0.6</li><li>6</li><li>60</li></ol>
+<div class="explain">0.05 failures/h × 12 h.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci13-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Define SLIs and SLOs for an LLM chat API.</summary>
+<div class="answer">
+<p>SLIs as good-event fractions: successful responses (server errors count as bad, client errors excluded; rate-limit rejections per policy); TTFT below a threshold per prompt-length bucket; TPOT or maximum inter-token gap below a threshold; streams that complete normally; quality proxies (refusal rate, empty/truncated responses, eval checks on samples). SLOs per tier and model, e.g. 99.9% success over 30 days, 95% of requests TTFT ≤ 1 s for prompts under 4k tokens, 99% TPOT ≤ 60 ms. Error budgets with multiwindow burn-rate alerts and a change policy tied to remaining budget. SLAs for enterprise tiers looser than SLOs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-02">
+<summary><span class="lvl warm">Warm-up</span> How many GPU failures per day should a 10,000-GPU fleet expect?</summary>
+<div class="answer">
+<p>From the Llama 3 report: 419 unexpected interruptions over about 2.1×10⁷ GPU-hours ≈ 2×10⁻⁵ per GPU-hour (~6-year MTBF per GPU). 10,000 × 24 × 2×10⁻⁵ ≈ 5 per day; more during burn-in of new hardware or under harsher conditions (2–3×). Each takes down its whole replica (TP group or multi-node group), so plan spares and automated remediation accordingly; with 12-hour repair time, about 2–3 GPUs are out at any moment.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is an error budget and how is it used?</summary>
+<div class="answer">
+<p>The allowed shortfall from an SLO over its window—e.g. 0.1% of requests (~43 min of total outage) for 99.9% over 30 days. It is consumed by incidents and risky changes; burn rate (bad-event rate ÷ budgeted rate) drives alerts (page at 14.4× over 1 h and 5 min; ticket at 1× over days). Policy: while budget remains, ship features and accept risk; when exhausted, slow or freeze risky changes and prioritise reliability. It aligns product velocity and reliability with a shared, quantitative rule.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-04">
+<summary><span class="lvl core">Core</span> Compute the availability of a request path and say how to improve it.</summary>
+<div class="answer">
+<p>Series path of components (edge, LB, gateway, auth, rate-limit store, router, replica pool): availability = product; seven at 99.95% → 99.65% (≈ 2.5 h/month). Improve by replicating each component independently (parallel: unavailabilities multiply → 99.9998%), removing dependencies from the request path (cache auth and limits locally, async updates), making dependencies fail safely (static stability), and reducing correlation (different zones, staggered rollouts, avoid shared config). Also shorten MTTR (fast failover, automated remediation). Then the limit becomes correlated failure: bad changes, shared bugs, regional events—addressed with progressive rollouts, cells and multi-region.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-05">
+<summary><span class="lvl core">Core</span> How would you detect a GPU that silently corrupts inference results?</summary>
+<div class="answer">
+<p>Golden-prompt checks on every replica on a schedule (minutes): fixed prompts with reference continuations; compute teacher-forced log-probabilities (or greedy outputs in a deterministic, batch-invariant mode) and compare to references with tolerances that exceed benign numerical noise; every TP rank participates in each forward pass, so one check covers the replica's GPUs (rotate checks across ranks for expert-parallel layouts). Complement with cross-replica comparisons of output statistics, DCGM diagnostics during maintenance, and evaluation on sampled production traffic. On failure: drain, run per-GPU diagnostics to localise, replace the part, quarantine repeat offenders; consider re-running recent requests if correctness critical.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-06">
+<summary><span class="lvl core">Core</span> Design an automated remediation system for GPU nodes.</summary>
+<div class="answer">
+<p>Signals: Xid codes, DCGM health and diagnostics, ECC/row-remap counts, NVLink errors, thermal throttling, engine progress, performance outliers, golden-prompt failures. Pipeline: cordon and drain (graceful, resume streams), automated diagnosis, remedy by severity (GPU reset or driver reload → reboot → reimage → repair ticket for part replacement), validation burn-in, return to service. Safeguards: cap on concurrent out-of-service nodes per pool and zone, quarantine for nodes failing repeatedly, human approval for mass actions, full audit trail. Metrics: detection-to-drain time, time out of service, repeat-failure rate, false positives. Feed failure data into hardware vendor RMAs and fleet planning.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-07">
+<summary><span class="lvl core">Core</span> How big must a canary be to catch a regression, and how long must it run?</summary>
+<div class="answer">
+<p>With baseline rate \(e_0\) and regressed rate \(e_1\), Poisson counts: detect at \(z\) standard deviations when \(n\ge z^2e_0/(e_1-e_0)^2\). 0.1% → 1%: ~110 requests (seconds). 0.1% → 0.15%: ~36,000 requests. 0.05% → 0.08%: 50,000. Bake time = required n ÷ canary traffic rate, which depends on time of day—compute dynamically. For latency or quality metrics, use variance-based tests; for multiple metrics, control false positives; use concurrent control cohorts. Choose the smallest regression worth catching and derive canary size from it.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-08">
+<summary><span class="lvl core">Core</span> Walk through how you would run an incident where TTFT has tripled in one region.</summary>
+<div class="answer">
+<p>Page via burn-rate alert; confirm impact (which tiers, models, tenants; TTFT and errors); declare incident with severity, incident commander, roles and comms channel. Mitigate first: check recent changes (model, engine, config, prompt templates) and roll back the most recent suspicious one; shift latency-tolerant traffic to other regions; enable admission control and degradation (shed free tier, disable long reasoning); scale up if capacity is the cause. Investigate in parallel: prefill queue depths, cache-hit rate (template change?), replica failures, network or KV-transfer problems, a dependency (guardrail) slowing. Communicate regularly. Resolve and verify SLIs. Blameless postmortem with action items (e.g. capacity alert on cache-hit rate, rollout gates on TTFT).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> How do failure rates and replica size interact, and what does it imply for model deployment?</summary>
+<div class="answer">
+<p>A replica needing \(g\) GPUs fails whenever any does: rate \(g\lambda_f\) per replica; the fleet's replica outages per hour equal its GPU failures, but each removes \(g\) GPUs of capacity and fails all in-flight requests of that replica. Mean replicas down = failures/hour × time out of service; spare needed for a target probability grows with \(g\) in GPU terms (Drill 13.1: 1.3% for TP8 vs 5% for 32-GPU groups at 12 h repair). Implications: prefer the smallest replica that meets latency (bigger-memory GPUs, quantisation), make recovery fast (hot spare nodes, cached weights, snapshots), allow partial recovery (replace one node in a group without reloading all), spread groups across failure domains, and size spares by Poisson tails.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Explain multiwindow burn-rate alerting and why it beats threshold alerts.</summary>
+<div class="answer">
+<p>Threshold alerts on instantaneous error rate either page on noise (low threshold) or miss slow burns (high threshold). Burn rate normalises error rate by the SLO's budgeted rate; a page fires when burn rate exceeds a high value (e.g. 14.4, consuming 2% of a monthly budget per hour) over both a long window (1 h, to ensure significance) and a short window (5 min, to ensure it is still happening and to reset quickly after recovery); a ticket fires for slow burns (e.g. >1 over 3 days). This yields high precision and recall for budget-threatening problems, scales across services with different SLOs, and ties alerting to user impact rather than component symptoms.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why are changes to kernels and drivers reliability risks for LLMs specifically?</summary>
+<div class="answer">
+<p>They can change numerics without errors: a fused kernel with a different accumulation order, an FP8 scale miscomputed for some shapes, an attention variant mishandling long contexts or masking, a driver bug in a math library. Outputs stay fluent, so error-rate canaries see nothing; quality degrades silently for some inputs (long contexts, rare languages, certain tasks). Treat such changes as model changes: run golden-prompt and evaluation suites (task accuracy, perplexity on reference data, long-context tests) before rollout, compare output statistics in canaries, and roll out progressively with quality gates; keep the previous version available for fast rollback.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-12">
+<summary><span class="lvl design">Design</span> Design the reliability programme for a new LLM API launching with a 99.9% SLO.</summary>
+<div class="answer">
+<p>SLIs and SLOs per tier (success, TTFT per length bucket, TPOT, stream completion), error budgets and burn-rate alerting, dashboards. Architecture: redundant, independent front-door components; multi-zone replicas with spread constraints; spare capacity sized from failure rates and repair times; multi-region active-active for failover; static stability. Detection and remediation: layered health checks including golden prompts; automated drain/diagnose/repair with safeguards. Change: progressive rollouts by cell/zone/region with statistically sized canaries for code, config, models, prompts, kernels; automated rollback; freezes when budget exhausted. Degradation modes and admission control. Incident process: on-call rotation, severity definitions, incident command, comms templates, postmortems. Regular game days and region evacuation drills.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-13">
+<summary><span class="lvl design">Design</span> An application depends on two external model APIs and a retrieval service. How do you make it reliable?</summary>
+<div class="answer">
+<p>Series dependencies multiply unavailabilities, so: put timeouts and circuit breakers on every external call; for the critical model, configure a tested fallback (second provider or self-hosted model with compatible prompts and output parsing), with periodic traffic to keep it warm; cache retrieval results and degrade to non-augmented answers or cached documents when retrieval is down; respect each provider's rate limits with client-side token buckets and backoff with jitter; idempotency for retries; monitor each dependency's availability and latency as SLIs; define degradation modes and their user impact; contract SLAs and capacity reservations (provisioned throughput) where needed; test failovers regularly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-14">
+<summary><span class="lvl core">Core</span> What do brownouts, circuit breakers and bulkheads each protect against?</summary>
+<div class="answer">
+<p>Brownouts protect capacity under stress by disabling optional, expensive features (long reasoning, huge contexts, image inputs, retrieval) for some tiers, keeping core service working. Circuit breakers protect against slow or failing dependencies by stopping calls after errors cross a threshold and using a defined fallback, preventing timeouts from tying up every request. Bulkheads protect against one tenant, feature or workload exhausting shared resources, by partitioning pools, queues or cells. All need predefined, safe fallback behaviours, triggers, owners and drills.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> How would you build quality SLIs for an LLM service?</summary>
+<div class="answer">
+<p>Quality is not directly observable per request, so use proxies and sampling: rates of empty, truncated or malformed outputs (e.g. invalid JSON for structured-output requests), refusal rates by category, average output lengths, user feedback signals (thumbs, regenerations, abandonment), tool-call failure rates, and automatic evaluation of a sample of production traffic with reference-free LLM judges or task-specific checks, tracked against baselines per model version. Add golden-prompt suites per replica for numerical integrity. Alert on statistically significant shifts, attribute shifts to changes (model, template, kernel), and include quality metrics in rollout gates. Treat them as SLOs for enterprise tiers where possible.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci13-qa-16">
+<summary><span class="lvl warm">Warm-up</span> Why is MTTR often a better investment than MTBF?</summary>
+<div class="answer">
+<p>Unavailability ≈ MTTR/MTBF, so halving either has the same effect. Failure rates of hardware and complex software are hard to reduce (vendor-dependent, physics), whereas recovery time is under engineering control: fast detection, automated failover and remediation, cached weights and fast cold starts, resumable streams, warm spares, rollbacks by digest. At fleet scale failures are daily events regardless, so the time each takes to absorb dominates the experienced availability and the spare capacity needed.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-llama3">A. Grattafiori et al. (Llama Team, Meta). The Llama 3 Herd of Models (§3.3.4, reliability during training). 2024. <a href="https://arxiv.org/abs/2407.21783">arXiv:2407.21783</a>.</li>
+<li id="r-sdc">H. D. Dixit et al. Silent Data Corruptions at Scale. 2021. <a href="https://arxiv.org/abs/2102.11245">arXiv:2102.11245</a>.</li>
+<li id="r-cores">P. H. Hochschild et al. Cores that don't count. <em>HotOS</em>, 2021.</li>
+<li>B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). <em>Site Reliability Engineering</em>. O'Reilly, 2016.</li>
+<li>B. Beyer et al. (eds.). <em>The Site Reliability Workbook</em> (alerting on SLOs, burn rates). O'Reilly, 2018.</li>
+<li>A. Kokolis et al. Revisiting Reliability in Large-Scale Machine Learning Research Clusters. 2024. <a href="https://arxiv.org/abs/2410.21680">arXiv:2410.21680</a>.</li>
+<li>J. Dean, L. A. Barroso. The Tail at Scale. <em>Communications of the ACM</em> 56(2), 2013.</li>
+<li>H. He and Thinking Machines Lab. Defeating Nondeterminism in LLM Inference. 2025.</li>
+<li>J. Allspaw. Blameless PostMortems and a Just Culture. Etsy Code as Craft, 2012.</li>
+<li>D. Oppenheimer, A. Ganapathi, D. Patterson. Why do Internet services fail, and what can be done about it? <em>USITS</em>, 2003.</li>
+<li>NVIDIA. Xid errors and DCGM diagnostics documentation, 2024–2025.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>
