@@ -294,3 +294,11 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(\Phi_P^{\text{ded}}\), \(\Phi_D^{\text{ded}}\) | prefill and decode rates of a replica doing only that phase |
 | \(F\), \(c_{\text{var}}\), \(V^{*}\) | fixed annual cost of self-hosting; variable cost per million tokens; break-even volume |
 | \(\mathcal C(S)\) | cost of serving the set \(S\) of tenants (cost-allocation game) |
+
+## Front door (Vol. II Ch. 11)
+| Symbol | Meaning |
+|---|---|
+| \(\theta\), \(\delta\), \(\tau_b\) | GCRA theoretical arrival time, emission interval \(1/r\), burst tolerance \((b-1)\delta\) (\(\theta\) here is not a RoPE frequency \(\theta_r\)) |
+| \(\mu\), \(t_{\text{dl}}\) | service rate of a queue; request deadline |
+| \(\Delta\) (Ch. 11 only) | synchronisation interval of distributed rate limiters |
+| \(p\), \(k\) (Ch. 11 only) | probability an attempt fails; maximum retries |

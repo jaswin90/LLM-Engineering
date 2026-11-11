@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 11 · The Front Door: Gateways, Streaming and Rate Limits — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 11 of Cloud AI Infrastructure: a request's journey through DNS, TLS, load balancers and an API gateway; protocols for streaming tokens (SSE, HTTP/2, HTTP/3, WebSockets, gRPC); long-lived connections and idle timeouts; rate limiting by requests and tokens with token buckets and GCRA; distributed rate limiting; admission control, load shedding and retry storms; and API design for LLMs.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci11" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part IV · The Global Request Path — Chapter 11</div>
+<h1 id="top">The Front Door: Gateways, Streaming and Rate Limits</h1>
+<p class="lede">Before a prompt reaches an engine it crosses the internet, a TLS handshake, several load balancers and an API gateway that decides who the caller is, whether they may make this request now, and where it should go. Then the response flows back as a stream of tokens over a connection that may stay open for minutes. This chapter follows that path: its latency budget, the protocols that carry token streams, the problems of long-lived connections, how rate limits are defined and enforced across many gateway instances, and how a service protects itself under overload without collapsing.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Parts I–III built and paid for a fleet. Part IV follows requests to it, from users anywhere in the world, and asks how the service stays fast, available and safe on the way. The first stop is the front door, and for LLM services it differs from the front door of a web application in three ways. Responses are <em>long-lived streams</em>: a chat response streams for ten seconds, a reasoning response for minutes, so the gateway holds hundreds of thousands of open connections. Requests are <em>wildly unequal in cost</em>: one may need 100 tokens of computation and the next 100,000, so limits on requests per minute are nearly meaningless and limits must be stated in tokens—including output tokens that are unknown when the request is admitted. And <em>overload is expensive and contagious</em>: a GPU fleet cannot be scaled in seconds (Chapters 5 and 9), so the gateway is the last line of defence when demand exceeds capacity, and a gateway that responds badly—queueing everything, or letting clients retry aggressively—turns a capacity shortfall into an outage.</p>
+<p>Volume I touched on parts of this: server-sent events in Vol. I §12.6 and token-bucket rate limits in Vol. I §27.5. This chapter treats the front door as a system. Interviewers ask about it in design questions ("design the API layer for an LLM service with 100,000 concurrent streams") and in debugging questions ("our reasoning model's long responses get cut off at exactly 60 seconds"; "a 5% error spike turned into a 40% load spike").</p>
+<p>We trace a request's path and its latency budget (§11.1), compare streaming protocols (§11.2), and examine long-lived connections (§11.3). We then define rate limits for LLMs and the algorithms that enforce them (§11.4), extend them to many gateway instances (§11.5), and treat admission control, load shedding and retries (§11.6). We end with the design of the API itself (§11.7).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Trace a request from DNS resolution to the engine, and build a latency budget for time to first token.</li>
+<li>Compare SSE, chunked HTTP/1.1, HTTP/2, HTTP/3, WebSockets and gRPC for streaming tokens, and compute their overheads.</li>
+<li>Size the connection-handling layer with Little's law and avoid idle-timeout and draining failures for long streams.</li>
+<li>Define request, token and concurrency limits, and implement them with token buckets, sliding windows and GCRA, including the reservation of unknown output tokens.</li>
+<li>Design distributed rate limiting across gateway instances and bound its error.</li>
+<li>Explain goodput collapse under overload, design admission control and load shedding, and quantify retry amplification.</li>
+</ol>
+<p class="small muted">Uses: Vol. I §12.6 (SSE), §27.5 (token buckets), §11.8 (queueing); Chapters 1, 6 and 8 of this volume.</p>
+</div>
+
+<h2 id="s11-1">11.1 A request's journey</h2>
+<p>Figure 11.1 traces one chat request from a user's laptop to an Atlas engine and back. Each hop adds latency and is a place where things can fail, and it is worth knowing what each does and roughly what it costs.</p>
+
+<figure class="diagram" id="fig-11-1">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="The path of an LLM request and its latency budget">
+<defs><marker id="a111" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="40" width="80" height="54" rx="7" class="bx"/><text x="50" y="63" text-anchor="middle" class="t-xs t-b">client</text><text x="50" y="79" text-anchor="middle" class="t-xs">SDK / app</text>
+<rect x="105" y="40" width="80" height="54" rx="7" class="bx4"/><text x="145" y="63" text-anchor="middle" class="t-xs t-b">DNS</text><text x="145" y="79" text-anchor="middle" class="t-xs">≈ 0–50 ms</text>
+<rect x="200" y="40" width="95" height="54" rx="7" class="bx4"/><text x="247" y="60" text-anchor="middle" class="t-xs t-b">edge / anycast</text><text x="247" y="74" text-anchor="middle" class="t-xs">TCP + TLS 1.3</text><text x="247" y="87" text-anchor="middle" class="t-xs">1–2 RTT</text>
+<rect x="310" y="40" width="95" height="54" rx="7" class="bx2"/><text x="357" y="60" text-anchor="middle" class="t-xs t-b">regional LB</text><text x="357" y="74" text-anchor="middle" class="t-xs">L4/L7</text><text x="357" y="87" text-anchor="middle" class="t-xs">≈ 1 ms</text>
+<rect x="420" y="40" width="95" height="54" rx="7" class="bx2"/><text x="467" y="60" text-anchor="middle" class="t-xs t-b">API gateway</text><text x="467" y="74" text-anchor="middle" class="t-xs">auth, limits,</text><text x="467" y="87" text-anchor="middle" class="t-xs">validate ≈ 2–10 ms</text>
+<rect x="530" y="40" width="80" height="54" rx="7" class="bx3"/><text x="570" y="60" text-anchor="middle" class="t-xs t-b">router</text><text x="570" y="74" text-anchor="middle" class="t-xs">pick replica</text><text x="570" y="87" text-anchor="middle" class="t-xs">≈ 1 ms</text>
+<rect x="625" y="40" width="85" height="54" rx="7" class="bx5"/><text x="667" y="60" text-anchor="middle" class="t-xs t-b">engine</text><text x="667" y="74" text-anchor="middle" class="t-xs">queue +</text><text x="667" y="87" text-anchor="middle" class="t-xs">prefill</text>
+<line x1="90" y1="67" x2="103" y2="67" class="ln" marker-end="url(#a111)"/><line x1="185" y1="67" x2="198" y2="67" class="ln" marker-end="url(#a111)"/><line x1="295" y1="67" x2="308" y2="67" class="ln" marker-end="url(#a111)"/><line x1="405" y1="67" x2="418" y2="67" class="ln" marker-end="url(#a111)"/><line x1="515" y1="67" x2="528" y2="67" class="ln" marker-end="url(#a111)"/><line x1="610" y1="67" x2="623" y2="67" class="ln" marker-end="url(#a111)"/>
+<path d="M667,96 C667,140 50,140 50,98" class="ln ln-s3" fill="none" marker-end="url(#a111)"/>
+<text x="360" y="153" text-anchor="middle" class="t-xs t-s3">token stream back over the same connections (SSE over HTTP/2 or HTTP/1.1)</text>
+<rect x="10" y="162" width="700" height="95" rx="8" class="bx"/>
+<text x="25" y="180" class="t-xs t-b">TTFT budget for a 2,000-token prompt to Atlas (user 1,500 km from the region, warm connection vs new connection)</text>
+<text x="25" y="200" class="t-xs">network round trip ≈ 20 ms · new connection: DNS + TCP + TLS ≈ 3 RTT ≈ 60 ms (0 if reused) · edge, LB, gateway, router ≈ 10 ms</text>
+<text x="25" y="218" class="t-xs">engine queue ≈ 0–200 ms (load-dependent) · prefill of 800 uncached tokens on a 70B replica ≈ 30–40 ms · first token decode ≈ 30 ms</text>
+<text x="25" y="236" class="t-xs t-b">total ≈ 100 ms (warm, idle) to ≈ 400 ms (new connection, loaded): the engine dominates when busy, the network when idle.</text>
+</svg>
+<figcaption><b>Figure 11.1 — From client to engine and back.</b> The forward path carries the request through name resolution, an edge that terminates TLS, regional load balancing, the API gateway and a router; the response streams back over the same connections. Typical latencies are shown in each box.</figcaption>
+</figure>
+
+<p>Walk through Figure 11.1. The client first resolves the API's host name through <strong>DNS</strong>, which, for a global service, returns an address chosen for the client's location (Chapter 12); results are cached, so this costs nothing on most requests. It then opens a TCP connection and negotiates <strong>TLS</strong> (encryption and server authentication); with TLS 1.3 this takes one round trip after TCP's own handshake, and connections are kept alive and reused, so a busy client pays it once. The connection usually terminates at an <strong>edge</strong> location close to the user—a point of presence of the provider's or a content-delivery network—that forwards the request over the provider's backbone to a region, where a <strong>regional load balancer</strong> spreads connections over many gateway instances. The <strong>API gateway</strong> authenticates the caller (an API key or token), validates the request (model name, parameters, size limits), checks rate limits and quotas, records usage, applies policies such as data-residency routing and guardrails (Chapter 18), and hands the request to the <strong>router</strong> of Chapter 8, which picks a replica. The engine queues the request, prefills it and starts streaming tokens back through the same chain.</p>
+<p>The budget at the bottom of Figure 11.1 makes the relative sizes plain. On a warm connection to an idle replica, time to first token is about 100 ms, of which the engine's prefill and first decode step are a third and the network round trip a fifth; everything the front door adds—edge, load balancer, gateway, router—is about 10 ms. On a new connection to a busy replica, connection setup adds tens of milliseconds and the engine's queue can add hundreds. The lesson is that the front door should be cheap and must never be the bottleneck, but that it controls the factors that dominate tail latency: whether connections are reused, which replica is chosen, and whether the request is admitted to a queue it cannot clear in time.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — latency budgets compose by addition, tails do not</div>
+<p>The mean latency of a request through stages in sequence is the sum of the stages' means. Percentiles do not add: the 99th percentile of a sum is generally less than the sum of the 99th percentiles, because the stages rarely hit their tails together, and more than the largest single 99th percentile. When a request fans out—a gateway that calls an authentication service, a quota store and a guardrail classifier in parallel and waits for all—the latency is the <em>maximum</em> of the calls, and if each has a probability \(\epsilon\) of a slow response, the fan-out of \(k\) calls is slow with probability \(1-(1-\epsilon)^k\approx k\epsilon\). Dean and Barroso's "tail at scale" argument (2013) is this observation applied to large services: every dependency on the request path multiplies the chance of a slow request, so front-door dependencies must be few, fast, and protected with timeouts and fallbacks.</p>
+</div>
+
+<h2 id="s11-2">11.2 Protocols for streaming tokens</h2>
+<p>An LLM response is a sequence of small messages—a few characters each—produced over seconds to minutes, and the client wants each as soon as it exists. HTTP was designed for request–response exchanges, and several mechanisms extend it to streams. Table 11.1 compares them.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 11.1 — Ways to stream tokens to a client</caption>
+<thead><tr><th>Mechanism</th><th>Direction</th><th>Transport</th><th>Used for</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Server-sent events (SSE)</td><td>server → client</td><td>HTTP/1.1 or HTTP/2</td><td>public LLM APIs (chat, completions)</td><td>text events <code>data: {...}\n\n</code>; simple; works through proxies</td></tr>
+<tr><td>Chunked HTTP/1.1, newline-delimited JSON</td><td>server → client</td><td>HTTP/1.1</td><td>some APIs and internal services</td><td>similar to SSE without the event format</td></tr>
+<tr><td>HTTP/2 streams</td><td>both</td><td>one TCP connection, multiplexed</td><td>SSE and gRPC underneath</td><td>many concurrent streams per connection; TCP head-of-line blocking</td></tr>
+<tr><td>HTTP/3 (QUIC)</td><td>both</td><td>UDP with per-stream reliability</td><td>edges, mobile clients</td><td>no head-of-line blocking across streams; faster connection setup</td></tr>
+<tr><td>WebSockets</td><td>both, full duplex</td><td>upgraded HTTP connection</td><td>real-time voice and interactive APIs</td><td>client can interrupt or send audio while receiving</td></tr>
+<tr><td>gRPC server streaming</td><td>both</td><td>HTTP/2</td><td>internal services (gateway ↔ engine)</td><td>typed messages (protobuf), deadlines, cancellation</td></tr>
+</tbody></table></div>
+
+<p>Public LLM APIs converged on <strong>server-sent events</strong> over HTTPS, for pragmatic reasons: SSE is plain HTTP, so it passes through corporate proxies, CDNs and load balancers that understand HTTP; it is trivially consumed in browsers and every language; and LLM streaming is one-directional once the prompt is sent. Each token or group of tokens is sent as an event: a line beginning <code>data:</code> followed by a JSON object with the token text, an index and sometimes log-probabilities, and a blank line; a final event carries usage counts and a finish reason. Real-time voice and interactive agents, where the client must send audio or interrupt while receiving, use <strong>WebSockets</strong> or WebRTC instead (Chapter 15). Inside the provider, between gateway and engine, <strong>gRPC</strong> streams are common because they carry typed messages, propagate deadlines and cancellations, and multiplex many streams over few connections.</p>
+<p>Figure 11.2 shows what actually travels on the wire for a short streamed answer. Each event is a self-contained line of text: the <code>data:</code> prefix, a JSON object repeating the response's identifier, model name and a "delta" with the new text, and a blank line. The final events carry the finish reason and usage counts, and a sentinel marks the end of the stream. Comment lines—a colon followed by anything—are ignored by clients and serve as keep-alives (§11.3).</p>
+
+<figure class="diagram" id="fig-11-2">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Anatomy of a server-sent events token stream">
+<rect x="20" y="20" width="680" height="190" rx="8" class="bx"/>
+<text x="35" y="44" class="t-xs">HTTP/1.1 200 OK · Content-Type: text/event-stream · Cache-Control: no-cache · (no compression, no proxy buffering)</text>
+<rect x="35" y="56" width="650" height="26" rx="4" class="bx4"/><text x="45" y="73" class="t-xs">data: {"id":"r_91f","model":"atlas-70b","choices":[{"index":0,"delta":{"content":"The"}}]}</text>
+<rect x="35" y="88" width="650" height="26" rx="4" class="bx4"/><text x="45" y="105" class="t-xs">data: {"id":"r_91f","model":"atlas-70b","choices":[{"index":0,"delta":{"content":" capital is"}}]}</text>
+<rect x="35" y="120" width="650" height="22" rx="4" class="bx3"/><text x="45" y="135" class="t-xs">: keep-alive (comment line, ignored by clients)</text>
+<rect x="35" y="148" width="650" height="26" rx="4" class="bx2"/><text x="45" y="165" class="t-xs">data: {"id":"r_91f","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"input":2000,"cached":1200,"output":4}}</text>
+<rect x="35" y="180" width="650" height="22" rx="4" class="bx5"/><text x="45" y="195" class="t-xs">data: [DONE]</text>
+<text x="360" y="232" text-anchor="middle" class="t-xs">≈ 100–200 bytes of framing per event for ≈ 4 bytes of text per token: coalesce tokens into fewer events.</text>
+</svg>
+<figcaption><b>Figure 11.2 — A token stream on the wire.</b> Each event repeats metadata around a few characters of text; the final event reports why generation stopped and how many tokens of each kind were used. The format is illustrative of OpenAI-compatible streaming APIs.</figcaption>
+</figure>
+
+<p>Streaming has overheads worth computing. A token of English text is about four characters, but an SSE event carrying it as JSON is typically 100–200 bytes, so the wire format can be thirty times larger than the content. For Atlas's \(2.2\times10^{11}\) output tokens a day, 150 bytes per token is about 33 TB a day of response traffic—cheap compared with GPUs (§4.8), but significant for gateways that must encrypt and frame every event, and for clients on slow mobile links. The common mitigation is to <em>coalesce</em>: send an event every few tokens or every 20–50 ms rather than every token, which cuts events by a factor of three to ten with no visible effect on a human reader. A second subtlety is <em>buffering</em>: proxies, compression middleware and some HTTP libraries buffer responses until a block fills, which turns a stream into a long wait followed by a burst. Streaming endpoints must disable response buffering and compression along the whole path, and set headers that tell intermediaries not to buffer.</p>
+
+<h2 id="s11-3">11.3 Long-lived connections</h2>
+<p>Every stream occupies a connection, or at least an HTTP/2 stream within one, for its whole duration, and the number of streams open at once follows from Little's law (Vol. I §1.10): concurrency equals arrival rate times duration. Atlas at its peak receives 10,000 requests per second, and a response streams for about 15 seconds on average, so about 150,000 streams are open at any moment—and the 5% of requests that are reasoning-heavy, streaming for several minutes, add tens of thousands more. Each open stream costs memory in the gateway (buffers, TLS state, request context, perhaps tens of kilobytes), a file descriptor, and work for every event sent. A gateway tier designed for short API calls, where concurrency is arrival rate times milliseconds, may be sized for a hundredth of this.</p>
+<p>Long streams also collide with timeouts that were designed for short requests. Load balancers and proxies close connections that have been <strong>idle</strong>—no bytes in either direction—for a configured time, often 60 seconds by default on cloud load balancers. A reasoning model that thinks for 90 seconds before emitting its first visible token, or a provider that does not stream hidden reasoning tokens, presents an idle connection that the load balancer kills at exactly 60 seconds. The client sees a dropped connection; the engine keeps generating for a client that is gone. The fixes are to raise idle timeouts on every hop for streaming endpoints, to send <em>keep-alive</em> events periodically (SSE allows comment lines beginning with a colon, which clients ignore), and to stream progress or reasoning summaries so the connection is not idle. Equally, maximum request durations configured in gateways and service meshes must exceed the longest permitted generation.</p>
+<p>Connections must also be <em>drained</em> gracefully. When a gateway instance is replaced during a rollout or scale-down, it should stop accepting new connections, let existing streams finish (subject to a grace period sized as in §6.7), and only then exit; regional load balancers support connection draining with configurable timeouts for this reason. And cancellation must propagate the other way: when a client disconnects, the gateway must tell the engine to abort the request, or the engine wastes GPU time generating tokens nobody will read. With 150,000 concurrent streams and a few percent of clients abandoning each minute, unpropagated cancellations can waste a measurable share of a fleet.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — sizing Atlas's streaming tier</div>
+<p><strong>Concurrency.</strong> 10,000 requests/s at peak. 95% are chat with mean streaming time 15 s; 5% are reasoning with mean 120 s. Concurrent streams: \(9{,}500\times15+500\times120\approx142{,}500+60{,}000\approx200{,}000\).</p>
+<p><strong>Memory.</strong> At about 64 KB per stream (TLS and HTTP state, buffers, request context), 200,000 streams need about 13 GB across the gateway tier: not a problem in aggregate, but instance limits on connections and file descriptors must be raised from defaults, and with 50 gateway instances each holds about 4,000 streams.</p>
+<p><strong>Event rate.</strong> About 4.5 million output tokens/s fleet-wide at peak (Table 1.1: \(2.4+1.4+0.75\) million). Coalescing tokens into events every 30 ms gives at most about 33 events per second per stream, or at most about 6.7 million events/s across 200,000 streams if every stream emitted continuously; in practice fewer, since many streams are waiting on prefill or reasoning. Each event is encrypted and framed: CPU, not bandwidth, sets the gateway's size.</p>
+<p><strong>Timeouts.</strong> Reasoning requests may produce no visible output for minutes: send an SSE comment every 15 s; set idle timeouts to 10 minutes on load balancers and maximum request duration to 30 minutes on the gateway; propagate client disconnects to the engine.</p>
+</div>
+
+<h2 id="s11-4">11.4 Rate limits for LLMs</h2>
+<p>A rate limit restricts how much of a shared service one caller may use per unit time. It protects the service from overload, divides capacity fairly among tenants, enforces commercial tiers, and contains abuse. For web APIs, limits are usually stated in requests per second or minute. For LLM APIs, a request is the wrong unit, because cost varies by orders of magnitude between requests. Providers therefore define several limits at once: <strong>requests per minute</strong> (to cap per-request overheads and abuse), <strong>input tokens per minute</strong> and <strong>output tokens per minute</strong> (to cap the actual work), sometimes <strong>concurrent requests</strong> (to cap the KV memory and decode slots a tenant can occupy at once), and longer-period <strong>quotas</strong> (tokens or dollars per day or month). A request is admitted only if it satisfies all of them.</p>
+<p>The classical algorithm for a rate limit is the <strong>token bucket</strong> (Vol. I §27.5): a bucket of capacity \(b\) fills at rate \(r\) units per second, and a request costing \(k\) units is admitted if the bucket holds at least \(k\), which are then removed. Over any interval of length \(\Delta t\), admitted work is at most \(b+r\Delta t\): the rate is \(r\) on average with bursts up to \(b\). An equivalent formulation used by many production limiters is the <strong>generic cell rate algorithm</strong> (GCRA), from telecommunications, which stores a single timestamp per key instead of a counter and a time.</p>
+
+<div class="box thm">
+<div class="box-title">Algorithm 11.1 — GCRA for a limit of rate \(r\) with burst tolerance \(b\)</div>
+<p>Keep, for each key, a <em>theoretical arrival time</em> \(\theta\) (initially 0). Let \(\delta=1/r\) be the emission interval and \(\tau_b=(b-1)\delta\) the burst tolerance. When a request costing \(k\) units arrives at time \(t\):</p>
+<p>1. Set \(\theta'=\max(\theta,t)+k\delta\).<br>2. If \(\theta'-t\le\tau_b+\delta\), admit the request and store \(\theta\leftarrow\theta'\).<br>3. Otherwise reject it, and report a retry time \(\theta'-(\tau_b+\delta)-t\) seconds.</p>
+<p><em>Why it is a token bucket.</em> The quantity \((\tau_b+\delta)-(\theta-t)\), divided by \(\delta\), is the number of units the bucket would hold: \(\theta\) advances by \(\delta\) per admitted unit (removing tokens) and the gap \(\theta-t\) shrinks at unit rate as time passes (refilling at rate \(r\)), capped when \(\theta\le t\) (a full bucket). The test admits exactly when the bucket holds at least \(k\). The advantage is storage and atomicity: one number per key, updated with a single compare-and-set.</p>
+</div>
+
+<p>LLM limits raise a problem that request-based limits do not: <em>output tokens are unknown at admission</em>. A request might generate 10 tokens or the caller's maximum of 8,000. Admitting it against the output-token limit requires a guess, and the two standard approaches trade accuracy for simplicity. The first <em>reserves</em> the caller's declared maximum output (<code>max_tokens</code>) at admission and <em>refunds</em> the unused part when the request finishes. This never lets a caller exceed the limit, but it penalises callers who set large maxima and makes admission conservative. The second admits against an <em>estimate</em>—the caller's recent average output length—and charges the true count afterwards, letting the bucket go negative so that later requests are delayed; this is more permissive and occasionally lets a burst through. Input tokens can be counted exactly at admission, though tokenising every prompt at the gateway costs CPU, so some gateways estimate from character counts and reconcile later.</p>
+
+<details class="drill">
+<summary>Drill 11.1 — Reserving output tokens</summary>
+<p>A tenant has an output-token limit of 400,000 tokens per minute with a burst of 100,000. Its requests declare <code>max_tokens</code> of 4,000 but generate 500 on average. If the gateway reserves <code>max_tokens</code> at admission and refunds on completion, and each request takes 20 s, how many requests per second can the tenant sustain? How does that compare with its true output rate?</p>
+<p><em>Solution.</em> While a request runs, 4,000 tokens are reserved; at completion 3,500 are refunded. The sustained admitted rate is limited by tokens actually charged (500 per request): \(400{,}000/60/500\approx13\) requests/s. But reservations in flight occupy the bucket: at 13 requests/s with 20 s duration, about 267 requests are in flight, holding \(267\times3{,}500\approx930{,}000\) tokens of unrefunded reservation—far above the 100,000 burst capacity. The bucket therefore cannot hold the reservations, and the tenant is throttled to about \(100{,}000/4000=25\) requests in flight, or 1.25 requests/s: a tenth of its entitlement. Reservation by <code>max_tokens</code> severely penalises callers with large maxima; estimating from history, or limiting concurrency separately, is fairer.</p>
+</details>
+
+<h2 id="s11-5">11.5 Distributed rate limiting</h2>
+<p>A single gateway could keep every tenant's bucket in memory. Atlas has dozens of gateway instances per region and several regions, and a tenant's requests arrive at all of them, so its limit must be enforced across instances. There are three common designs, sketched in Figure 11.3, with different points on a trade-off between accuracy, latency and availability.</p>
+
+<figure class="diagram" id="fig-11-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Three designs for distributed rate limiting">
+<rect x="10" y="20" width="225" height="225" rx="10" class="bx"/>
+<text x="122" y="42" text-anchor="middle" class="t-sm t-b">Central store</text>
+<rect x="30" y="60" width="50" height="28" rx="5" class="bx2"/><text x="55" y="78" text-anchor="middle" class="t-xs">gw</text>
+<rect x="95" y="60" width="50" height="28" rx="5" class="bx2"/><text x="120" y="78" text-anchor="middle" class="t-xs">gw</text>
+<rect x="160" y="60" width="50" height="28" rx="5" class="bx2"/><text x="185" y="78" text-anchor="middle" class="t-xs">gw</text>
+<rect x="70" y="130" width="100" height="34" rx="6" class="bx4"/><text x="120" y="151" text-anchor="middle" class="t-xs t-b">Redis / store</text>
+<line x1="55" y1="88" x2="100" y2="130" class="ln"/><line x1="120" y1="88" x2="120" y2="130" class="ln"/><line x1="185" y1="88" x2="140" y2="130" class="ln"/>
+<text x="122" y="190" text-anchor="middle" class="t-xs">exact, atomic per request</text>
+<text x="122" y="206" text-anchor="middle" class="t-xs">+1 network hop per request</text>
+<text x="122" y="222" text-anchor="middle" class="t-xs">store is a dependency</text>
+<rect x="248" y="20" width="225" height="225" rx="10" class="bx"/>
+<text x="360" y="42" text-anchor="middle" class="t-sm t-b">Local buckets, split quota</text>
+<rect x="268" y="60" width="50" height="40" rx="5" class="bx2"/><text x="293" y="78" text-anchor="middle" class="t-xs">gw</text><text x="293" y="92" text-anchor="middle" class="t-xs">r/n</text>
+<rect x="333" y="60" width="50" height="40" rx="5" class="bx2"/><text x="358" y="78" text-anchor="middle" class="t-xs">gw</text><text x="358" y="92" text-anchor="middle" class="t-xs">r/n</text>
+<rect x="398" y="60" width="50" height="40" rx="5" class="bx2"/><text x="423" y="78" text-anchor="middle" class="t-xs">gw</text><text x="423" y="92" text-anchor="middle" class="t-xs">r/n</text>
+<text x="360" y="150" text-anchor="middle" class="t-xs">no coordination on the path;</text>
+<text x="360" y="166" text-anchor="middle" class="t-xs">quota rebalanced periodically</text>
+<text x="360" y="190" text-anchor="middle" class="t-xs">fast, always available</text>
+<text x="360" y="206" text-anchor="middle" class="t-xs">under-admits when traffic is</text>
+<text x="360" y="222" text-anchor="middle" class="t-xs">uneven across gateways</text>
+<rect x="486" y="20" width="225" height="225" rx="10" class="bx"/>
+<text x="598" y="42" text-anchor="middle" class="t-sm t-b">Local + async sync</text>
+<rect x="506" y="60" width="50" height="28" rx="5" class="bx2"/><text x="531" y="78" text-anchor="middle" class="t-xs">gw</text>
+<rect x="571" y="60" width="50" height="28" rx="5" class="bx2"/><text x="596" y="78" text-anchor="middle" class="t-xs">gw</text>
+<rect x="636" y="60" width="50" height="28" rx="5" class="bx2"/><text x="661" y="78" text-anchor="middle" class="t-xs">gw</text>
+<rect x="546" y="130" width="100" height="34" rx="6" class="bx4"/><text x="596" y="151" text-anchor="middle" class="t-xs t-b">aggregator</text>
+<line x1="531" y1="88" x2="576" y2="130" class="ln" stroke-dasharray="4 3"/><line x1="596" y1="88" x2="596" y2="130" class="ln" stroke-dasharray="4 3"/><line x1="661" y1="88" x2="616" y2="130" class="ln" stroke-dasharray="4 3"/>
+<text x="598" y="190" text-anchor="middle" class="t-xs">decide locally, report counts</text>
+<text x="598" y="206" text-anchor="middle" class="t-xs">every Δ; overshoot bounded</text>
+<text x="598" y="222" text-anchor="middle" class="t-xs">by n · r · Δ</text>
+</svg>
+<figcaption><b>Figure 11.3 — Enforcing one limit across many gateways.</b> A central store is exact but adds a hop and a dependency; splitting the quota is fast but rigid; local decisions with periodic synchronisation are the common compromise, with an overshoot that the synchronisation interval controls.</figcaption>
+</figure>
+
+<p>A <strong>central store</strong>—typically Redis or a similar in-memory database, with the bucket or GCRA update performed atomically by a script—gives exact enforcement: every gateway consults the same state for every request. It adds a network round trip (sub-millisecond within a zone) and makes the store a dependency on the request path, which must be replicated and must fail sensibly (§1.7: keep enforcing the last known limits locally, rather than reject all or admit all). Its throughput must cover every request, which for hot tenants means sharding by key. <strong>Local buckets with a split quota</strong> give each of \(n\) gateways a share \(r/n\) of the limit and enforce it locally, with no coordination on the request path. They are fast and robust but inaccurate when a tenant's traffic is uneven across gateways—a tenant whose requests all land on one gateway gets only \(r/n\)—so the shares must be rebalanced periodically from observed traffic. <strong>Local decisions with asynchronous synchronisation</strong> let each gateway decide locally using its own estimate of the tenant's global usage, and exchange counts with an aggregator every \(\Delta\) seconds. Between synchronisations each gateway may admit up to the full remaining allowance, so in the worst case \(n\) gateways together over-admit by about \(n\,r\,\Delta\); with 50 gateways, a 100 ms sync interval and a limit of 1,000 tokens per second, that is up to 5,000 tokens—a five-second overshoot in a pathological burst, negligible in normal traffic.</p>
+<details class="drill">
+<summary>Drill 11.2 — How much can synchronised local limits overshoot?</summary>
+<p>A tenant has a limit of 600,000 input tokens per minute (10,000 per second). Its requests are spread over 40 gateway instances, each making local decisions and synchronising counts every 200 ms. A misbehaving client suddenly sends everything it can. What is the worst-case over-admission before the gateways learn of each other's admissions, and what would reduce it?</p>
+<p><em>Solution.</em> Between synchronisations each gateway may believe the tenant has its full remaining allowance. In the worst case all 40 admit up to the allowance for one interval: about \(n\,r\,\Delta=40\times10{,}000\times0.2=80{,}000\) tokens, eight seconds' worth of the limit, on top of the bucket's burst. Afterwards the global state is known and the tenant is throttled until it is back within its limit, so the long-run rate is still enforced. To reduce the overshoot: synchronise faster for tenants near their limits, give each gateway a local cap of a few times its fair share \(r/n\), or route a tenant's traffic to a small subset of gateways (sharding by tenant), which reduces \(n\) for that tenant.</p>
+</details>
+
+<p>Which design fits depends on what the limit protects. Limits that protect the service's capacity can be approximate, because capacity planning has slack and admission control (§11.6) catches the rest. Limits that enforce money—prepaid credits, free-tier quotas that abusers try to exceed—need tighter accuracy, often with a central store for the final check of long-period quotas and local approximations for per-second smoothing. Many providers combine them: fast local GCRA for requests and tokens per minute, synchronised periodically, plus an exact central ledger for daily and monthly quotas. Rate limits divide capacity among callers who behave; protecting the service when <em>everyone</em> wants more than exists is the job of admission control.</p>
+
+<h2 id="s11-6">11.6 Admission control, load shedding and retries</h2>
+<p>When demand exceeds capacity, a service must choose which work to do. The worst choice is not to choose: to accept every request into an ever-growing queue. Each request then waits longer, until requests wait longer than their clients are willing to wait; clients time out and retry, adding load; the engines spend their capacity on requests whose clients have already gone. Throughput stays high while <em>goodput</em>—requests completed within their deadline (Vol. I §13.2)—collapses. Figure 11.4 shows the effect in the simplest queueing model.</p>
+
+<figure class="chart" id="fig-11-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Goodput against offered load, M/M/1 queue with a deadline of 10 mean service times","height":330,
+ "x":{"label":"Offered load ρ = λ/μ","min":0.4,"max":1.5,"ticks":[0.5,0.75,1,1.25,1.5]},
+ "y":{"label":"Goodput (fraction of capacity meeting deadline)","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"Admit everything (FIFO, unbounded queue)","color":"s2","points":[[0.5,0.497],[0.7,0.665],[0.8,0.692],[0.9,0.569],[0.95,0.374],[0.99,0.094],[1.0,0.0],[1.25,0.0],[1.5,0.0]]},
+  {"name":"Admission control (bounded queue, shed excess)","color":"s3","points":[[0.5,0.497],[0.7,0.69],[0.8,0.77],[0.9,0.82],[1.0,0.85],[1.25,0.86],[1.5,0.86]]}
+ ]}
+</script>
+<figcaption><b>Figure 11.4 — Without admission control, goodput collapses before the service is even fully loaded.</b> Admitting everything, the fraction of requests meeting a deadline of ten service times peaks near 80% load and falls to zero as load approaches capacity, because waiting times grow without bound. Bounding the queue so that admitted requests can meet their deadline keeps goodput near capacity, rejecting the excess. The admission-control curve is schematic.</figcaption>
+</figure>
+
+<p>Figure 11.4's red curve is the formula \(\lambda\Pr(T\le t_{\text{dl}})\) for an M/M/1 queue, where the time in system \(T\) is exponential with rate \(\mu-\lambda\): goodput \(=\lambda\bigl(1-e^{-(\mu-\lambda)t_{\text{dl}}}\bigr)\), which reaches zero at \(\lambda=\mu\). Real LLM services are more complicated—many servers, continuous batching, heavy-tailed service times—but the qualitative lesson survives: as load approaches capacity, queueing delay grows without bound, and a service that admits everything delivers almost nothing useful. The green curve is what <strong>admission control</strong> achieves: the service admits a request only if it expects to meet the request's deadline, and rejects the rest immediately, so the requests it does serve finish in time. Rejection is unpleasant, but a fast rejection lets a client retry elsewhere or later, while a slow timeout wastes the client's time and the service's capacity.</p>
+<figure class="diagram" id="fig-11-5">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Admission control decision for an LLM request">
+<defs><marker id="a115" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="100" width="110" height="50" rx="8" class="bx"/><text x="70" y="122" text-anchor="middle" class="t-xs t-b">request</text><text x="70" y="138" text-anchor="middle" class="t-xs">tenant, tier, n_in</text>
+<rect x="150" y="100" width="130" height="50" rx="8" class="bx4"/><text x="215" y="122" text-anchor="middle" class="t-xs t-b">rate limits ok?</text><text x="215" y="138" text-anchor="middle" class="t-xs">requests, tokens, conc.</text>
+<rect x="305" y="100" width="140" height="50" rx="8" class="bx4"/><text x="375" y="118" text-anchor="middle" class="t-xs t-b">estimated TTFT</text><text x="375" y="132" text-anchor="middle" class="t-xs">≤ deadline on best</text><text x="375" y="145" text-anchor="middle" class="t-xs">replica? (§8.4)</text>
+<rect x="470" y="100" width="120" height="50" rx="8" class="bx4"/><text x="530" y="122" text-anchor="middle" class="t-xs t-b">tier within</text><text x="530" y="138" text-anchor="middle" class="t-xs">its share?</text>
+<rect x="615" y="100" width="95" height="50" rx="8" class="bx3"/><text x="662" y="122" text-anchor="middle" class="t-xs t-b">admit</text><text x="662" y="138" text-anchor="middle" class="t-xs">route, stream</text>
+<line x1="125" y1="125" x2="148" y2="125" class="ln" marker-end="url(#a115)"/><line x1="280" y1="125" x2="303" y2="125" class="ln" marker-end="url(#a115)"/><line x1="445" y1="125" x2="468" y2="125" class="ln" marker-end="url(#a115)"/><line x1="590" y1="125" x2="613" y2="125" class="ln" marker-end="url(#a115)"/>
+<rect x="150" y="190" width="130" height="46" rx="8" class="bx2"/><text x="215" y="210" text-anchor="middle" class="t-xs t-b">429 + Retry-After</text><text x="215" y="226" text-anchor="middle" class="t-xs">which limit</text>
+<rect x="305" y="190" width="140" height="46" rx="8" class="bx2"/><text x="375" y="210" text-anchor="middle" class="t-xs t-b">degrade or 503</text><text x="375" y="226" text-anchor="middle" class="t-xs">smaller model / retry later</text>
+<rect x="470" y="190" width="120" height="46" rx="8" class="bx2"/><text x="530" y="210" text-anchor="middle" class="t-xs t-b">shed or defer</text><text x="530" y="226" text-anchor="middle" class="t-xs">batch queue</text>
+<line x1="215" y1="150" x2="215" y2="188" class="ln" marker-end="url(#a115)"/><line x1="375" y1="150" x2="375" y2="188" class="ln" marker-end="url(#a115)"/><line x1="530" y1="150" x2="530" y2="188" class="ln" marker-end="url(#a115)"/>
+<text x="228" y="174" class="t-xs">no</text><text x="388" y="174" class="t-xs">no</text><text x="543" y="174" class="t-xs">no</text>
+<text x="360" y="40" text-anchor="middle" class="t-xs">Each check is cheap and local; every "no" is a fast, typed answer instead of a slow timeout.</text>
+<text x="360" y="60" text-anchor="middle" class="t-xs">The deadline check uses the router's view of queued prefill tokens and the request's uncached length.</text>
+</svg>
+<figcaption><b>Figure 11.5 — Admission control as a sequence of cheap checks.</b> A request is admitted only if it is within its limits, can meet its deadline on the best available replica, and its tier is within its share of capacity during overload; otherwise it receives an immediate, actionable answer.</figcaption>
+</figure>
+
+<p>Figure 11.5 arranges admission as a sequence of cheap checks, each of which ends in a fast, typed answer if it fails. Admission decisions for LLMs can use more information than generic services have. The gateway knows each request's input length and the router knows each replica's prefill queue (§8.4), so it can estimate the request's TTFT and reject it if the estimate exceeds the deadline. It knows the tenant's priority and can shed lower tiers first (free before paid, batch before interactive). And it can adapt the limit itself: instead of a fixed queue bound, an <strong>adaptive concurrency limit</strong> raises the number of in-flight requests while latency stays near its minimum and lowers it when latency rises, the same principle as TCP Vegas congestion control, which Netflix and others applied to service-to-service traffic.</p>
+<p>The other half of overload is the client's behaviour. A client whose request fails or times out retries. If a fraction \(p\) of attempts fail and each client retries up to \(k\) times immediately, each original request generates on average \(1+p+p^2+\dots+p^k\) attempts. When failures are caused by overload, retries add load exactly when the service has none to spare, raising \(p\), which raises retries further: a <strong>retry storm</strong>. Figure 11.6 shows the amplification.</p>
+
+<figure class="chart" id="fig-11-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Load amplification from retries: attempts per original request = 1 + p + … + p^k","height":320,
+ "x":{"label":"Probability an attempt fails, p","min":0.05,"max":0.95,"fmt":"pct","ticks":[0.1,0.3,0.5,0.7,0.9]},
+ "y":{"label":"Attempts per request","min":1,"max":7,"ticks":[1,2,3,4,5,6,7]},
+ "series":[
+  {"name":"k = 1 retry","color":"s3","points":[[0.1,1.1],[0.3,1.3],[0.5,1.5],[0.7,1.7],[0.9,1.9]]},
+  {"name":"k = 3 retries","color":"s1","points":[[0.1,1.11],[0.3,1.42],[0.5,1.88],[0.7,2.53],[0.9,3.44]]},
+  {"name":"k = 10 retries","color":"s2","points":[[0.1,1.11],[0.3,1.43],[0.5,2.0],[0.7,3.27],[0.9,6.86]]}
+ ]}
+</script>
+<figcaption><b>Figure 11.6 — Retries amplify overload.</b> At 50% failure, three retries nearly double offered load; at 90%, ten retries multiply it by almost seven. Because overload raises \(p\), the feedback can turn a modest shortfall into an outage.</figcaption>
+</figure>
+
+<p>The defences against retry storms are well established, and an LLM service must apply them on both sides. Clients and SDKs should retry with <strong>exponential backoff and jitter</strong>—waiting a random time that doubles with each attempt—so that retries spread out instead of arriving in synchronised waves, and should respect <code>Retry-After</code> headers. Services should cap retries with <strong>retry budgets</strong> (retries may add at most, say, 10% to the load), distinguish errors that should be retried (429 Too Many Requests, 503 Service Unavailable with a retry time) from those that should not (400 Bad Request), and make retries cheap: an idempotency key lets a retried request be recognised and its cached result returned, and a resumable stream lets a client continue from the last token received rather than start over. Internal services between gateway and engine follow the same rules, since an internal retry storm is just as destructive.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a 5% error spike becomes a 40% load spike</div>
+<p><strong>Incident.</strong> A bad deployment makes 5% of Atlas's replicas return errors. Clients use an SDK that retries immediately up to 10 times, and the gateway itself retries failed upstream calls up to 3 times. The fleet was at 85% utilisation.</p>
+<p><strong>Amplification.</strong> With \(p=0.05\), the gateway's 3 retries turn each client attempt into \(1+0.05+0.05^2+0.05^3\approx1.05\) upstream calls: harmless. But retries land on the healthy replicas, utilisation passes 90%, queues lengthen, TTFTs exceed the client's 10 s timeout for some requests, which now count as failures too: \(p\) rises to 30%. Clients' 10 retries now give \(1.43\) attempts per request, the gateway's 3 retries multiply that by 1.42: about 2 upstream calls per original request at the worst moment, against a fleet already near capacity. Load roughly doubles; within a minute most requests fail.</p>
+<p><strong>Fixes.</strong> Client backoff with jitter and at most 2–3 retries; gateway retry budget of 10%; retries only to a different replica; fast rejection (429 with Retry-After) once estimated TTFT exceeds the deadline; idempotency keys and resumable streams so retries do not redo work; and automated rollback of the bad deployment, which was the actual cause.</p>
+</div>
+
+<h2 id="s11-7">11.7 Designing the API</h2>
+<p>The last element of the front door is the API itself, whose design determines how well clients can use the service and how well the service can protect itself. By 2024 most LLM providers and open-source engines offered an interface compatible with OpenAI's chat-completions API—a list of messages in, a message or stream of message deltas out—so that client libraries and applications could switch between providers; newer interfaces added server-side conversation state, tool calls and structured outputs (Chapter 17). Whatever the shape, several properties matter for infrastructure. The request should declare <strong>limits</strong>—maximum output tokens, a deadline or timeout, stop sequences—so the service can plan and enforce them. It should carry an <strong>idempotency key</strong>, so retries are safe, and receive a <strong>request identifier</strong> that appears in logs and bills, so problems can be traced end to end. Responses should report <strong>usage</strong>—input, cached input, output and reasoning tokens—in the final event, so clients can track cost (§10.4). Errors should be <strong>typed and actionable</strong>: rate-limited (retry after so many seconds), overloaded (retry elsewhere or later), invalid request (do not retry), content refused (do not retry). And streams should be <strong>resumable</strong> where possible, identified by a stream ID and an offset, so a dropped connection costs a reconnect rather than a regeneration.</p>
+<p>Versioning deserves a word. An API that names models by mutable aliases ("latest") lets the provider upgrade models silently, which surprises clients whose prompts were tuned to the old behaviour; one that names models by dated versions lets clients pin and migrate deliberately, at the cost of the provider serving several versions at once (Chapter 8's lifecycle). Most providers offer both: dated versions for stability and aliases for convenience, with published deprecation schedules. With the front door designed, the next question is which region's front door a user reaches, and what happens when that region fails.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We followed a request from the client to the engine within one region: through TLS, load balancers and a gateway that authenticates, limits and admits it, over a streaming protocol that keeps a connection open for minutes. But Atlas's users are on every continent, some of their data may legally be processed only in particular countries, and whole regions occasionally fail. Which region should answer each request? How is traffic steered there, and moved away when a region is degraded? What state—prefix caches, conversation history, uploaded files—must follow a user across regions? And how much capacity must each region hold to absorb another's failure? Chapter 12 takes up multi-region serving and disaster recovery.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>A request passes DNS, TCP/TLS (reused connections avoid 1–3 RTTs), an edge, a regional load balancer, the API gateway (auth, validation, limits, metering, policy) and a router to an engine; the front door should add about 10 ms, while queueing and prefill dominate TTFT under load.</li>
+<li>Tail latency compounds over dependencies: fan-out to \(k\) services is slow with probability \(\approx k\epsilon\); keep front-door dependencies few and protected.</li>
+<li>Public LLM APIs stream with SSE over HTTP/1.1 or HTTP/2; real-time APIs use WebSockets; internal hops use gRPC. JSON framing inflates tokens about 30×; coalesce events and disable buffering.</li>
+<li>Concurrent streams = arrival rate × duration (Little's law): about 200,000 for Atlas; raise connection limits, idle timeouts (default 60 s kills reasoning streams), send keep-alives, drain gracefully, propagate cancellations.</li>
+<li>LLM limits combine requests, input tokens, output tokens, concurrency and quotas; token bucket and GCRA (one timestamp per key) enforce them; unknown output tokens are reserved and refunded or estimated and reconciled.</li>
+<li>Distributed limiting: central store (exact, extra hop and dependency), split local quotas (fast, rigid), or local decisions with periodic sync (overshoot \(\lesssim n\,r\,\Delta\)).</li>
+<li>Without admission control, goodput collapses as load nears capacity (M/M/1: \(\lambda(1-e^{-(\mu-\lambda)t_{\text{dl}}})\to0\)); shed early using estimated TTFT, priorities and adaptive concurrency limits.</li>
+<li>Retries amplify load by \(1+p+\dots+p^k\); use backoff with jitter, retry budgets, typed errors, Retry-After, idempotency keys and resumable streams.</li>
+<li>APIs should declare limits and deadlines, carry idempotency keys and request IDs, report usage by token type, return actionable errors, support resumable streams and pinned model versions.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci11-mcq-01" data-topic="§11.1 Journey">
+<p class="q">On a warm connection to an idle replica, what dominates TTFT for a 2,000-token prompt?</p>
+<ol class="opts"><li>The API gateway</li><li data-correct>Network round trip plus engine prefill and first decode</li><li>DNS</li><li>TLS handshakes</li></ol>
+<div class="explain">The front door adds about 10 ms in total.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-02" data-topic="§11.1 Journey">
+<p class="q">Why do connection reuse and keep-alive matter for LLM API latency?</p>
+<ol class="opts"><li>They compress tokens</li><li data-correct>A new connection costs DNS, TCP and TLS round trips (tens of ms) that reuse avoids</li><li>They increase GPU throughput</li><li>They are required by SSE</li></ol>
+<div class="explain">TLS 1.3 needs one round trip after TCP's handshake.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-03" data-topic="§11.1 Journey">
+<p class="q">A gateway calls 4 services in parallel, each slow 1% of the time. Approximately how often is the gateway slow?</p>
+<ol class="opts"><li>0.01%</li><li>1%</li><li data-correct>4%</li><li>25%</li></ol>
+<div class="explain">\(1-(0.99)^4\approx3.9\%\).</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-04" data-topic="§11.1 Journey">
+<p class="q">Which functions belong to the API gateway? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Authentication</li><li data-correct>Rate limiting and quotas</li><li data-correct>Usage metering</li><li>Continuous batching</li></ol>
+<div class="explain">Batching is the engine's job.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-05" data-topic="§11.2 Protocols">
+<p class="q">Why did public LLM APIs converge on server-sent events?</p>
+<ol class="opts"><li>They are binary and compact</li><li data-correct>They are plain HTTP, pass through proxies and CDNs, are easy to consume, and streaming is one-directional</li><li>They support audio</li><li>They avoid TLS</li></ol>
+<div class="explain">WebSockets are used when the client must also send during the response.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-06" data-topic="§11.2 Protocols">
+<p class="q">HTTP/3 improves on HTTP/2 for streaming mainly by:</p>
+<ol class="opts"><li>Using JSON</li><li data-correct>Avoiding TCP head-of-line blocking across streams (QUIC over UDP) and faster connection setup</li><li>Removing encryption</li><li>Supporting SSE only</li></ol>
+<div class="explain">One lost packet no longer stalls every stream on the connection.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-07" data-topic="§11.2 Protocols">
+<p class="q">Which protocol suits a real-time voice API where the user can interrupt?</p>
+<ol class="opts"><li>SSE</li><li>Chunked HTTP/1.1</li><li data-correct>WebSockets (or WebRTC)</li><li>DNS</li></ol>
+<div class="explain">Full duplex is needed.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-08" data-topic="§11.2 Protocols">
+<p class="q">A stream arrives at the client in large bursts after long pauses. The likely cause is:</p>
+<ol class="opts"><li>The GPU is slow</li><li data-correct>A proxy or compression layer buffering the response</li><li>DNS caching</li><li>Rate limiting</li></ol>
+<div class="explain">Disable buffering and compression for streaming endpoints.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-09" data-topic="§11.2 Protocols">
+<p class="q">Why coalesce several tokens per SSE event?</p>
+<ol class="opts"><li>To change the output</li><li data-correct>Each event costs ~100–200 bytes and framing/encryption CPU; coalescing every 20–50 ms cuts overhead with no visible effect</li><li>Clients require it</li><li>To bypass rate limits</li></ol>
+<div class="explain">Wire format can be 30× the content.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-10" data-topic="§11.3 Connections">
+<p class="q">At 10,000 requests/s with a mean stream duration of 15 s, concurrent streams are about:</p>
+<ol class="opts"><li>667</li><li>15,000</li><li data-correct>150,000</li><li>1.5 million</li></ol>
+<div class="explain">Little's law.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-11" data-topic="§11.3 Connections">
+<p class="q">Reasoning responses are cut off at exactly 60 seconds. The most likely cause is:</p>
+<ol class="opts"><li>The model's max tokens</li><li data-correct>A load balancer's idle timeout closing a connection with no bytes flowing</li><li>GPU failure</li><li>DNS TTL</li></ol>
+<div class="explain">Raise timeouts and send SSE keep-alive comments.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-12" data-topic="§11.3 Connections">
+<p class="q">Why must client disconnects be propagated to the engine?</p>
+<ol class="opts"><li>For billing only</li><li data-correct>Otherwise the engine keeps generating tokens nobody will read, wasting GPU time</li><li>To close TLS</li><li>It is not necessary</li></ol>
+<div class="explain">Abandonments at scale waste measurable capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-13" data-topic="§11.3 Connections">
+<p class="q">What typically sets the size of a streaming gateway tier for LLMs?</p>
+<ol class="opts"><li>Bandwidth</li><li data-correct>CPU for encrypting and framing events, and connection limits</li><li>GPU memory</li><li>DNS queries</li></ol>
+<div class="explain">Memory per stream is modest in aggregate.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-14" data-topic="§11.4 Rate limits">
+<p class="q">Why are requests-per-minute limits insufficient for LLM APIs?</p>
+<ol class="opts"><li>Requests are uncountable</li><li data-correct>Request costs vary by orders of magnitude; token limits cap actual work</li><li>Clients send no requests</li><li>They are too strict</li></ol>
+<div class="explain">Providers combine request, input-token, output-token and concurrency limits.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-15" data-topic="§11.4 Rate limits">
+<p class="q">A token bucket with capacity \(b\) and rate \(r\) admits at most how much work over an interval \(\Delta t\)?</p>
+<ol class="opts"><li>\(r\Delta t\)</li><li data-correct>\(b+r\Delta t\)</li><li>\(b\)</li><li>\(br\Delta t\)</li></ol>
+<div class="explain">Average rate \(r\), bursts up to \(b\).</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-16" data-topic="§11.4 Rate limits">
+<p class="q">What does GCRA store per key?</p>
+<ol class="opts"><li>A list of request times</li><li data-correct>A single theoretical arrival time</li><li>A counter and a window start</li><li>Nothing</li></ol>
+<div class="explain">One number, updatable with a compare-and-set.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-17" data-topic="§11.4 Rate limits">
+<p class="q">The main drawback of reserving <code>max_tokens</code> against an output-token limit is:</p>
+<ol class="opts"><li>It lets callers exceed limits</li><li data-correct>It over-reserves for callers whose maxima exceed actual outputs, throttling them far below their entitlement</li><li>It is hard to implement</li><li>It ignores input tokens</li></ol>
+<div class="explain">Drill 11.1 throttled a tenant to a tenth of its entitlement.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-18" data-topic="§11.4 Rate limits">
+<p class="q">Which limit caps the KV memory and decode slots a tenant can occupy?</p>
+<ol class="opts"><li>Requests per minute</li><li>Monthly quota</li><li data-correct>Concurrent requests</li><li>Input tokens per minute</li></ol>
+<div class="explain">Long requests occupy capacity for their whole duration.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-19" data-topic="§11.5 Distributed">
+<p class="q">The main downside of a central rate-limit store is:</p>
+<ol class="opts"><li>Inaccuracy</li><li data-correct>An extra hop per request and a dependency on the request path</li><li>It cannot handle tokens</li><li>It requires GPUs</li></ol>
+<div class="explain">It must be replicated and fail sensibly.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-20" data-topic="§11.5 Distributed">
+<p class="q">With split local quotas, a tenant whose traffic all reaches one of \(n\) gateways gets:</p>
+<ol class="opts"><li>Its full limit</li><li data-correct>Only \(r/n\) until shares are rebalanced</li><li>Unlimited throughput</li><li>Nothing</li></ol>
+<div class="explain">Split quotas are rigid under uneven traffic.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-21" data-topic="§11.5 Distributed">
+<p class="q">With local decisions and synchronisation every \(\Delta\), worst-case over-admission is about:</p>
+<ol class="opts"><li>Zero</li><li data-correct>\(n\,r\,\Delta\)</li><li>\(r/n\)</li><li>\(b\)</li></ol>
+<div class="explain">Each gateway may admit the full allowance between syncs.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-22" data-topic="§11.5 Distributed">
+<p class="q">Which limits need the most exact enforcement?</p>
+<ol class="opts"><li>Per-second smoothing for capacity</li><li data-correct>Money-like limits: prepaid credits and abuse-prone free-tier quotas</li><li>Concurrency limits for idle tenants</li><li>None</li></ol>
+<div class="explain">Capacity limits can be approximate.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-23" data-topic="§11.6 Admission">
+<p class="q">In an M/M/1 queue with deadline \(t_{\text{dl}}\), goodput as \(\lambda\to\mu\) tends to:</p>
+<ol class="opts"><li>\(\mu\)</li><li data-correct>Zero</li><li>\(\lambda/2\)</li><li>\(t_{\text{dl}}\)</li></ol>
+<div class="explain">\(\lambda(1-e^{-(\mu-\lambda)t_{\text{dl}}})\to0\).</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-24" data-topic="§11.6 Admission">
+<p class="q">Why is a fast rejection better than a slow timeout under overload?</p>
+<ol class="opts"><li>It looks better in logs</li><li data-correct>It frees the client to retry later or elsewhere and saves capacity for requests that can meet their deadline</li><li>It increases revenue</li><li>Timeouts are illegal</li></ol>
+<div class="explain">Goodput, not throughput, is the objective.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-25" data-topic="§11.6 Admission">
+<p class="q">An adaptive concurrency limit:</p>
+<ol class="opts"><li>Is fixed at deployment</li><li data-correct>Raises in-flight requests while latency stays near its minimum and lowers them when latency rises</li><li>Counts requests per day</li><li>Uses GPU temperature</li></ol>
+<div class="explain">The TCP Vegas principle applied to services.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-26" data-topic="§11.6 Retries">
+<p class="q">With failure probability 0.5 and up to 3 immediate retries, attempts per request are about:</p>
+<ol class="opts"><li>1.25</li><li data-correct>1.88</li><li>3</li><li>4</li></ol>
+<div class="explain">\(1+0.5+0.25+0.125\).</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-27" data-topic="§11.6 Retries">
+<p class="q">Which practices prevent retry storms? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Exponential backoff with jitter</li><li data-correct>Retry budgets</li><li data-correct>Honouring Retry-After and typed errors</li><li>More immediate retries</li></ol>
+<div class="explain">Idempotency keys and resumable streams make retries cheap.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-28" data-topic="§11.6 Retries">
+<p class="q">Why does jitter matter in backoff?</p>
+<ol class="opts"><li>It reduces latency</li><li data-correct>It spreads retries over time instead of synchronised waves</li><li>It changes the error</li><li>It is cosmetic</li></ol>
+<div class="explain">Synchronised retries recreate the overload.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-29" data-topic="§11.7 API">
+<p class="q">An idempotency key lets the service:</p>
+<ol class="opts"><li>Authenticate users</li><li data-correct>Recognise a retried request and return its existing result instead of redoing the work</li><li>Encrypt prompts</li><li>Choose a model</li></ol>
+<div class="explain">Retries become safe and cheap.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-30" data-topic="§11.7 API">
+<p class="q">Which error should a client not retry?</p>
+<ol class="opts"><li>429 Too Many Requests</li><li>503 with Retry-After</li><li data-correct>400 Bad Request</li><li>A dropped connection with a resumable stream ID</li></ol>
+<div class="explain">Invalid requests will fail again.</div>
+</div>
+
+<div class="mcq" data-id="ci11-mcq-31" data-topic="§11.7 API">
+<p class="q">Why do providers offer dated model versions as well as aliases?</p>
+<ol class="opts"><li>To raise prices</li><li data-correct>So clients can pin behaviour and migrate deliberately, while aliases offer convenience</li><li>To reduce GPU use</li><li>Aliases are illegal</li></ol>
+<div class="explain">The cost is serving several versions concurrently.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci11-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Walk me through what happens between a client sending a chat request and the first token arriving.</summary>
+<div class="answer">
+<p>DNS resolves the API host (cached, geo-aware); TCP and TLS 1.3 handshakes (reused if keep-alive); the connection terminates at an edge near the user and is forwarded to a region; a regional load balancer spreads it over gateway instances; the gateway authenticates, validates, checks rate limits and quotas, meters, applies policy (residency, guardrails); the router picks a replica by load and cache affinity; the engine queues, prefills uncached tokens and decodes the first token, which streams back as an SSE event through the same chain. Warm and idle: ~100 ms; new connection and loaded replica: several hundred ms, dominated by queueing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-02">
+<summary><span class="lvl warm">Warm-up</span> SSE, WebSockets or gRPC for streaming LLM output?</summary>
+<div class="answer">
+<p>Public chat/completions APIs: SSE over HTTPS—plain HTTP, passes proxies and CDNs, easy clients, one-directional is enough. Real-time voice or interactive agents where the client sends audio or interrupts while receiving: WebSockets or WebRTC (full duplex). Internal gateway-to-engine traffic: gRPC streaming over HTTP/2 (typed messages, deadlines, cancellation, multiplexing). HTTP/3 at the edge helps mobile clients. In all cases disable buffering and compression on streaming paths and coalesce tokens into events.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-03">
+<summary><span class="lvl warm">Warm-up</span> How do you rate-limit an LLM API?</summary>
+<div class="answer">
+<p>Multiple limits per tenant and tier: requests per minute, input tokens per minute (counted at admission), output tokens per minute (reserved at admission from max_tokens or estimated from history, reconciled at completion), concurrent requests, and daily/monthly quotas. Enforce with token buckets or GCRA (one timestamp per key). Across many gateways: local decisions with periodic synchronisation for per-minute limits, exact central ledger for money-like quotas. Return 429 with Retry-After and remaining-limit headers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-04">
+<summary><span class="lvl core">Core</span> Our reasoning model's responses fail at exactly 60 seconds. Diagnose and fix.</summary>
+<div class="answer">
+<p>A hop with a 60 s idle timeout (cloud load balancer default, proxy, service mesh) closes the connection when no bytes flow—reasoning models may think for a long time without visible tokens, or hidden reasoning isn't streamed. Confirm with logs (connection closed by LB, engine still generating). Fix: raise idle timeouts and max request durations on every hop for streaming endpoints; send SSE comment keep-alives every 10–15 s or stream progress/reasoning summaries; propagate client disconnects to abort generation; make streams resumable; test with synthetic long-silence requests.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-05">
+<summary><span class="lvl core">Core</span> Size the connection-handling tier for 10,000 requests/s with 5% reasoning traffic.</summary>
+<div class="answer">
+<p>Little's law: chat 9,500/s × 15 s ≈ 142,500 streams; reasoning 500/s × 120 s = 60,000; total ≈ 200,000 concurrent streams (more at P99 durations). Memory ≈ 64 KB/stream → ≈ 13 GB across the tier. Raise per-instance connection and file-descriptor limits; with 50 instances, ≈ 4,000 streams each. CPU: encrypt and frame events; coalesce tokens every 20–50 ms to cap events per stream. Configure long idle timeouts and keep-alives, graceful draining with long grace periods, cancellation propagation, and autoscale the gateway on concurrent streams and CPU, not requests per second.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-06">
+<summary><span class="lvl core">Core</span> Explain GCRA and show it is equivalent to a token bucket.</summary>
+<div class="answer">
+<p>State: theoretical arrival time \(\theta\). Emission interval \(\delta=1/r\), burst tolerance \(\tau_b=(b-1)\delta\). For a request of cost \(k\) at time \(t\): \(\theta'=\max(\theta,t)+k\delta\); admit iff \(\theta'-t\le\tau_b+\delta\), then store \(\theta'\); otherwise reject with retry-after \(\theta'-t-(\tau_b+\delta)\). Equivalence: define bucket level \(=((\tau_b+\delta)-(\theta-t))/\delta\); it decreases by \(k\) per admission (θ advances \(k\delta\)), increases at rate \(r\) as \(t\) advances, and is capped at \(b\) when \(\theta\le t\); the admission test is level ≥ k. Benefit: one value per key, atomic compare-and-set in Redis, no background refill.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-07">
+<summary><span class="lvl core">Core</span> How do you handle output-token limits when output length is unknown at admission?</summary>
+<div class="answer">
+<p>Option A: reserve max_tokens at admission, refund the unused part at completion—never exceeds the limit but over-reserves for callers with large maxima (in-flight reservations can exhaust the burst capacity and throttle a tenant to a fraction of its entitlement). Option B: admit against an estimate (recent mean output length per tenant/model), charge actual usage at completion, allow the bucket to go negative so subsequent requests wait—fairer, occasionally lets bursts through. Combine with a concurrency limit (caps in-flight work directly) and server-side max output caps. Document behaviour; expose remaining limits in headers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-08">
+<summary><span class="lvl core">Core</span> Design distributed rate limiting across 50 gateway instances in 3 regions.</summary>
+<div class="answer">
+<p>Per-second/minute limits: each gateway runs local GCRA per tenant using its estimate of global usage; instances report counts to a regional aggregator every ~100 ms and receive updated global usage (or rebalanced shares); bound overshoot ≈ n·r·Δ and accept it for capacity-protection limits. Cross-region: allocate each tenant's global limit to regions in proportion to recent traffic, rebalanced every few seconds. Money-like quotas (credits, daily caps): exact central ledger (replicated store) checked at admission for large requests and reconciled per request; cache in gateways with short TTL. Failure mode: if the store or aggregator is unreachable, keep enforcing last known limits locally (static stability). Shard hot tenants' keys.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Explain goodput collapse under overload and design admission control for an LLM service.</summary>
+<div class="answer">
+<p>As utilisation approaches 1, queueing delay grows without bound; with deadlines (client timeouts, TTFT SLOs), more and more completed work is useless—M/M/1 goodput \(\lambda(1-e^{-(\mu-\lambda)t_{\text{dl}}})\) peaks below capacity and falls to zero at \(\lambda=\mu\); abandoned requests still consume capacity and trigger retries. Admission control: estimate each request's TTFT from its uncached input length and the chosen replica's prefill queue; reject immediately (429/503 + Retry-After) if it exceeds the deadline; shed by priority (free before paid, batch before interactive); bound queues by time not count; use adaptive concurrency limits keyed to latency; propagate cancellations; prefer degrading (smaller model) to rejecting for some tiers. Measure goodput explicitly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> A 5% error spike became a 40% load spike and then an outage. Explain the dynamics and fixes.</summary>
+<div class="answer">
+<p>Retries amplify load by \(1+p+\dots+p^k\), and layers multiply (client SDK retries × gateway retries × internal retries). Retries land on healthy replicas, pushing utilisation up, which lengthens queues and causes timeouts, raising \(p\)—positive feedback. Fixes: client backoff with jitter, few retries, honour Retry-After; retry budgets per layer (e.g. ≤ 10% extra load), retries only at one layer; retry to different replicas; circuit breakers to stop sending to failing replicas; fast rejection under overload; idempotency keys and resumable streams so retries don't redo work; and fix the root cause (roll back the bad deployment automatically).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why do tail latencies compound across the front door's dependencies, and how do you contain them?</summary>
+<div class="answer">
+<p>Each synchronous dependency (auth service, quota store, guardrail classifier, routing service) has its own tail; a sequential chain's tail is at least the largest and fan-out's latency is the maximum, so with \(k\) dependencies each slow with probability \(\epsilon\), about \(k\epsilon\) of requests are slow ("tail at scale"). Contain: minimise dependencies on the request path (cache auth decisions and limits locally, update asynchronously), use timeouts with fallbacks (fail open or closed by policy), hedged requests for idempotent reads, parallelise independent calls, keep dependencies in-zone, and measure per-hop latency distributions with tracing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-12">
+<summary><span class="lvl design">Design</span> Design the API gateway layer for Atlas.</summary>
+<div class="answer">
+<p>Edge: anycast/GeoDNS to nearest healthy region, TLS 1.3 termination, HTTP/2 and HTTP/3, DDoS protection. Regional L7 load balancers with long idle timeouts and connection draining. Gateway instances (stateless, autoscaled on concurrent streams and CPU): authenticate API keys (cached), validate requests, enforce per-tenant request/token/concurrency limits with local GCRA plus async sync and an exact ledger for quotas, data-residency routing, guardrail calls with timeouts, usage metering to a billing pipeline, request IDs and tracing. Admission control using estimated TTFT from the router; priority shedding. Streaming: SSE with coalesced events, keep-alives, cancellation propagation, resumable streams with idempotency keys. Internal gRPC to routers. Static stability: last-known config, no hard dependency on control plane.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-13">
+<summary><span class="lvl design">Design</span> How would you make streams resumable after a dropped connection?</summary>
+<div class="answer">
+<p>Assign each request a stream ID and number events with offsets; the gateway (or a small stream buffer service) keeps the generated tokens for a short window (or until completion plus a TTL) keyed by stream ID. On reconnect with stream ID and last offset, replay missing events and continue streaming if generation is ongoing. If the replica that was generating has failed, re-issue the request to another replica with the prompt plus already-generated tokens as a prefix (cheap with prefix caching) and continue from the offset, preserving sampling seeds if determinism is required. Bound buffer memory, authenticate reconnects, and expose the behaviour in the SDK so clients reconnect automatically with backoff.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-14">
+<summary><span class="lvl core">Core</span> Compare a central store with local token buckets for distributed rate limiting.</summary>
+<div class="answer">
+<p>Central store (Redis with atomic scripts): exact global enforcement, simple semantics; costs a network hop per request, throughput limits per hot key (shard), and a dependency that must be highly available with a defined failure mode. Local buckets: zero added latency, robust to partitions; but split quotas under-admit uneven traffic, and unsynchronised local decisions over-admit up to \(n\,r\,\Delta\) between syncs. Hybrid: local decisions with periodic sync for per-minute limits; central exact checks for money-like quotas. Choose by what the limit protects.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-15">
+<summary><span class="lvl core">Core</span> What should an LLM API return in errors and final stream events?</summary>
+<div class="answer">
+<p>Errors typed and actionable: 400 invalid (don't retry), 401/403 auth, 404 model, 413 too large, 429 rate-limited with Retry-After and which limit, 503 overloaded with Retry-After, content-policy refusal (don't retry), timeouts; include request ID. Final event: finish reason (stop, length, content filter, tool call), usage by token type (input, cached input, output, reasoning), model version served, and timing if useful. Headers: remaining limits and reset times. This lets clients back off correctly, track cost and debug.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci11-qa-16">
+<summary><span class="lvl deep">Deep-dive</span> How would you implement priority-based load shedding without starving low tiers?</summary>
+<div class="answer">
+<p>Classify requests (enterprise, paid, free, batch) and give each a weight and a minimum guaranteed share of capacity; under overload, admit by weighted fair queueing over classes (each class's share proportional to weight, but never below its guarantee), and within a class by deadline feasibility. Shed lowest tiers first only above their guaranteed share. Use per-class adaptive concurrency limits and per-class queues bounded by time. Move deferrable traffic to batch queues instead of rejecting. Monitor per-class goodput and rejection rate; alert when lower tiers hit their floors for long periods (a capacity signal, Chapter 9).</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li>J. Dean, L. A. Barroso. The Tail at Scale. <em>Communications of the ACM</em> 56(2), 2013.</li>
+<li>E. Rescorla. The Transport Layer Security (TLS) Protocol Version 1.3. RFC 8446, 2018.</li>
+<li>M. Belshe, R. Peon, M. Thomson. Hypertext Transfer Protocol Version 2 (HTTP/2). RFC 7540, 2015; M. Bishop. HTTP/3. RFC 9114, 2022.</li>
+<li>WHATWG. HTML Living Standard: Server-sent events. 2024.</li>
+<li>I. Fette, A. Melnikov. The WebSocket Protocol. RFC 6455, 2011.</li>
+<li>ATM Forum. Traffic Management Specification 4.0 (generic cell rate algorithm), 1996.</li>
+<li>L. S. Brakmo, L. L. Peterson. TCP Vegas: End to End Congestion Avoidance on a Global Internet. <em>IEEE JSAC</em> 13(8), 1995.</li>
+<li>M. Brooker. Exponential Backoff and Jitter. AWS Architecture Blog, 2015; and Timeouts, retries, and backoff with jitter. <em>The Amazon Builders' Library</em>, 2019.</li>
+<li>B. Beyer et al. (eds.). <em>Site Reliability Engineering</em>, chapters on handling overload and cascading failures. O'Reilly, 2016.</li>
+<li>Kubernetes SIG Network. Gateway API and Gateway API Inference Extension documentation, 2024–2025.</li>
+<li>L. Kleinrock. <em>Queueing Systems, Volume 1: Theory</em>. Wiley, 1975.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

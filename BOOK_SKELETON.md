@@ -313,7 +313,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 8 | Serving Platforms and Control Planes | ✅ v1 |
 | 9 | Capacity, Procurement and Autoscaling | ✅ v1 |
 | 10 | The Economics of Inference | ✅ v1 |
-| 11 | The Front Door: Gateways, Streaming and Rate Limits | ⏳ |
+| 11 | The Front Door: Gateways, Streaming and Rate Limits | ✅ v1 |
 | 12 | Multi-Region Serving and Disaster Recovery | ⏳ |
 | 13 | Reliability Engineering for AI Services | ⏳ |
 | 14 | Security, Isolation and Multi-Tenancy | ⏳ |
