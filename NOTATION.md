@@ -330,3 +330,11 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(n_{\text{img}}\), \(n_{\text{patch}}\), \(N_{\text{enc}}\) | image tokens; encoder patches; encoder parameters |
 | \(f_{\text{fps}}\), \(n_{\text{frame}}\) | sampled video frames per second; tokens per frame |
 | \(t_{\text{sil}}\) | silence threshold for end-of-turn detection |
+
+## Retrieval (Vol. II Ch. 16)
+| Symbol | Meaning |
+|---|---|
+| \(d_{\text{emb}}\), \(N_{\text{emb}}\) | embedding dimension; embedding-model parameters |
+| \(n_{\text{vec}}\), \(k_{\text{nn}}\) | vectors in an index; neighbours returned |
+| \(n_{\text{list}}\), \(n_{\text{probe}}\), \(n_{\text{sub}}\) | IVF lists; lists probed per query; PQ sub-spaces (bytes per code) |
+| \(M_{\text{hnsw}}\), \(ef_{\text{s}}\) | HNSW neighbours per vertex; search beam width |

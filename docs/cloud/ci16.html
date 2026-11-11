@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 16 · Embeddings, Retrieval and Vector Search at Scale — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 16 of Cloud AI Infrastructure: why retrieval-augmented generation needs infrastructure; serving embedding models for queries and backfills; the cost of exact nearest-neighbour search; IVF and product quantisation with the optimal number of lists; HNSW and DiskANN graph indexes; memory per billion vectors; sharding, replication, freshness, filtering and multi-tenancy of indexes; hybrid search and rerankers; and latency and cost budgets for RAG.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci16" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part V · Beyond Chat — Chapter 16</div>
+<h1 id="top">Embeddings, Retrieval and Vector Search at Scale</h1>
+<p class="lede">Most enterprise LLM applications do not send their whole knowledge base to the model. They embed documents into vectors, find the few most relevant to each question, and give only those to the model. This retrieval step has its own models, its own indexes and its own latency and cost budget, and at the scale of billions of documents it is a serious distributed system. This chapter explains how embedding models are served, why exact search is impossible at scale, how approximate indexes trade recall for memory and speed, how indexes are sharded, filtered and kept fresh, and what retrieval adds to the cost and latency of a request.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Retrieval-augmented generation (RAG), introduced under that name by Lewis and colleagues in 2020<span class="cite"><a href="#r-rag">[1]</a></span>, became the default architecture for applications that answer questions over private or changing information: company documents, support tickets, code bases, product catalogues, legal and medical literature. Vol. I §21.4 compared retrieval with simply placing everything in a long context and found that, for large corpora, retrieval is orders of magnitude cheaper per query. But Volume I treated retrieval as a black box. In practice the retrieval stack—embedding models, vector indexes, rerankers, filters—often has more components, more data and more operational complexity than the LLM serving behind it, and its quality determines the quality of the answers.</p>
+<p>Infrastructure interviews ask about it in system-design form ("design semantic search over a billion documents with 50 ms latency", "how much memory does an HNSW index of 500 million vectors need?", "how do you enforce document permissions in vector search?") and in estimation form ("how long does it take to embed our corpus?"). The mathematics—quantisation, nearest-neighbour graphs, partitioning—is well suited to the mathematically trained reader, and this chapter develops it.</p>
+<p>We begin with the shape of a RAG request (§16.1) and the serving of embedding models (§16.2). We show why exact search fails at scale (§16.3), then develop partition-and-quantise indexes (§16.4) and graph indexes (§16.5). We turn to scaling indexes across machines, keeping them fresh and filtering them (§16.6), to rerankers and hybrid search (§16.7), and finally to end-to-end latency and cost budgets (§16.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Describe the stages of a RAG request and their latency and cost.</li>
+<li>Estimate the cost of embedding a corpus and of serving query embeddings, and explain how embedding serving differs from LLM serving.</li>
+<li>Explain why exact nearest-neighbour search is infeasible at billion scale and derive the cost of IVF search, including the optimal number of lists.</li>
+<li>Explain product quantisation, HNSW and DiskANN, and compute the memory of each index type for a given corpus.</li>
+<li>Design sharded, replicated, filtered and multi-tenant vector indexes, and handle updates and deletions.</li>
+<li>Budget latency and cost for a RAG request including reranking, and compare retrieval with long context quantitatively.</li>
+</ol>
+<p class="small muted">Uses: Vol. I §2.10 (FLOPs), §21.4 (retrieval versus long context); Chapters 11, 13 and 14 of this volume (fan-out tails, security).</p>
+</div>
+
+<h2 id="s16-1">16.1 The shape of a retrieval-augmented request</h2>
+<p>Figure 16.1 shows a typical RAG request. Offline, documents are split into <strong>chunks</strong> of a few hundred tokens, each chunk is passed through an <strong>embedding model</strong> that maps it to a vector in \(\mathbb R^{d_{\text{emb}}}\) (typically 384 to 4,096 dimensions) such that semantically similar texts have nearby vectors, and the vectors are stored in a <strong>vector index</strong> together with the chunks' text and metadata. Online, the user's question is embedded with the same model, the index returns the \(k_{\text{nn}}\) chunks whose vectors are most similar (by cosine similarity or inner product), optional filters remove chunks the user may not see or that do not match constraints, a <strong>reranker</strong> may rescore the candidates more accurately, and the top few chunks are inserted into the LLM's prompt.</p>
+
+<figure class="diagram" id="fig-16-1">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="The stages of a retrieval-augmented generation request">
+<defs><marker id="a161" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="20" y="22" class="t-sm t-b">Offline (indexing)</text>
+<rect x="20" y="32" width="110" height="46" rx="8" class="bx"/><text x="75" y="52" text-anchor="middle" class="t-xs t-b">documents</text><text x="75" y="68" text-anchor="middle" class="t-xs">+ ACLs, metadata</text>
+<rect x="150" y="32" width="110" height="46" rx="8" class="bx4"/><text x="205" y="52" text-anchor="middle" class="t-xs t-b">chunk</text><text x="205" y="68" text-anchor="middle" class="t-xs">≈ 200–800 tokens</text>
+<rect x="280" y="32" width="120" height="46" rx="8" class="bx2"/><text x="340" y="52" text-anchor="middle" class="t-xs t-b">embed (batch)</text><text x="340" y="68" text-anchor="middle" class="t-xs">GPU, throughput</text>
+<rect x="420" y="32" width="120" height="46" rx="8" class="bx3"/><text x="480" y="52" text-anchor="middle" class="t-xs t-b">vector index</text><text x="480" y="68" text-anchor="middle" class="t-xs">IVF-PQ, HNSW…</text>
+<line x1="130" y1="55" x2="148" y2="55" class="ln" marker-end="url(#a161)"/><line x1="260" y1="55" x2="278" y2="55" class="ln" marker-end="url(#a161)"/><line x1="400" y1="55" x2="418" y2="55" class="ln" marker-end="url(#a161)"/>
+<text x="20" y="118" class="t-sm t-b">Online (per query; typical latencies)</text>
+<rect x="20" y="128" width="95" height="56" rx="8" class="bx"/><text x="67" y="150" text-anchor="middle" class="t-xs t-b">question</text><text x="67" y="166" text-anchor="middle" class="t-xs">+ user identity</text>
+<rect x="130" y="128" width="95" height="56" rx="8" class="bx2"/><text x="177" y="150" text-anchor="middle" class="t-xs t-b">embed query</text><text x="177" y="166" text-anchor="middle" class="t-xs">≈ 5–20 ms</text>
+<rect x="240" y="128" width="110" height="56" rx="8" class="bx3"/><text x="295" y="150" text-anchor="middle" class="t-xs t-b">ANN + filters</text><text x="295" y="166" text-anchor="middle" class="t-xs">≈ 5–50 ms, top 100</text>
+<rect x="365" y="128" width="100" height="56" rx="8" class="bx4"/><text x="415" y="150" text-anchor="middle" class="t-xs t-b">rerank</text><text x="415" y="166" text-anchor="middle" class="t-xs">≈ 30–200 ms</text>
+<rect x="480" y="128" width="110" height="56" rx="8" class="bx5"/><text x="535" y="150" text-anchor="middle" class="t-xs t-b">LLM</text><text x="535" y="166" text-anchor="middle" class="t-xs">prefill top 5–20</text>
+<rect x="605" y="128" width="100" height="56" rx="8" class="bx"/><text x="655" y="150" text-anchor="middle" class="t-xs t-b">answer</text><text x="655" y="166" text-anchor="middle" class="t-xs">with citations</text>
+<line x1="115" y1="156" x2="128" y2="156" class="ln" marker-end="url(#a161)"/><line x1="225" y1="156" x2="238" y2="156" class="ln" marker-end="url(#a161)"/><line x1="350" y1="156" x2="363" y2="156" class="ln" marker-end="url(#a161)"/><line x1="465" y1="156" x2="478" y2="156" class="ln" marker-end="url(#a161)"/><line x1="590" y1="156" x2="603" y2="156" class="ln" marker-end="url(#a161)"/>
+<line x1="480" y1="78" x2="300" y2="126" class="ln ln-acc" stroke-dasharray="4 3"/>
+<text x="20" y="215" class="t-xs">Retrieval adds tens to a few hundred milliseconds before the LLM starts, and its output (thousands of tokens of context) sets the LLM's</text>
+<text x="20" y="231" class="t-xs">prefill cost. Quality depends on chunking, the embedding model, index recall and reranking as much as on the LLM.</text>
+</svg>
+<figcaption><b>Figure 16.1 — A RAG request.</b> Offline, documents are chunked, embedded in bulk and indexed; online, the question is embedded, the index finds candidate chunks subject to filters, a reranker refines them, and the LLM answers from the best few.</figcaption>
+</figure>
+
+<p>Figure 16.1 shows that retrieval sits on the critical path before time to first token, and that it consists of two very different computational problems: running a neural network (the embedding model and the reranker), which is a small version of the serving problems of this book, and searching a high-dimensional index, which is a memory- and algorithm-bound problem with its own mathematics. We take them in turn.</p>
+
+<h2 id="s16-2">16.2 Serving embedding models</h2>
+<p>An embedding model is usually a Transformer encoder (in the style of BERT) or a decoder-based LLM adapted to produce embeddings, ranging from about 30 million to several billion parameters; benchmark suites such as MTEB compare them across retrieval, classification and clustering tasks<span class="cite"><a href="#r-mteb">[2]</a></span>. Its serving profile differs from an LLM's in a way that simplifies it: there is no decode. Each input is processed in a single forward pass, like a prefill, and produces one vector. The work is therefore compute-bound, batches perfectly, and its cost is about \(2N_{\text{emb}}\) FLOPs per input token for a model of \(N_{\text{emb}}\) parameters, with no KV cache to hold.</p>
+<p>There are two workloads with opposite requirements. <strong>Query embedding</strong> is online: one short input (a question of tens of tokens) per request, with a latency budget of a few milliseconds to tens of milliseconds. A small model on a GPU or even a CPU handles it easily, and the main design concern is batching enough concurrent queries to use the hardware without adding latency. <strong>Corpus embedding</strong> is offline: billions of chunks to embed when an index is built, and again whenever the embedding model changes, plus a stream of new and updated documents. It is a batch workload (Chapter 19) and its cost is easy to estimate.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — embedding a billion chunks</div>
+<p><strong>Setup.</strong> A corpus of \(10^{9}\) chunks of 500 tokens each, \(5\times10^{11}\) tokens. A 300M-parameter embedding model; H100s at an effective 400 TFLOP/s in BF16 (about 40% MFU, plausible for short, padded sequences).</p>
+<p><strong>FLOPs.</strong> \(2\times3\times10^{8}\times5\times10^{11}=3\times10^{20}\).</p>
+<p><strong>GPU time.</strong> \(3\times10^{20}/4\times10^{14}=7.5\times10^{5}\) GPU-seconds, about 208 GPU-hours, or 8.7 GPU-days: about 4 hours on 50 GPUs.</p>
+<p><strong>Cost.</strong> At $1.00 per GPU-hour on spot capacity (Chapter 9), about $210. Storage of the vectors at 768 dimensions in FP16: \(10^{9}\times768\times2\approx1.5\) TB.</p>
+<p><strong>With a 7B embedding model.</strong> 23 times the FLOPs: about 200 GPU-days and $4,800—still modest, but a re-embedding every time the model improves becomes a planned project, and query embeddings cost 23 times more per query too.</p>
+<p><strong>Lesson.</strong> Embedding is cheap per token, so corpus size and model size, not engineering, decide the bill; the index is where the infrastructure difficulty lies.</p>
+</div>
+
+<p>A few properties of embeddings matter for the rest of the stack. Their <strong>dimension</strong> sets the index's memory and search cost, linearly; models trained with Matryoshka representation learning produce embeddings whose leading coordinates form useful lower-dimensional embeddings, so a system can store 256 dimensions for search and keep the full vector for reranking<span class="cite"><a href="#r-matryoshka">[3]</a></span>. Their <strong>precision</strong> can be reduced: FP16 is standard, 8-bit and even binary embeddings lose little recall for many tasks and cut memory by two to sixteen times. And they are <strong>model-specific</strong>: vectors from different embedding models are not comparable, so changing the model means re-embedding the corpus, which is why embedding-model upgrades are planned like database migrations.</p>
+
+<h2 id="s16-3">16.3 Why exact search fails at scale</h2>
+<p>Given a query vector \(q\) and a corpus of \(n_{\text{vec}}\) vectors \(x_1,\dots,x_{n_{\text{vec}}}\), exact nearest-neighbour search computes the similarity \(\langle q,x_i\rangle\) for every \(i\) and returns the largest \(k_{\text{nn}}\). Its cost is \(n_{\text{vec}}d_{\text{emb}}\) multiply-adds and, more importantly, reading all \(n_{\text{vec}}d_{\text{emb}}b\) bytes of vectors per query: a memory-bound scan, just like a decode step reading its weights (Vol. I §3.6). For a million vectors of 768 dimensions in FP16, that is 1.5 GB per query—about half a millisecond on a GPU, fine. For a billion vectors, it is 1.5 TB per query: half a second even across a whole eight-GPU server, and the whole corpus must fit in memory. At thousands of queries per second, exact search over billions of vectors is out of the question. It remains useful as the ground truth against which approximate methods are measured, and for small corpora (under a few million vectors) it is often the right choice.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — why high dimensions resist indexing</div>
+<p>Classical spatial indexes such as k-d trees prune the search by excluding regions of space that cannot contain a closer point, which works in two or three dimensions. In high dimensions it fails, for a reason captured by the <em>concentration of distances</em>: for many natural distributions, as \(d_{\text{emb}}\) grows, the ratio of the distances from a query to its farthest and nearest points tends to one, so almost every region of space is about equally close and almost nothing can be pruned. Exact search in high dimensions therefore costs nearly a linear scan for any index structure, and practical methods give up exactness: an <em>approximate</em> nearest-neighbour (ANN) method returns, with high probability, most of the true nearest neighbours. Its quality is measured by <strong>recall@\(k\)</strong>, the fraction of the true \(k\) nearest neighbours that it returns. Fortunately, real embeddings are not uniformly spread: they lie near low-dimensional structures and form clusters, which is what ANN methods exploit.</p>
+</div>
+
+<p>Two families of ANN methods dominate production systems: methods that <em>partition</em> the space and <em>compress</em> the vectors, so that each query reads only a small, compact part of the data; and methods that build a <em>graph</em> of near neighbours and walk it towards the query. Both trade recall for speed and memory, and both are implemented in widely used libraries (FAISS from Meta<span class="cite"><a href="#r-faiss">[4]</a></span>, ScaNN from Google, hnswlib, DiskANN from Microsoft) and in vector databases built on them.</p>
+
+<h2 id="s16-4">16.4 Partition and compress: IVF and product quantisation</h2>
+<p>The <strong>inverted file</strong> (IVF) index partitions the corpus by clustering. Run k-means on the vectors to find \(n_{\text{list}}\) centroids; assign each vector to its nearest centroid, forming \(n_{\text{list}}\) lists of about \(n_{\text{vec}}/n_{\text{list}}\) vectors each. At query time, compare the query with all centroids, pick the \(n_{\text{probe}}\) closest, and scan only their lists. Recall depends on \(n_{\text{probe}}\): a true neighbour may lie just across a cluster boundary, so probing more lists finds more of them, at proportional cost.</p>
+<p>Scanning lists is still a scan, and the second idea makes it cheap: <strong>product quantisation</strong> (PQ), introduced by Jégou, Douze and Schmid in 2011<span class="cite"><a href="#r-pq">[5]</a></span>. Split each \(d_{\text{emb}}\)-dimensional vector into \(n_{\text{sub}}\) sub-vectors of \(d_{\text{emb}}/n_{\text{sub}}\) dimensions; for each sub-space, learn 256 centroids by k-means; replace each sub-vector by the index of its nearest centroid, one byte. A 768-dimensional FP16 vector of 1,536 bytes becomes \(n_{\text{sub}}\) bytes—64 bytes for \(n_{\text{sub}}=64\), a 24-fold compression. Distances are computed by <em>asymmetric distance computation</em>: for each query, precompute a table of the inner products between each of the query's sub-vectors and each sub-space's 256 centroids (\(n_{\text{sub}}\times256\) numbers), after which the approximate similarity to any database vector is the sum of \(n_{\text{sub}}\) table lookups. Figure 16.2 shows the scheme.</p>
+
+<figure class="diagram" id="fig-16-2">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="IVF partitioning with product quantisation">
+<rect x="15" y="20" width="230" height="220" rx="10" class="bx"/>
+<text x="130" y="40" text-anchor="middle" class="t-sm t-b">IVF: k-means partitions</text>
+<circle cx="70" cy="90" r="28" class="bx4"/><circle cx="150" cy="80" r="30" class="bx4"/><circle cx="200" cy="140" r="26" class="bx4"/><circle cx="90" cy="170" r="30" class="bx2"/><circle cx="160" cy="200" r="24" class="bx4"/>
+<circle cx="112" cy="150" r="5" class="fill-acc"/><text x="120" y="146" class="t-xs t-acc">q</text>
+<text x="130" y="232" text-anchor="middle" class="t-xs">probe the n_probe closest lists only</text>
+<rect x="265" y="20" width="440" height="220" rx="10" class="bx"/>
+<text x="485" y="40" text-anchor="middle" class="t-sm t-b">PQ: each vector → n_sub one-byte codes</text>
+<rect x="285" y="58" width="400" height="26" rx="4" class="bx3"/>
+<line x1="385" y1="58" x2="385" y2="84" class="ln"/><line x1="485" y1="58" x2="485" y2="84" class="ln"/><line x1="585" y1="58" x2="585" y2="84" class="ln"/>
+<text x="335" y="76" text-anchor="middle" class="t-xs">sub-vector 1</text><text x="435" y="76" text-anchor="middle" class="t-xs">sub-vector 2</text><text x="535" y="76" text-anchor="middle" class="t-xs">…</text><text x="635" y="76" text-anchor="middle" class="t-xs">sub-vector n_sub</text>
+<rect x="285" y="104" width="400" height="26" rx="4" class="bx4"/><text x="485" y="122" text-anchor="middle" class="t-xs">codes: 17 · 203 · … · 88 (n_sub bytes, e.g. 64 B instead of 1,536 B)</text>
+<rect x="285" y="150" width="400" height="44" rx="4" class="bx2"/><text x="485" y="168" text-anchor="middle" class="t-xs">per query: lookup table T[s][c] = ⟨q_s, centroid_c of sub-space s⟩</text><text x="485" y="184" text-anchor="middle" class="t-xs">n_sub × 256 entries, computed once</text>
+<text x="485" y="220" text-anchor="middle" class="t-xs">similarity(q, x) ≈ Σ_s T[s][code_s(x)] — n_sub lookups and adds per vector</text>
+</svg>
+<figcaption><b>Figure 16.2 — IVF with product quantisation.</b> Clustering limits a query to a few lists; product quantisation shrinks each vector to a few bytes and turns distance computation into table lookups. Together they read a small, compressed fraction of the corpus per query.</figcaption>
+</figure>
+
+<p>PQ is lossy, and its error can be analysed. Each sub-vector is replaced by its nearest of 256 centroids, so the reconstruction error is the sum over sub-spaces of the k-means quantisation errors; for a fixed total number of bytes, PQ achieves much lower distortion than quantising each coordinate separately, because it captures correlations within each sub-space. In practice, IVF-PQ indexes reach recall@10 around 0.8–0.95 depending on \(n_{\text{probe}}\) and \(n_{\text{sub}}\), and a common refinement is to <em>re-rank</em> the top few hundred candidates using full-precision vectors stored elsewhere (on SSD, say), which restores most of the lost accuracy at small cost. How should \(n_{\text{list}}\) be chosen? The search cost has two terms that pull in opposite directions.</p>
+
+<div class="box thm">
+<div class="box-title">Proposition 16.1 — The optimal number of IVF lists</div>
+<p>Suppose comparing the query with one centroid costs \(d_{\text{emb}}\) operations and scanning one PQ-coded vector costs \(n_{\text{sub}}\) operations. The cost of a query that probes \(n_{\text{probe}}\) lists of an IVF index with \(n_{\text{list}}\) lists over \(n_{\text{vec}}\) vectors is</p>
+\[
+C(n_{\text{list}})=n_{\text{list}}\,d_{\text{emb}}+n_{\text{probe}}\frac{n_{\text{vec}}}{n_{\text{list}}}\,n_{\text{sub}},
+\]
+<p>minimised at \(n_{\text{list}}^{*}=\sqrt{n_{\text{vec}}\,n_{\text{probe}}\,n_{\text{sub}}/d_{\text{emb}}}\), where the two terms are equal and \(C^{*}=2\sqrt{n_{\text{vec}}\,n_{\text{probe}}\,n_{\text{sub}}\,d_{\text{emb}}}\).</p>
+<p><em>Proof.</em> \(C\) is the sum of an increasing linear term and a decreasing hyperbolic term; \(C'(n_{\text{list}})=d_{\text{emb}}-n_{\text{probe}}n_{\text{vec}}n_{\text{sub}}/n_{\text{list}}^2=0\) at \(n_{\text{list}}^*\); by the AM–GM inequality the minimum value is twice the geometric mean of the two terms. \(\square\)</p>
+</div>
+
+<p>Figure 16.3 plots \(C\) for a billion 768-dimensional vectors with 64-byte codes and 32 probes. The optimum is near 52,000 lists, where a query performs about \(8\times10^{7}\) operations—touching roughly \(32\times10^{9}/52{,}000\approx620{,}000\) codes, 0.06% of the corpus, about 40 MB of reads. In practice the first term is reduced further by indexing the centroids themselves with a small graph index, which moves the optimum to more lists; but the square-root law captures the balance.</p>
+
+<figure class="chart" id="fig-16-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"IVF-PQ query cost against number of lists (10⁹ vectors, d = 768, 64-byte codes, 32 probes)","height":320,
+ "x":{"label":"Number of lists n_list (log)","log":true,"min":1000,"max":1000000,"ticks":[1000,10000,100000,1000000]},
+ "y":{"label":"Operations per query (log)","log":true,"min":50000000,"max":3000000000,"ticks":[100000000,300000000,1000000000]},
+ "series":[
+  {"name":"Total cost C(n_list)","color":"s1","points":[[1000,2.05e9],[3000,6.85e8],[10000,2.12e8],[30000,9.13e7],[51600,7.93e7],[100000,9.73e7],[300000,2.37e8],[1000000,7.7e8]]}
+ ],
+ "vlines":[{"x":51640,"text":"n_list* ≈ 52k"}]}
+</script>
+<figcaption><b>Figure 16.3 — Too few lists scan too much; too many cost too much to choose among.</b> The optimum balances centroid comparisons against list scanning, giving the square-root law of Proposition 16.1.</figcaption>
+</figure>
+
+<h2 id="s16-5">16.5 Graph indexes: HNSW and DiskANN</h2>
+<p>The second family builds a graph whose vertices are the vectors and whose edges join near neighbours, and searches it greedily: start at an entry point, repeatedly move to whichever neighbour of the current best vertex is closest to the query, and stop when no neighbour is closer. On a well-built graph this reaches the query's neighbourhood in a small number of hops, because the graph is a <em>navigable small world</em>: it has short edges for local accuracy and long edges for fast travel. The most widely used construction is the <strong>hierarchical navigable small world</strong> (HNSW) graph of Malkov and Yashunin (2016)<span class="cite"><a href="#r-hnsw">[6]</a></span>, illustrated in Figure 16.4. Each vector is inserted into layer 0 and, with geometrically decreasing probability, into higher layers; each layer is a proximity graph with up to \(M_{\text{hnsw}}\) neighbours per vertex (\(2M_{\text{hnsw}}\) at layer 0). Search starts at the top layer, where the graph is sparse and edges are long, descends greedily layer by layer, and at layer 0 runs a beam search keeping the best \(ef_{\text{s}}\) candidates. Larger \(ef_{\text{s}}\) gives higher recall at higher cost.</p>
+
+<figure class="diagram" id="fig-16-4">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Hierarchical navigable small world graph search">
+<defs><marker id="a164" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="15" width="470" height="60" rx="8" class="bx"/><text x="30" y="35" class="t-xs t-b">layer 2 (few vertices, long edges)</text>
+<circle cx="120" cy="55" r="7" class="bx4"/><circle cx="330" cy="50" r="7" class="bx4"/><line x1="127" y1="55" x2="323" y2="50" class="ln"/>
+<rect x="15" y="90" width="470" height="70" rx="8" class="bx"/><text x="30" y="108" class="t-xs t-b">layer 1</text>
+<circle cx="120" cy="135" r="6" class="bx4"/><circle cx="200" cy="125" r="6" class="bx4"/><circle cx="270" cy="145" r="6" class="bx4"/><circle cx="330" cy="125" r="6" class="bx4"/><circle cx="410" cy="140" r="6" class="bx4"/>
+<line x1="126" y1="135" x2="194" y2="125" class="ln"/><line x1="206" y1="125" x2="264" y2="145" class="ln"/><line x1="276" y1="145" x2="324" y2="125" class="ln"/><line x1="336" y1="125" x2="404" y2="140" class="ln"/>
+<rect x="15" y="175" width="470" height="70" rx="8" class="bx"/><text x="30" y="193" class="t-xs t-b">layer 0 (all vectors, up to 2M neighbours each)</text>
+<g><circle cx="80" cy="220" r="5" class="bx4"/><circle cx="120" cy="215" r="5" class="bx4"/><circle cx="160" cy="228" r="5" class="bx4"/><circle cx="200" cy="212" r="5" class="bx4"/><circle cx="240" cy="226" r="5" class="bx4"/><circle cx="270" cy="214" r="5" class="bx4"/><circle cx="300" cy="230" r="5" class="bx4"/><circle cx="330" cy="215" r="5" class="bx4"/><circle cx="370" cy="226" r="5" class="bx4"/><circle cx="410" cy="214" r="5" class="bx4"/><circle cx="445" cy="228" r="5" class="bx4"/></g>
+<circle cx="285" cy="222" r="6" class="fill-acc"/><text x="292" y="240" class="t-xs t-acc">query</text>
+<path d="M330,50 C330,90 330,100 330,119" class="ln ln-acc" fill="none" marker-end="url(#a164)"/>
+<path d="M324,128 C300,135 285,140 277,143" class="ln ln-acc" fill="none" marker-end="url(#a164)"/>
+<path d="M270,151 C272,180 274,195 271,208" class="ln ln-acc" fill="none" marker-end="url(#a164)"/>
+<rect x="505" y="15" width="200" height="230" rx="10" class="bx"/>
+<text x="605" y="38" text-anchor="middle" class="t-xs t-b">Search</text>
+<text x="518" y="60" class="t-xs">1. enter at the top layer</text>
+<text x="518" y="80" class="t-xs">2. greedy descent: move to</text>
+<text x="518" y="94" class="t-xs">   the closest neighbour</text>
+<text x="518" y="114" class="t-xs">3. drop a layer, repeat</text>
+<text x="518" y="134" class="t-xs">4. at layer 0, beam search</text>
+<text x="518" y="148" class="t-xs">   with ef_s candidates</text>
+<text x="518" y="172" class="t-xs t-b">Cost: ≈ log n hops ×</text>
+<text x="518" y="186" class="t-xs t-b">neighbours checked</text>
+<text x="518" y="210" class="t-xs">Memory: vectors +</text>
+<text x="518" y="224" class="t-xs">≈ 2M × 4-byte links each</text>
+</svg>
+<figcaption><b>Figure 16.4 — Searching an HNSW graph.</b> Sparse upper layers carry the search quickly to the right region; the dense bottom layer refines it. Each hop reads the vectors of a vertex's neighbours, which is random access to memory.</figcaption>
+</figure>
+
+<p>HNSW gives excellent recall–latency trade-offs—recall above 0.95 at sub-millisecond latencies for millions of vectors on a single machine—and supports insertion of new vectors without rebuilding. Its cost is memory. Every vector must be held in RAM at full or near-full precision (graph search compares the query with each visited vector), plus about \(2M_{\text{hnsw}}\) four-byte neighbour identifiers per vector at layer 0. Its access pattern is random, one vertex's neighbours at a time, which suits CPU caches and DRAM well and GPUs less well (though GPU graph indexes such as NVIDIA's CAGRA exist). For a billion vectors, an HNSW index needs terabytes of RAM.</p>
+<p><strong>DiskANN</strong>, from Microsoft (2019), addresses exactly that: it builds a graph (called Vamana) designed to need few hops, stores the full-precision vectors and the graph on SSD, and keeps only PQ-compressed vectors in RAM to guide the search<span class="cite"><a href="#r-diskann">[7]</a></span>. Each query reads a few dozen SSD blocks, which modern NVMe drives serve in microseconds, achieving high recall over billions of vectors on a single machine with a fraction of the RAM. Figure 16.5 compares the memory of the main index types for a billion 768-dimensional vectors.</p>
+
+<figure class="chart" id="fig-16-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"RAM needed for one billion 768-dimensional vectors, by index type (approximate)","height":320,
+ "x":{"label":"Index type (see labels)","min":0.5,"max":5.5,"ticks":[1,2,3,4,5]},
+ "y":{"label":"RAM (GB, log)","log":true,"min":10,"max":5000,"ticks":[10,30,100,300,1000,3000]},
+ "series":[
+  {"name":"RAM","color":"s1","line":false,"labels":true,"points":[[1,3072,"flat FP32"],[2,1536,"flat FP16"],[3,1792,"HNSW FP16, M=32"],[4,72,"IVF-PQ 64 B"],[5,40,"DiskANN"]]}
+ ]}
+</script>
+<figcaption><b>Figure 16.5 — Compression decides where an index can live.</b> Full-precision flat and HNSW indexes need terabytes of RAM for a billion vectors; IVF-PQ fits in tens of gigabytes; DiskANN keeps compressed codes in RAM and full vectors on SSD. Values ignore metadata and are approximate.</figcaption>
+</figure>
+
+<p>Figure 16.5 shows the decisive role of compression. A flat or HNSW index of a billion FP16 vectors needs about 1.5–1.8 TB of RAM, a large machine or many smaller ones; IVF-PQ with 64-byte codes needs about 72 GB including identifiers, one ordinary server or one GPU's worth of memory; DiskANN needs tens of gigabytes of RAM plus a couple of terabytes of SSD. The right choice depends on the recall target, the query rate, the update rate and the budget, and many production systems combine them: PQ codes for the first stage, full vectors on SSD for re-ranking, graph indexes over centroids for routing.</p>
+
+<details class="drill">
+<summary>Drill 16.1 — Sizing an HNSW index</summary>
+<p>A product-search index holds 200 million items with 1,024-dimensional FP16 embeddings, HNSW with \(M_{\text{hnsw}}=24\). How much RAM does it need, and how many 512 GB machines must hold it if each copy must fit with 30% headroom? What if the embeddings were truncated to 256 dimensions (Matryoshka) and stored in 8-bit?</p>
+<p><em>Solution.</em> Vectors: \(2\times10^{8}\times1024\times2\approx410\) GB. Links at layer 0: \(2\times24\times4=192\) bytes per vector, \(\approx38\) GB (upper layers add a few percent). Total ≈ 450 GB; with 30% headroom, about 585 GB: two machines per copy, splitting the index into two shards (§16.6). Truncated to 256 dimensions in 8-bit: vectors \(2\times10^{8}\times256=51\) GB, links 38 GB, total ≈ 90 GB: one machine per copy with plenty of room—at some loss of recall that must be measured, perhaps recovered by re-ranking the top candidates with full vectors read from SSD.</p>
+</details>
+
+<h2 id="s16-6">16.6 Scaling indexes: shards, replicas, freshness, filters and tenants</h2>
+<p>When an index outgrows one machine, or one machine cannot serve the query rate, it is split. <strong>Sharding</strong> divides the vectors among machines. The simplest scheme assigns vectors to shards at random or by document; each query is then sent to every shard (scatter), each returns its local top \(k_{\text{nn}}\), and a coordinator merges them (gather). Scatter–gather is simple and balanced, but every query touches every shard, so its latency is the maximum over shards—subject to the tail-at-scale effect of §11.1: with 20 shards each slow 1% of the time, a fifth of queries are slow—and the total work per query grows with the number of shards. <strong>Partition-aware sharding</strong> instead places whole IVF lists (or graph regions) on shards and routes each query only to the shards holding its probed lists, reducing work but risking hot shards when queries concentrate on popular regions. <strong>Replication</strong> copies shards for throughput and availability; a query can go to any replica of each shard, and hedged requests (§13.6) to a second replica cut tail latency cheaply because searches are idempotent and inexpensive. Figure 16.6 shows both.</p>
+
+<figure class="diagram" id="fig-16-6">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Sharded and replicated vector index with scatter-gather">
+<defs><marker id="a166" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="100" width="120" height="56" rx="8" class="bx4"/><text x="75" y="122" text-anchor="middle" class="t-xs t-b">coordinator</text><text x="75" y="138" text-anchor="middle" class="t-xs">scatter, merge top-k</text>
+<g>
+<rect x="200" y="20" width="150" height="56" rx="8" class="bx3"/><text x="275" y="42" text-anchor="middle" class="t-xs t-b">shard 1</text><text x="275" y="58" text-anchor="middle" class="t-xs">replicas a, b, c</text>
+<rect x="200" y="100" width="150" height="56" rx="8" class="bx3"/><text x="275" y="122" text-anchor="middle" class="t-xs t-b">shard 2</text><text x="275" y="138" text-anchor="middle" class="t-xs">replicas a, b, c</text>
+<rect x="200" y="180" width="150" height="56" rx="8" class="bx3"/><text x="275" y="202" text-anchor="middle" class="t-xs t-b">shard S</text><text x="275" y="218" text-anchor="middle" class="t-xs">replicas a, b, c</text>
+</g>
+<line x1="135" y1="120" x2="198" y2="50" class="ln" marker-end="url(#a166)"/><line x1="135" y1="128" x2="198" y2="128" class="ln" marker-end="url(#a166)"/><line x1="135" y1="136" x2="198" y2="206" class="ln" marker-end="url(#a166)"/>
+<rect x="390" y="20" width="315" height="216" rx="10" class="bx"/>
+<text x="547" y="42" text-anchor="middle" class="t-sm t-b">Design choices</text>
+<text x="405" y="66" class="t-xs">• random sharding: balanced; every query hits all shards</text>
+<text x="405" y="86" class="t-xs">• partition sharding: fewer shards per query; hot spots</text>
+<text x="405" y="106" class="t-xs">• tail latency = max over shards → hedge to replicas</text>
+<text x="405" y="126" class="t-xs">• freshness: small mutable delta index + periodic merge</text>
+<text x="405" y="146" class="t-xs">• deletes: tombstones, filtered at query, compacted later</text>
+<text x="405" y="166" class="t-xs">• filters (ACLs, metadata): pre-, post- or in-search</text>
+<text x="405" y="186" class="t-xs">• tenants: per-tenant indexes, or shared + tenant filter</text>
+<text x="405" y="206" class="t-xs">• versioning: new embedding model → rebuild in parallel,</text>
+<text x="405" y="220" class="t-xs">  switch atomically</text>
+</svg>
+<figcaption><b>Figure 16.6 — Scaling a vector index.</b> Shards divide the data, replicas multiply throughput and availability, and a coordinator merges per-shard results. Freshness, deletions, filters, tenancy and model versions are the operational questions that dominate real deployments.</figcaption>
+</figure>
+
+<p>Real corpora change, and ANN indexes are expensive to rebuild. A common pattern keeps a large, immutable, well-optimised main index and a small, mutable <strong>delta index</strong> (often a flat or HNSW index) that receives new and updated vectors; queries search both and merge, and the delta is periodically merged into a rebuilt main index. Deletions are recorded as <strong>tombstones</strong>—identifiers excluded at query time—and physically removed during compaction. When the embedding model changes, every vector must be recomputed, so the new index is built in parallel and queries are switched atomically, with the old index kept for rollback: a migration in the database sense.</p>
+<p><strong>Filtering</strong> is where vector search meets security and product logic. Queries often carry constraints—"only documents this user may read", "only products in stock in the UK", "only tickets from the last 30 days". <em>Post-filtering</em> retrieves the top candidates and then removes those that fail the filter, which is simple but can return too few results when the filter is selective (if the user may read 1% of the corpus, the top 100 candidates contain one permitted document on average). <em>Pre-filtering</em> restricts the search to permitted vectors, which is accurate but can defeat the index's structure (an HNSW walk that may only visit 1% of vertices loses its navigability). Modern vector databases implement filter-aware search that adapts between the two by selectivity, and for very selective filters such as per-user permissions, a <strong>per-tenant index</strong> (or partition) is often best.</p>
+<p>Access control deserves emphasis, because a retrieval system is a powerful way to leak data. If a user's query retrieves a chunk from a document they may not read, the LLM may quote it. Permissions must therefore be enforced at retrieval time, using the user's identity and the documents' access-control lists, kept in sync with the source systems; and because an index built from many tenants' data shares memory and caches, the isolation questions of Chapter 14—side channels, cache scoping, residency (§12.4)—apply to vector stores as well.</p>
+
+<h2 id="s16-7">16.7 Hybrid search and rerankers</h2>
+<p>Dense embeddings capture meaning but can miss exact matches: product codes, names, rare terms. Classical lexical retrieval with inverted indexes and BM25 scoring captures those but misses paraphrase. <strong>Hybrid search</strong> runs both and fuses their rankings—reciprocal-rank fusion, which scores each document by \(\sum1/(c+\text{rank})\) across the lists, is a simple and robust method—and usually beats either alone. Lexical indexes are mature infrastructure (search engines have used them for decades) and are cheap to add alongside a vector index.</p>
+<p>First-stage retrieval, dense or lexical, scores the query and each document independently, which is fast but coarse. A <strong>reranker</strong> rescores a short list of candidates with a model that sees the query and the document <em>together</em>—a <em>cross-encoder</em>—which is far more accurate and far more expensive: it runs a Transformer forward pass over the concatenated query and chunk for every candidate. Reranking 100 candidates of 500 tokens each processes about 50,000 tokens per query. With a 300M-parameter reranker that is \(2\times3\times10^{8}\times5\times10^{4}=3\times10^{13}\) FLOPs, around 75 ms on a GPU at 400 TFLOP/s if not batched across queries, and at 1,000 queries per second it needs about 75 GPUs' worth of compute. Reranking is often the most expensive stage of retrieval, and its depth (how many candidates) is a direct cost–quality dial. Late-interaction models such as ColBERT, which store per-token document embeddings and compute a cheap interaction at query time, sit between the two, at the price of much larger indexes<span class="cite"><a href="#r-colbert">[8]</a></span>.</p>
+
+<h2 id="s16-8">16.8 Latency and cost budgets for RAG</h2>
+<p>We can now assemble the budget for a RAG request end to end, and compare it with the alternative of putting everything into the model's context.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — a RAG request over a billion chunks</div>
+<p><strong>Retrieval.</strong> Query embedding with a 300M model: about 10 ms. IVF-PQ search across 8 shards with hedging: about 15–30 ms. Re-scoring the top 200 with full vectors from SSD: about 5 ms. Reranking the top 50 with a cross-encoder: about 40 ms with batching. Total retrieval: about 80 ms.</p>
+<p><strong>Generation.</strong> The top 8 chunks of 500 tokens plus the question and system prompt: about 4,500 input tokens to Llama 3 70B, mostly uncached (the retrieved chunks differ per query). Prefill at about 25,000 tokens/s per replica's share: about 180 ms. First token about 30 ms later.</p>
+<p><strong>TTFT.</strong> About 300 ms including network: retrieval is about a quarter of it.</p>
+<p><strong>Cost per query.</strong> Retrieval compute (embedding, search, rerank) is a fraction of a cent; the LLM's prefill of 4,500 tokens at $0.25 per million input tokens (§10.4) is about $0.0011, and 300 output tokens at $1.26 per million about $0.0004. The LLM dominates, and the retrieved context dominates the LLM's input.</p>
+<p><strong>Versus long context.</strong> If the relevant documents were instead passed whole—say 200,000 tokens per query—prefill would cost about $0.05 and take seconds, 45 times more, and the corpus of a billion chunks could not be passed at all. Retrieval wins by orders of magnitude for large corpora; long context wins when the relevant material is a single document of moderate size that the model must read in full.</p>
+</div>
+
+<p>The example shows two levers that infrastructure controls. The first is the <em>number of retrieved tokens</em>: every chunk passed to the LLM costs prefill and KV, so better reranking (fewer, more relevant chunks) saves LLM cost, and chunks that recur across queries—popular documents—benefit from prefix caching if they are placed consistently at the start of the context. The second is <em>caching of whole answers</em>: a <strong>semantic cache</strong> returns a stored answer when a new query's embedding is very close to a previous one's, skipping retrieval and generation. It can cut cost dramatically for repetitive traffic, such as support questions, but it must respect permissions and freshness (an answer computed for one user from documents another may not see must not be returned to them), it can return confidently wrong answers for queries that are similar in embedding but different in meaning, and, as Chapter 14 noted, a semantic cache shared across tenants is another timing side channel. Retrieval also brings data along with it into the model's context, and some of that data may be adversarial; the prompt-injection defences of §14.7 apply to every retrieved chunk.</p>
+
+<details class="drill">
+<summary>Drill 16.2 — Reranking depth versus LLM context</summary>
+<p>A team can either pass the top 20 first-stage chunks (500 tokens each) to Llama 3 70B without reranking, or rerank the top 100 with a 300M cross-encoder and pass the top 6. Compare the per-query compute and cost of the two options using the prices of §10.4 ($0.25 per million input tokens for the 70B model) and $2.50 per GPU-hour at 400 TFLOP/s effective for the reranker.</p>
+<p><em>Solution.</em> Option A: 10,000 retrieved tokens to the LLM: \(10^{4}\times0.25\times10^{-6}=\$0.0025\) per query. Option B: reranker processes \(100\times520\approx52{,}000\) tokens: \(2\times3\times10^{8}\times5.2\times10^{4}\approx3.1\times10^{13}\) FLOPs, about 0.078 GPU-seconds, \(0.078/3600\times2.5\approx\$0.000054\); LLM gets 3,000 tokens: $0.00075. Total about $0.0008, a third of option A, with lower TTFT (less prefill) and, typically, better answers because the context is more relevant. Reranking pays for itself when it shortens the LLM's context.</p>
+</details>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Retrieval turns one request into a short pipeline: embed, search, rerank, generate. Agents go much further. An agent decides for itself which tools to call—search, code execution, databases, other services—reads their results, and calls the model again, sometimes dozens of times for one user request, holding a growing context and session state across the calls. That changes the unit of work from a request to a program, introduces untrusted code execution, and makes the latency and cost of a task the product of many steps. How are tool calls and agent loops served, how are code sandboxes isolated and scaled, how should an engine schedule programs rather than requests, and what keeps a fifty-step workflow reliable? Chapter 17 takes up agents and compound AI systems.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>RAG: offline chunk, embed (batch) and index; online embed query, ANN search with filters, rerank, generate from the top chunks. Retrieval adds tens to hundreds of ms before TTFT and sets the LLM's input size.</li>
+<li>Embedding models have no decode: compute-bound single passes at \(\approx2N_{\text{emb}}\) FLOPs per token. A billion 500-token chunks with a 300M model is ≈ 9 GPU-days; model changes require re-embedding; dimension and precision set index cost (Matryoshka, 8-bit, binary).</li>
+<li>Exact search reads all \(n_{\text{vec}}d_{\text{emb}}b\) bytes per query (1.5 TB for a billion 768-d FP16 vectors): infeasible at scale; high-dimensional concentration defeats exact pruning; ANN quality is recall@k.</li>
+<li>IVF partitions by k-means and probes \(n_{\text{probe}}\) lists; PQ codes vectors in \(n_{\text{sub}}\) bytes with table-lookup distances; optimal \(n_{\text{list}}^*=\sqrt{n_{\text{vec}}n_{\text{probe}}n_{\text{sub}}/d_{\text{emb}}}\).</li>
+<li>HNSW: layered navigable small-world graph, high recall at low latency, needs vectors plus \(\approx2M_{\text{hnsw}}\times4\) bytes per vector in RAM; DiskANN keeps compressed codes in RAM and vectors plus graph on SSD. A billion vectors: ≈ 1.5–1.8 TB (flat/HNSW FP16), ≈ 72 GB (IVF-PQ), tens of GB RAM plus SSD (DiskANN).</li>
+<li>Scale with shards (scatter–gather tails; partition sharding hot spots) and replicas (hedging); freshness via delta indexes and tombstones; model changes as migrations; filtering pre/post/in-search; per-tenant indexes for selective ACLs; enforce permissions at retrieval.</li>
+<li>Hybrid lexical+dense search with rank fusion; cross-encoder reranking is accurate but costly (≈ 50k tokens per query for 100 candidates) and pays for itself by shortening LLM context.</li>
+<li>RAG TTFT ≈ retrieval (≈ 80 ms) + prefill of retrieved context; the LLM dominates cost; retrieval beats long context by orders of magnitude for large corpora; semantic caches need permission, freshness and isolation care.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci16-mcq-01" data-topic="§16.1 RAG">
+<p class="q">Which stages are on the online path of a RAG request? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Query embedding</li><li data-correct>ANN search with filters</li><li data-correct>Reranking</li><li>Chunking the corpus</li></ol>
+<div class="explain">Chunking and corpus embedding are offline.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-02" data-topic="§16.2 Embedding">
+<p class="q">Why is serving an embedding model simpler than serving an LLM?</p>
+<ol class="opts"><li>Embedding models are always tiny</li><li data-correct>There is no decode: one compute-bound forward pass per input and no KV cache to hold</li><li>They run only on CPUs</li><li>They need no batching</li></ol>
+<div class="explain">It is like prefill only.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-03" data-topic="§16.2 Embedding">
+<p class="q">Embedding 5×10¹¹ tokens with a 300M model at 400 TFLOP/s effective takes about:</p>
+<ol class="opts"><li>9 GPU-hours</li><li data-correct>9 GPU-days</li><li>9 GPU-months</li><li>9 GPU-years</li></ol>
+<div class="explain">3×10²⁰ FLOPs / 4×10¹⁴ ≈ 7.5×10⁵ s.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-04" data-topic="§16.2 Embedding">
+<p class="q">Why are embedding-model upgrades planned like database migrations?</p>
+<ol class="opts"><li>They change the schema of text</li><li data-correct>Vectors from different models are not comparable, so the whole corpus must be re-embedded and the index rebuilt</li><li>They need downtime</li><li>They are illegal otherwise</li></ol>
+<div class="explain">Build the new index in parallel and switch atomically.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-05" data-topic="§16.2 Embedding">
+<p class="q">Matryoshka embeddings allow:</p>
+<ol class="opts"><li>Larger dimensions at no cost</li><li data-correct>Using leading coordinates as useful lower-dimensional embeddings (e.g. 256 for search, full for reranking)</li><li>Binary text</li><li>Skipping the index</li></ol>
+<div class="explain">Dimension sets index memory linearly.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-06" data-topic="§16.3 Exact search">
+<p class="q">Exact search over a billion 768-dimensional FP16 vectors reads about how much data per query?</p>
+<ol class="opts"><li>1.5 MB</li><li>1.5 GB</li><li data-correct>1.5 TB</li><li>1.5 PB</li></ol>
+<div class="explain">\(10^9\times768\times2\) bytes.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-07" data-topic="§16.3 Exact search">
+<p class="q">Why do k-d trees fail in high dimensions?</p>
+<ol class="opts"><li>They need GPUs</li><li data-correct>Distances concentrate, so almost no region can be pruned and search degenerates to a scan</li><li>They cannot store floats</li><li>They are patented</li></ol>
+<div class="explain">Hence approximate methods.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-08" data-topic="§16.3 Exact search">
+<p class="q">recall@10 measures:</p>
+<ol class="opts"><li>Query latency</li><li data-correct>The fraction of the true 10 nearest neighbours the ANN method returns</li><li>Index size</li><li>Answer quality</li></ol>
+<div class="explain">The standard ANN quality metric.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-09" data-topic="§16.4 IVF-PQ">
+<p class="q">In an IVF index, increasing <code>n_probe</code>:</p>
+<ol class="opts"><li>Reduces memory</li><li data-correct>Raises recall at proportionally higher search cost</li><li>Changes the clusters</li><li>Has no effect</li></ol>
+<div class="explain">Neighbours across cluster boundaries are found.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-10" data-topic="§16.4 IVF-PQ">
+<p class="q">Product quantisation with 64 sub-spaces stores a vector in:</p>
+<ol class="opts"><li>8 bytes</li><li data-correct>64 bytes</li><li>768 bytes</li><li>1,536 bytes</li></ol>
+<div class="explain">One byte (256 centroids) per sub-space.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-11" data-topic="§16.4 IVF-PQ">
+<p class="q">Asymmetric distance computation in PQ works by:</p>
+<ol class="opts"><li>Decompressing every vector</li><li data-correct>Precomputing a table of query–centroid inner products per sub-space, then summing table lookups per vector</li><li>Hashing the query</li><li>Sorting vectors</li></ol>
+<div class="explain">\(n_{\text{sub}}\) lookups per vector.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-12" data-topic="§16.4 IVF-PQ">
+<p class="q">The optimal number of IVF lists scales with corpus size as:</p>
+<ol class="opts"><li>\(n_{\text{vec}}\)</li><li data-correct>\(\sqrt{n_{\text{vec}}}\)</li><li>\(\log n_{\text{vec}}\)</li><li>Constant</li></ol>
+<div class="explain">Proposition 16.1.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-13" data-topic="§16.4 IVF-PQ">
+<p class="q">Why do IVF-PQ systems often re-rank top candidates with full-precision vectors?</p>
+<ol class="opts"><li>To save memory</li><li data-correct>PQ distances are approximate; exact distances on a few hundred candidates restore accuracy cheaply</li><li>To update the index</li><li>For security</li></ol>
+<div class="explain">Full vectors can live on SSD.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-14" data-topic="§16.5 Graphs">
+<p class="q">HNSW search proceeds by:</p>
+<ol class="opts"><li>Scanning all vectors</li><li data-correct>Greedy descent through sparse upper layers, then beam search at layer 0</li><li>Random sampling</li><li>Sorting by norm</li></ol>
+<div class="explain">Navigable small-world graphs give few hops.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-15" data-topic="§16.5 Graphs">
+<p class="q">The main cost of HNSW at billion scale is:</p>
+<ol class="opts"><li>CPU time</li><li data-correct>RAM: full vectors plus neighbour links for every vector</li><li>Network</li><li>GPU kernels</li></ol>
+<div class="explain">Terabytes for a billion FP16 vectors.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-16" data-topic="§16.5 Graphs">
+<p class="q">DiskANN reduces RAM by:</p>
+<ol class="opts"><li>Dropping vectors</li><li data-correct>Keeping PQ codes in RAM and full vectors plus the graph on SSD, reading few blocks per query</li><li>Using only CPUs</li><li>Using binary graphs</li></ol>
+<div class="explain">NVMe serves the random reads in microseconds.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-17" data-topic="§16.5 Graphs">
+<p class="q">Parameter <code>ef_s</code> in HNSW search controls:</p>
+<ol class="opts"><li>The number of layers</li><li data-correct>The beam width at layer 0, trading recall for cost</li><li>The embedding dimension</li><li>The number of shards</li></ol>
+<div class="explain">Larger beams find more true neighbours.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-18" data-topic="§16.5 Graphs">
+<p class="q">From Figure 16.5, a billion-vector IVF-PQ index with 64-byte codes needs roughly:</p>
+<ol class="opts"><li>7 GB</li><li data-correct>70 GB</li><li>700 GB</li><li>7 TB</li></ol>
+<div class="explain">64 GB of codes plus identifiers.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-19" data-topic="§16.6 Scaling">
+<p class="q">With random sharding, why does query latency suffer as shards increase?</p>
+<ol class="opts"><li>Shards are slower</li><li data-correct>Every query waits for the slowest of all shards (fan-out tail)</li><li>Merging is expensive</li><li>Replicas are removed</li></ol>
+<div class="explain">Hedging to replicas mitigates it.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-20" data-topic="§16.6 Scaling">
+<p class="q">How are frequent inserts usually handled?</p>
+<ol class="opts"><li>Rebuild the main index per insert</li><li data-correct>A small mutable delta index searched alongside the main index, merged periodically</li><li>Ignore new data</li><li>Store new data only in the LLM</li></ol>
+<div class="explain">Deletes use tombstones and compaction.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-21" data-topic="§16.6 Scaling">
+<p class="q">Why does post-filtering fail for very selective filters?</p>
+<ol class="opts"><li>It is slow</li><li data-correct>The top candidates contain few items that pass the filter, so too few results remain</li><li>It leaks data</li><li>It breaks the index</li></ol>
+<div class="explain">Use filter-aware search or per-tenant indexes.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-22" data-topic="§16.6 Scaling">
+<p class="q">Where must document permissions be enforced in RAG?</p>
+<ol class="opts"><li>Only in the UI</li><li data-correct>At retrieval time, using the user's identity and synced ACLs</li><li>After the LLM answers</li><li>Nowhere; embeddings are anonymous</li></ol>
+<div class="explain">Otherwise the LLM may quote forbidden content.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-23" data-topic="§16.7 Hybrid">
+<p class="q">Why combine lexical (BM25) and dense retrieval?</p>
+<ol class="opts"><li>Dense is always worse</li><li data-correct>Lexical catches exact terms and identifiers; dense catches paraphrase; fusion beats either alone</li><li>BM25 is required by law</li><li>To save memory</li></ol>
+<div class="explain">Reciprocal-rank fusion is a robust combiner.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-24" data-topic="§16.7 Hybrid">
+<p class="q">A cross-encoder reranker is more accurate than first-stage retrieval because:</p>
+<ol class="opts"><li>It uses more dimensions</li><li data-correct>It processes query and document together, attending across both</li><li>It uses BM25</li><li>It caches results</li></ol>
+<div class="explain">At the cost of a forward pass per candidate.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-25" data-topic="§16.7 Hybrid">
+<p class="q">Reranking 100 candidates of 500 tokens processes about how many tokens per query?</p>
+<ol class="opts"><li>500</li><li>5,000</li><li data-correct>50,000</li><li>500,000</li></ol>
+<div class="explain">Often the costliest retrieval stage.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-26" data-topic="§16.8 Budgets">
+<p class="q">In the RAG worked example, which component dominated per-query cost?</p>
+<ol class="opts"><li>Query embedding</li><li>ANN search</li><li>Reranking</li><li data-correct>The LLM, especially prefill of retrieved context</li></ol>
+<div class="explain">Retrieval was a fraction of a cent.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-27" data-topic="§16.8 Budgets">
+<p class="q">In Drill 16.2, reranking 100 and passing 6 chunks versus passing 20 unreranked chunks:</p>
+<ol class="opts"><li>Costs three times more</li><li data-correct>Costs about a third as much, with lower TTFT</li><li>Costs the same</li><li>Is impossible</li></ol>
+<div class="explain">Shorter LLM context outweighs reranker cost.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-28" data-topic="§16.8 Budgets">
+<p class="q">Which are risks of a semantic answer cache? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Returning an answer built from documents the new user may not see</li><li data-correct>Stale answers after documents change</li><li data-correct>Wrong answers for queries similar in embedding but different in meaning</li><li>Higher LLM cost</li></ol>
+<div class="explain">Shared across tenants, it is also a timing side channel.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-29" data-topic="§16.8 Budgets">
+<p class="q">When does long context beat retrieval?</p>
+<ol class="opts"><li>For billion-document corpora</li><li data-correct>When the relevant material is a single moderate-size document the model must read in full</li><li>Always</li><li>Never</li></ol>
+<div class="explain">For large corpora retrieval is orders of magnitude cheaper.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-30" data-topic="§16.5 Graphs">
+<p class="q">In Drill 16.1, truncating 1,024-d FP16 embeddings to 256-d 8-bit reduced the HNSW index from about 450 GB to about:</p>
+<ol class="opts"><li>40 GB</li><li data-correct>90 GB</li><li>200 GB</li><li>450 GB</li></ol>
+<div class="explain">Vectors shrink 8×; links stay at about 38 GB.</div>
+</div>
+
+<div class="mcq" data-id="ci16-mcq-31" data-topic="§16.6 Scaling">
+<p class="q">Why are hedged requests cheap for vector search but expensive for LLM generation?</p>
+<ol class="opts"><li>Vector search is not idempotent</li><li data-correct>A search is a short, idempotent, inexpensive operation, while a duplicated decode costs as much as the original</li><li>LLMs cannot be hedged</li><li>Vector search has no tails</li></ol>
+<div class="explain">Hedge the cheap stages.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci16-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Explain the components of a RAG system and where the latency goes.</summary>
+<div class="answer">
+<p>Offline: chunk documents, embed in batch, build an ANN index with metadata and ACLs. Online: embed the query (5–20 ms), ANN search with filters across shards (5–50 ms), optional full-precision re-score, cross-encoder rerank of tens of candidates (30–200 ms), build the prompt with the top chunks, LLM prefill of thousands of retrieved tokens (often the largest part of TTFT) and decode. Retrieval quality (chunking, embedding model, recall, reranking) sets answer quality; retrieved context size sets LLM cost.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-02">
+<summary><span class="lvl warm">Warm-up</span> How does HNSW work, and what are its costs?</summary>
+<div class="answer">
+<p>A multi-layer proximity graph: each vector is in layer 0 and, with geometrically decreasing probability, in higher layers; each layer links vertices to up to M (2M at layer 0) near neighbours. Search starts at the top layer and greedily moves to closer neighbours, descends, and at layer 0 runs a beam search of width ef_s. High recall at sub-ms latency; supports inserts. Costs: full (or near-full) precision vectors in RAM plus ~2M × 4-byte links per vector; random memory access; deletes are awkward; billion-scale needs terabytes of RAM.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is product quantisation and why is it useful?</summary>
+<div class="answer">
+<p>Split each d-dimensional vector into n_sub sub-vectors; learn 256 centroids per sub-space by k-means; store each sub-vector as one byte (its centroid index). A 768-d FP16 vector (1,536 B) becomes 64 B with n_sub = 64. Distances via asymmetric computation: precompute a per-query table of sub-vector/centroid inner products, then each database vector's similarity is n_sub lookups. Gives 10–50× memory reduction and fast scans; lossy, so re-rank top candidates with full vectors. Combined with IVF partitioning for billion-scale indexes.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-04">
+<summary><span class="lvl core">Core</span> Design semantic search over one billion documents with a 50 ms p99 latency target.</summary>
+<div class="answer">
+<p>Chunk to ~500 tokens; embed with a compact model (e.g. 300M, 768-d, possibly Matryoshka 256-d for search); index with IVF-PQ (n_list ~50k–1M with a graph over centroids, 64-byte codes) or DiskANN; ~72 GB of codes, so shard across a handful of servers by partition or randomly; replicate each shard 3× for throughput and availability; hedge to replicas to cut tails; re-score top ~200 with full vectors from SSD; filter-aware search for ACLs and metadata, per-tenant partitions for selective permissions; delta index for fresh documents, tombstones for deletes, periodic rebuild; latency budget: embed 10 ms, search 20 ms, re-score 5 ms, merge 5 ms; measure recall@k against exact search on samples.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-05">
+<summary><span class="lvl core">Core</span> How long and how much does it cost to embed a corpus? Walk through the estimate.</summary>
+<div class="answer">
+<p>Tokens = chunks × tokens per chunk (e.g. 10⁹ × 500 = 5×10¹¹). FLOPs ≈ 2 N_emb × tokens (300M model: 3×10²⁰). GPU-seconds = FLOPs / effective throughput (400 TFLOP/s on H100 at ~40% MFU → 7.5×10⁵ s ≈ 208 GPU-hours ≈ 9 GPU-days). At $1/GPU-h spot ≈ $210; with a 7B embedder ≈ 23× more. Storage of vectors: 10⁹ × 768 × 2 B ≈ 1.5 TB. Run as a batch job on spot capacity with checkpointing by completed shards; plan re-embedding for model upgrades.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-06">
+<summary><span class="lvl core">Core</span> Derive the optimal number of IVF lists.</summary>
+<div class="answer">
+<p>Per query: compare to all centroids (n_list × d) plus scan n_probe lists of n_vec/n_list vectors at n_sub ops each: C = n_list d + n_probe n_vec n_sub / n_list. dC/dn_list = d − n_probe n_vec n_sub / n_list² = 0 ⇒ n_list* = sqrt(n_vec n_probe n_sub / d), with the two terms equal and C* = 2 sqrt(n_vec n_probe n_sub d). For 10⁹ vectors, d = 768, n_sub = 64, n_probe = 32: ≈ 52k lists, ~8×10⁷ ops/query, scanning ~0.06% of codes. Indexing centroids with a graph reduces the first term, shifting the optimum to more lists.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-07">
+<summary><span class="lvl core">Core</span> How do you enforce document permissions in vector search?</summary>
+<div class="answer">
+<p>Store ACL metadata with each chunk synced from source systems; at query time attach the user's identity and groups; filter during search (filter-aware ANN) or pre-filter when selective, and avoid naive post-filtering for selective permissions (too few results); for strong isolation or very selective access, per-tenant or per-group indexes/partitions; propagate permission changes quickly (and invalidate caches, including semantic answer caches); audit retrieval; never rely on the LLM to withhold content it was given. Treat shared vector stores with the isolation considerations of Chapter 14.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-08">
+<summary><span class="lvl core">Core</span> Compare IVF-PQ, HNSW and DiskANN for a billion vectors.</summary>
+<div class="answer">
+<p>IVF-PQ: tens of GB RAM (64 B codes ≈ 72 GB), fast scans, GPU-friendly (FAISS GPU), recall ~0.8–0.95 depending on probes and codes, re-rank to improve; rebuild for large changes. HNSW: best recall–latency on CPUs, supports inserts, but needs vectors plus links in RAM (≈ 1.8 TB for FP16 768-d with M = 32), so many machines; random access. DiskANN: compressed codes in RAM (tens of GB) with full vectors and graph on NVMe, high recall at billion scale on single machines, latency ~ms bound by SSD reads, more complex updates (FreshDiskANN). Choose by recall target, QPS, update rate and budget; combinations common.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Why does exact nearest-neighbour search degrade in high dimensions, and what makes ANN work in practice?</summary>
+<div class="answer">
+<p>Concentration of measure: for many distributions, the relative contrast (max distance − min distance)/min distance shrinks as dimension grows, so bounding-box or ball pruning eliminates almost nothing and search approaches a linear scan. ANN gives up exactness, returning most true neighbours with high probability. It works because real embeddings have low intrinsic dimension and cluster structure: k-means partitions (IVF) align with clusters, PQ exploits correlations within sub-spaces, and proximity graphs are navigable because local neighbourhoods are well-defined. Quality is measured empirically by recall@k against exact search on sample queries.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How do you migrate a production RAG system to a new embedding model?</summary>
+<div class="answer">
+<p>Vectors are model-specific, so: evaluate the new model offline (retrieval benchmarks on your data, end-to-end answer quality); re-embed the corpus as a batch job (cost ∝ tokens × model size); build the new index in parallel with its own parameters; dual-write new and updated documents to both indexes during the migration; shadow queries against the new index and compare recall and answer quality; switch traffic atomically (or by tenant/cohort) via a versioned index alias; keep the old index for rollback; then decommission. Update query embedding service in lockstep (same model version as the index). Plan capacity for double storage during migration.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> When is reranking worth its cost?</summary>
+<div class="answer">
+<p>A cross-encoder over K candidates of L tokens costs ≈ 2 N_rr K L FLOPs per query (300M, K = 100, L = 520: 3×10¹³), often the costliest retrieval stage. It pays when it lets you pass fewer, more relevant chunks to the LLM: LLM input tokens cost far more (2N with N = 70B vs 0.3B) and add TTFT and KV; e.g. rerank 100 → pass 6 vs pass 20 unreranked cuts per-query cost about 3× and improves quality. It does not pay if the LLM context is already small and first-stage precision is high, or under strict latency where reranker time dominates; tune K (depth) and model size; consider late interaction (ColBERT) or distilled rerankers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-12">
+<summary><span class="lvl design">Design</span> Design a multi-tenant RAG platform for 5,000 enterprise customers.</summary>
+<div class="answer">
+<p>Ingestion connectors per source with ACL sync; per-tenant chunking and embedding pipelines (batch on spot); storage per tenant with residency; index layout: small tenants share physical indexes partitioned by tenant (tenant filter is a hard partition key), large tenants get dedicated indexes; filter-aware search for document ACLs; versioned indexes for model migrations; query path: gateway auth → query embed → tenant-scoped ANN → rerank → LLM with tenant-scoped prefix caches; semantic cache scoped per tenant and permission set with freshness invalidation; quotas and rate limits per tenant; observability of retrieval recall proxies and latency; security: no cross-tenant caches, prompt-injection defences for retrieved content, audit logs; cost attribution per tenant (embedding, storage, search, rerank, LLM).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-13">
+<summary><span class="lvl core">Core</span> How does sharding affect vector-search tail latency, and how do you fix it?</summary>
+<div class="answer">
+<p>Random sharding sends every query to all S shards and waits for the slowest: if each shard is slow with probability ε, ≈ Sε of queries are slow. Fixes: replicate shards and hedge (send to a second replica after a short delay, take the first answer—cheap since searches are idempotent and small); partition-aware sharding to reduce shards per query (watch for hot partitions; replicate hot ones more); keep shards balanced and on similar hardware; set per-shard timeouts and return partial results if acceptable; reduce per-shard work (better compression, smaller indexes per shard).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-14">
+<summary><span class="lvl deep">Deep-dive</span> Quantify retrieval versus long context for answering questions over a company's documents.</summary>
+<div class="answer">
+<p>Retrieval: embed + search + rerank ≈ 80 ms and a fraction of a cent; LLM input ≈ 4–5k tokens (≈ $0.001 at $0.25/M on a 70B model), TTFT ≈ 300 ms. Long context: placing 200k tokens per query costs ≈ $0.05 in prefill, seconds of TTFT, and ≈ 64 GB of KV on a 70B model (320 KiB/token), unless cached; a corpus beyond the context window cannot be placed at all. Prefix caching helps long context only if the same documents recur in the same order. Use retrieval for large or changing corpora; long context for reading one moderate-size document fully or when retrieval quality is poor; hybrids (retrieve then read whole sections) are common.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-15">
+<summary><span class="lvl core">Core</span> How would you keep a vector index fresh with millions of updates per day?</summary>
+<div class="answer">
+<p>Stream changes from sources; embed new and updated chunks continuously (online embedding service or micro-batches); insert into a mutable delta index (HNSW or flat) searched alongside the main index; record deletes and superseded versions as tombstones filtered at query time; periodically merge deltas and rebuild the main index offline (IVF retraining of centroids if distribution drifts), swapping atomically; monitor delta size, tombstone fraction and recall; ensure ACL changes propagate immediately (they may not require re-embedding, only metadata updates).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci16-qa-16">
+<summary><span class="lvl warm">Warm-up</span> How much RAM does a billion-vector index need?</summary>
+<div class="answer">
+<p>Depends on representation: flat FP32 768-d ≈ 3 TB; FP16 ≈ 1.5 TB; HNSW FP16 with M = 32 adds ≈ 256 GB of links ≈ 1.8 TB; IVF-PQ with 64-byte codes ≈ 64 GB plus IDs ≈ 72 GB; DiskANN keeps ≈ 32-byte PQ codes in RAM (tens of GB) and full vectors plus graph on SSD (≈ 2 TB). Lower dimensions (Matryoshka) and 8-bit or binary embeddings shrink these proportionally, at some recall cost.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-rag">P. Lewis et al. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. <em>NeurIPS</em>, 2020. <a href="https://arxiv.org/abs/2005.11401">arXiv:2005.11401</a>.</li>
+<li id="r-mteb">N. Muennighoff, N. Tazi, L. Magne, N. Reimers. MTEB: Massive Text Embedding Benchmark. 2022. <a href="https://arxiv.org/abs/2210.07316">arXiv:2210.07316</a>.</li>
+<li id="r-matryoshka">A. Kusupati et al. Matryoshka Representation Learning. <em>NeurIPS</em>, 2022. <a href="https://arxiv.org/abs/2205.13147">arXiv:2205.13147</a>.</li>
+<li id="r-faiss">J. Johnson, M. Douze, H. Jégou. Billion-scale similarity search with GPUs (FAISS). 2017. <a href="https://arxiv.org/abs/1702.08734">arXiv:1702.08734</a>.</li>
+<li id="r-pq">H. Jégou, M. Douze, C. Schmid. Product Quantization for Nearest Neighbor Search. <em>IEEE TPAMI</em> 33(1), 2011.</li>
+<li id="r-hnsw">Y. A. Malkov, D. A. Yashunin. Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs. 2016. <a href="https://arxiv.org/abs/1603.09320">arXiv:1603.09320</a>.</li>
+<li id="r-diskann">S. J. Subramanya et al. DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node. <em>NeurIPS</em>, 2019.</li>
+<li id="r-colbert">O. Khattab, M. Zaharia. ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT. <em>SIGIR</em>, 2020. <a href="https://arxiv.org/abs/2004.12832">arXiv:2004.12832</a>.</li>
+<li>R. Guo et al. Accelerating Large-Scale Inference with Anisotropic Vector Quantization (ScaNN). <em>ICML</em>, 2020. <a href="https://arxiv.org/abs/1908.10396">arXiv:1908.10396</a>.</li>
+<li>S. Robertson, H. Zaragoza. The Probabilistic Relevance Framework: BM25 and Beyond. <em>Foundations and Trends in IR</em> 3(4), 2009.</li>
+<li>G. V. Cormack, C. L. A. Clarke, S. Büttcher. Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods. <em>SIGIR</em>, 2009.</li>
+<li>K. Beyer et al. When Is "Nearest Neighbor" Meaningful? <em>ICDT</em>, 1999.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>
