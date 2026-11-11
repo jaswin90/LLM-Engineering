@@ -259,6 +259,13 @@
 <tr><td>\(\tau_c\), \(\delta_c\), \(M_{\text{bf}}\)</td><td>checkpoint interval; cost of one checkpoint; mean time between interruptions (Ch. 7)</td></tr>
 <tr><td>\(z\), \(n_{\text{req}}\)</td><td>number of failure domains a tier is spread over; replicas required (Ch. 7, 13)</td></tr>
 </tbody></table></div>
+<h2>Serving platforms (Vol. II Ch. 8)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(n_{\text{q},j}\), \(n_{\text{hit},j}\)</td><td>prefill tokens queued at replica \(j\); length of the request's prefix already cached there</td></tr>
+<tr><td>\(u^{\text{kv}}_j\), \(t_{\text{kv}}\), \(t_{\text{lora}}\)</td><td>KV-cache utilisation of replica \(j\); time penalties for KV pressure and adapter loading</td></tr>
+<tr><td>\(m\), \(m^{*}\)</td><td>autoscaling metric per replica and its target</td></tr>
+<tr><td>\(c_{\text{ded}}\), \(c_{\text{sls}}\), \(o\)</td><td>dedicated price per GPU-hour; serverless price per busy GPU-hour; cold-start overhead fraction</td></tr>
+</tbody></table></div>
 </div>
 </body>
 </html>

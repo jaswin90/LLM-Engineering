@@ -266,3 +266,11 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(c_j\), \(a_i\), \(n_{\text{res}}\) | free-capacity vector of node \(j\); demand vector of pod \(i\); number of resource types (Ch. 7) |
 | \(\tau_c\), \(\delta_c\), \(M_{\text{bf}}\) | checkpoint interval; cost of one checkpoint; mean time between interruptions (Ch. 7) |
 | \(z\), \(n_{\text{req}}\) | number of failure domains a tier is spread over; replicas required (Ch. 7, 13) |
+
+## Serving platforms (Vol. II Ch. 8)
+| Symbol | Meaning |
+|---|---|
+| \(n_{\text{q},j}\), \(n_{\text{hit},j}\) | prefill tokens queued at replica \(j\); length of the request's prefix already cached there |
+| \(u^{\text{kv}}_j\), \(t_{\text{kv}}\), \(t_{\text{lora}}\) | KV-cache utilisation of replica \(j\); time penalties for KV pressure and adapter loading |
+| \(m\), \(m^{*}\) | autoscaling metric per replica and its target |
+| \(c_{\text{ded}}\), \(c_{\text{sls}}\), \(o\) | dedicated price per GPU-hour; serverless price per busy GPU-hour; cold-start overhead fraction |

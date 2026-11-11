@@ -310,7 +310,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 5 | Storage, Weights and Cold Starts | ✅ v1 |
 | 6 | Containers and Kubernetes for Accelerators | ✅ v1 |
 | 7 | Scheduling a GPU Cluster | ✅ v1 |
-| 8 | Serving Platforms and Control Planes | ⏳ |
+| 8 | Serving Platforms and Control Planes | ✅ v1 |
 | 9 | Capacity, Procurement and Autoscaling | ⏳ |
 | 10 | The Economics of Inference | ⏳ |
 | 11 | The Front Door: Gateways, Streaming and Rate Limits | ⏳ |

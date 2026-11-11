@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 8 · Serving Platforms and Control Planes — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 8 of Cloud AI Infrastructure: what a serving platform adds to an inference engine; Triton, KServe, Ray Serve and BentoML; LLM-native control planes (NVIDIA Dynamo, llm-d, AIBrix, the Gateway API Inference Extension); replica selection as scoring; autoscaling on the right signals and the pitfalls of feedback with delay; managed endpoints, token APIs and serverless GPUs; and the model lifecycle from registry to rollback.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci08" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part II · Orchestration — Chapter 8</div>
+<h1 id="top">Serving Platforms and Control Planes</h1>
+<p class="lede">An inference engine turns a prompt into tokens on one replica. A serving platform turns a model into a service: it deploys replicas from a registry, routes each request to a good replica, scales the fleet with demand, rolls out new versions safely, and exposes an endpoint with authentication, quotas and metrics. This chapter surveys the platforms that do this—from general model servers to LLM-native control planes and managed cloud endpoints—and develops the two quantitative problems at their core: choosing a replica for each request and choosing how many replicas to run.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapters 6 and 7 gave us a cluster that can run containers on GPUs, place them sensibly and share capacity among workloads. Kubernetes knows about pods and GPUs, but nothing about models: it does not know that a replica has Llama 3 70B loaded with a particular LoRA adapter, that it holds a tenant's conversation prefix in its KV cache, that its decode batch is nearly full, or that the right signal for adding replicas is queued prefill tokens rather than CPU usage. Volume I described these concerns at the level of the fleet in Vol. I Chapter 27—routing with cache affinity, autoscaling with cold starts, multi-LoRA—without saying what software implements them. That software is the serving platform.</p>
+<p>The landscape of serving platforms changed quickly between 2018 and 2026, and the reasons for each change are instructive. General-purpose model servers were built for small models with millisecond inference and request-level batching. LLMs broke their assumptions—token streaming, continuous batching inside the engine, KV caches that make replicas stateful, prefill and decode with different needs—and a new generation of LLM-native control planes appeared in 2024–2025. In parallel, the clouds turned model serving into managed products and per-token APIs, and a class of serverless GPU platforms emerged for spiky workloads. Interviewers expect a candidate to know what each layer does, to design the routing and autoscaling logic themselves, and to say when to build, when to adopt open source and when to buy.</p>
+<p>We start with what a platform adds to an engine (§8.1), survey general model servers (§8.2) and the LLM-native control planes that followed (§8.3), and then develop replica selection (§8.4) and autoscaling (§8.5) quantitatively. We compare managed endpoints, token APIs and serverless GPUs (§8.6), describe the model lifecycle from registry to rollback (§8.7), and close with the build-versus-buy question (§8.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>List the responsibilities a serving platform adds to an inference engine and draw the layers of a model-serving stack.</li>
+<li>Describe Triton, KServe, Ray Serve and BentoML, and explain why LLMs needed new control planes such as NVIDIA Dynamo, llm-d and AIBrix.</li>
+<li>Explain the Gateway API Inference Extension and design a replica-scoring function that combines load, KV-cache pressure, prefix affinity and adapter locality.</li>
+<li>Choose autoscaling signals for LLM serving, apply the proportional scaling rule, and avoid overshoot and oscillation caused by cold-start delay.</li>
+<li>Compare managed endpoints, token APIs and serverless GPUs by cost, control and latency, including the break-even utilisation for serverless.</li>
+<li>Design a model lifecycle with registry, evaluation gates, shadow traffic, canaries and rollback.</li>
+</ol>
+<p class="small muted">Uses: Vol. I Chapters 11–13 and 27 (engines, disaggregation, fleet routing and autoscaling); Chapters 1, 5, 6 and 7 of this volume.</p>
+</div>
+
+<h2 id="s8-1">8.1 What a platform adds to an engine</h2>
+<p>An inference engine such as vLLM, SGLang or TensorRT-LLM (Vol. I Chapter 12) is a process that loads one model, accepts requests on an HTTP port, batches them continuously, and streams tokens back. Everything outside that process is the platform's job, and it helps to list the responsibilities explicitly, because each is a component that can be built, adopted or bought. <em>Deployment</em>: turn a declaration such as "Llama 3 70B, FP8, TP8, at least 40 replicas, in these zones" into running replicas with the right image, weights, arguments and resources. <em>Endpoint management</em>: give the model a stable name and URL, map model names and versions to replica pools, and support many models and adapters behind one API. <em>Routing</em>: choose a replica for each request, taking account of load and cache state. <em>Autoscaling</em>: decide how many replicas each pool needs, on the right signals. <em>Lifecycle</em>: register models, gate them on evaluation, roll new versions out gradually and roll back. <em>Multi-tenancy</em>: authenticate callers, enforce quotas and rate limits, meter usage for billing. <em>Observability</em>: collect per-request latency, tokens, errors and costs.</p>
+<p>Figure 8.1 arranges these responsibilities into layers. The lowest platform layer runs and scales replicas (the Kubernetes machinery of Chapters 6–7 plus a controller that understands model deployments). Above it, a request-routing layer selects replicas. Above that, the API layer presents an OpenAI-compatible or provider-specific interface with authentication and limits (Chapter 11). Cutting across all of them are the lifecycle and observability systems. Different products cover different subsets: a general model server covers mostly the engine and part of deployment; an LLM control plane covers routing, autoscaling and disaggregation; a managed endpoint covers everything except the application.</p>
+
+<figure class="diagram" id="fig-8-1">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="Layers of a model-serving stack">
+<rect x="20" y="20" width="560" height="38" rx="6" class="bx4"/><text x="300" y="44" text-anchor="middle" class="t-xs t-b">API layer: OpenAI-compatible endpoint, auth, quotas, rate limits, metering (Ch. 11)</text>
+<rect x="20" y="66" width="560" height="38" rx="6" class="bx2"/><text x="300" y="90" text-anchor="middle" class="t-xs t-b">routing layer: model → pool, replica selection (load, KV, prefix, adapter), disaggregation (§8.4)</text>
+<rect x="20" y="112" width="560" height="38" rx="6" class="bx3"/><text x="300" y="136" text-anchor="middle" class="t-xs t-b">deployment and scaling: replica pools, autoscaler on token signals, warm pools (§8.5)</text>
+<rect x="20" y="158" width="560" height="38" rx="6" class="bx5"/><text x="300" y="182" text-anchor="middle" class="t-xs t-b">engines: vLLM, SGLang, TensorRT-LLM, TGI — batching, KV cache, kernels (Vol. I)</text>
+<rect x="20" y="204" width="560" height="38" rx="6" class="bx"/><text x="300" y="228" text-anchor="middle" class="t-xs t-b">cluster: Kubernetes, schedulers, GPUs, network, storage (Ch. 2–7)</text>
+<rect x="600" y="20" width="105" height="222" rx="8" class="bx4"/>
+<text x="652" y="60" text-anchor="middle" class="t-xs t-b">lifecycle</text><text x="652" y="76" text-anchor="middle" class="t-xs">registry</text><text x="652" y="90" text-anchor="middle" class="t-xs">eval gates</text><text x="652" y="104" text-anchor="middle" class="t-xs">rollouts</text>
+<text x="652" y="150" text-anchor="middle" class="t-xs t-b">observability</text><text x="652" y="166" text-anchor="middle" class="t-xs">latency, tokens</text><text x="652" y="180" text-anchor="middle" class="t-xs">errors, cost</text>
+<text x="360" y="268" text-anchor="middle" class="t-xs">General model servers cover mostly the engine layer; LLM control planes cover routing and scaling; managed endpoints cover all but the application.</text>
+</svg>
+<figcaption><b>Figure 8.1 — The layers of a serving stack.</b> Each layer can be built in-house, adopted as open source or bought as a managed service, and the boundaries between products and layers do not always coincide.</figcaption>
+</figure>
+
+<h2 id="s8-2">8.2 General model servers: Triton, KServe, Ray Serve and BentoML</h2>
+<p>The first generation of serving platforms was designed before LLMs, for models such as image classifiers, recommenders and speech recognisers, and it established ideas that are still used. NVIDIA's <strong>Triton Inference Server</strong>, released in 2018 as the TensorRT Inference Server, introduced a <em>model repository</em> (a directory or bucket of models with configuration files), pluggable <em>backends</em> for TensorRT, PyTorch, ONNX Runtime, TensorFlow and Python, <em>dynamic batching</em> (collecting individual requests into batches up to a size or time limit), concurrent execution of several models on one GPU, and <em>ensembles</em> that chain models into pipelines (tokenizer → model → post-processing). A Triton backend for TensorRT-LLM later brought LLMs into the same server, with in-flight batching inside the engine.</p>
+<p><strong>KServe</strong>, begun in 2019 as KFServing within the Kubeflow project, is a Kubernetes-native platform built around a custom resource, the <em>InferenceService</em>, which declares a model's storage location, runtime and resources; KServe's controller turns it into deployments, services and routes. It standardised an inference protocol (the "v2" or Open Inference Protocol, shared with Triton), integrated Knative for request-driven autoscaling including scale to zero, offered canary rollouts by traffic splitting, and added ModelMesh for packing many small models densely onto shared servers. Later versions added LLM-specific runtimes and integration with the Gateway API Inference Extension discussed in §8.3.</p>
+<p><strong>Ray Serve</strong>, built on the Ray distributed computing framework, takes a programming-model view: a deployment is a Python class whose replicas Ray schedules across a cluster, deployments can call each other to form pipelines, and an autoscaler adjusts replica counts from queue lengths. It suits applications that compose several models with custom Python logic, and it is commonly used with vLLM for LLM serving and for batch inference (Chapter 19). <strong>BentoML</strong> packages models and serving code into deployable "bentos" with a focus on developer experience; its company also operates a managed platform. These systems remain useful, especially for non-LLM models and for pipelines around LLMs (embedding models, rerankers, classifiers, guardrails; Chapters 16 and 18).</p>
+<p>The limitation of this generation for LLMs lies in assumptions buried in its design. It assumes requests are short and roughly uniform, so that request counts measure load and simple round-robin balances it; LLM requests vary by a thousand-fold in cost (Vol. I §27.1). It assumes replicas are stateless and interchangeable; LLM replicas carry prefix caches whose reuse can halve the cost of a request (Vol. I §27.2). It assumes batching happens in the server; for LLMs, batching happens inside the engine, step by step. And it has no notion of splitting a request's prefill and decode across machines (Vol. I Chapter 13). Each of these mismatches motivated the next generation.</p>
+
+<h2 id="s8-3">8.3 LLM-native control planes</h2>
+<p>Between 2024 and 2025, several open-source control planes appeared that treat LLM serving as their primary case. Their designs differ, but they converge on the same set of capabilities: token- and cache-aware routing, autoscaling on LLM signals, disaggregated prefill and decode with KV-cache transfer, management of LoRA adapters, and tiered KV-cache storage beyond a single replica's HBM. Table 8.1 summarises the main ones.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 8.1 — LLM-native control planes (as of 2025–2026)</caption>
+<thead><tr><th>System</th><th>Origin</th><th>Key ideas</th></tr></thead>
+<tbody>
+<tr><td>NVIDIA Dynamo</td><td>NVIDIA, announced March 2025</td><td>Engine-agnostic (vLLM, SGLang, TensorRT-LLM); disaggregated prefill/decode; KV-aware router; "planner" that resizes prefill and decode pools; NIXL for KV transfer; KV block manager spanning HBM, host memory and storage</td></tr>
+<tr><td>llm-d</td><td>Red Hat, Google, IBM, NVIDIA, CoreWeave and others, May 2025</td><td>Kubernetes-native; vLLM engines; inference scheduler built on the Gateway API Inference Extension; prefix-cache-aware and load-aware routing; disaggregation; wide expert parallelism</td></tr>
+<tr><td>AIBrix</td><td>ByteDance, 2025</td><td>Kubernetes control plane for vLLM: high-density LoRA management, LLM-specific autoscaler, distributed KV cache, heterogeneous-GPU serving</td></tr>
+<tr><td>vLLM production stack; SGLang router</td><td>Engine projects</td><td>Reference deployments with prefix-aware routing, observability and KV offload (e.g. LMCache)</td></tr>
+<tr><td>Gateway API Inference Extension</td><td>Kubernetes SIG Network, 2024–2025</td><td>Standard API (InferencePool and model objectives) and an endpoint-picker protocol letting any gateway route LLM requests by model, criticality and replica state</td></tr>
+</tbody></table></div>
+
+<p>The <strong>Gateway API Inference Extension</strong> deserves a closer look, because it turns replica selection into a standard component. Kubernetes' Gateway API is the successor to Ingress for configuring HTTP load balancers. The inference extension adds an <em>InferencePool</em> resource—a set of model-server pods sharing a base model—and model-level objectives such as criticality, and it defines an <strong>endpoint picker</strong> (EPP): an extension service that the gateway consults for each request. The gateway parses the request, tells the endpoint picker which model and adapter it wants, and the picker, which continuously scrapes each replica's metrics (queue length, KV-cache utilisation, loaded LoRA adapters) and may track which prefixes each replica holds, returns the replica to use. Figure 8.2 shows the flow. The design separates the generic parts of load balancing (connections, TLS, retries, which any gateway implements) from the LLM-specific choice of replica, which a pluggable picker implements.</p>
+
+<figure class="diagram" id="fig-8-2">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Gateway with an inference endpoint picker">
+<defs><marker id="a82" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="105" width="90" height="50" rx="8" class="bx"/><text x="60" y="128" text-anchor="middle" class="t-xs t-b">client</text><text x="60" y="144" text-anchor="middle" class="t-xs">model, prompt</text>
+<rect x="140" y="95" width="130" height="70" rx="8" class="bx4"/><text x="205" y="118" text-anchor="middle" class="t-xs t-b">gateway</text><text x="205" y="134" text-anchor="middle" class="t-xs">TLS, auth, limits,</text><text x="205" y="148" text-anchor="middle" class="t-xs">retries, streaming</text>
+<rect x="140" y="200" width="130" height="56" rx="8" class="bx2"/><text x="205" y="222" text-anchor="middle" class="t-xs t-b">endpoint picker</text><text x="205" y="238" text-anchor="middle" class="t-xs">scores replicas</text>
+<line x1="105" y1="130" x2="138" y2="130" class="ln" marker-end="url(#a82)"/>
+<line x1="195" y1="165" x2="195" y2="198" class="ln ln-acc" marker-end="url(#a82)"/>
+<line x1="215" y1="198" x2="215" y2="167" class="ln ln-acc" marker-end="url(#a82)"/>
+<text x="232" y="186" class="t-xs t-acc">which replica?</text>
+<rect x="330" y="20" width="370" height="236" rx="10" class="bx"/>
+<text x="515" y="40" text-anchor="middle" class="t-sm t-b">InferencePool: Llama 3 70B replicas</text>
+<rect x="345" y="55" width="340" height="40" rx="6" class="bx3"/><text x="355" y="73" class="t-xs t-b">replica 1</text><text x="355" y="88" class="t-xs">queue 2 · KV 61% · adapters {a, b} · holds tenant X prefix</text>
+<rect x="345" y="103" width="340" height="40" rx="6" class="bx3"/><text x="355" y="121" class="t-xs t-b">replica 2</text><text x="355" y="136" class="t-xs">queue 0 · KV 35% · adapters {c}</text>
+<rect x="345" y="151" width="340" height="40" rx="6" class="bx3"/><text x="355" y="169" class="t-xs t-b">replica 3</text><text x="355" y="184" class="t-xs">queue 9 · KV 93% · adapters {a}</text>
+<text x="515" y="215" text-anchor="middle" class="t-xs">picker scrapes engine metrics every ≈ 50–100 ms</text>
+<text x="515" y="231" text-anchor="middle" class="t-xs">and tracks prefix ownership from routing history</text>
+<line x1="270" y1="130" x2="343" y2="80" class="ln" marker-end="url(#a82)"/>
+<line x1="270" y1="225" x2="343" y2="225" class="ln ln-s3" stroke-dasharray="4 4"/>
+</svg>
+<figcaption><b>Figure 8.2 — LLM-aware routing as a pluggable picker.</b> The gateway handles generic HTTP concerns; for each request it asks the endpoint picker, which knows each replica's queue, KV-cache pressure, loaded adapters and likely cached prefixes, which replica to use. Here a request from tenant X with adapter <i>a</i> goes to replica 1.</figcaption>
+</figure>
+
+<p>Dynamo approaches the same problems from the engine side outward. Its router keeps a global index of which KV-cache blocks each worker holds, published by the workers as blocks are created and evicted, and routes each request to the worker that maximises cache reuse subject to load. Its planner watches prefill and decode queues and resizes the two pools of a disaggregated deployment, the dynamic version of the pool-sizing problem of Vol. I §13.5. Its KV block manager offloads cache blocks from HBM to host memory and storage and fetches them back on reuse, the hierarchical KV storage of Vol. I §10.7 made fleet-wide. Whatever the system, two decisions recur on every request and every few seconds: which replica, and how many replicas. We take them in turn.</p>
+
+<p>One capability in Table 8.1 deserves its own discussion because it changes the economics of a platform: serving <em>many models on one fleet</em>. Enterprise platforms host hundreds or thousands of fine-tuned variants, most of them rarely used. Giving each its own replica pool wastes GPUs on idle replicas (Figure 3.4); packing them onto shared capacity requires the platform to move models and adapters in and out of GPU memory as demand shifts. For LoRA adapters (Vol. I §27.4), which are tens to hundreds of megabytes, the platform keeps a <strong>cache hierarchy</strong> analogous to the weight hierarchy of Chapter 5, shown in Figure 8.3: the adapters currently in use reside in each replica's HBM, a larger set in host memory, the whole catalogue on local NVMe or in object storage. A request for an adapter that is not in HBM incurs a load from the next tier—roughly 1 ms per 50 MB from host memory over PCIe, 10–50 ms from NVMe, a few hundred milliseconds from object storage—and the router prefers replicas that already hold it.</p>
+
+<figure class="diagram" id="fig-8-3">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="Adapter cache hierarchy in a multi-LoRA platform">
+<rect x="20" y="20" width="300" height="40" rx="6" class="bx2"/><text x="32" y="45" class="t-xs t-b">HBM: active adapters (tens per replica)</text>
+<rect x="20" y="70" width="360" height="40" rx="6" class="bx4"/><text x="32" y="95" class="t-xs t-b">host DRAM: recently used (hundreds to thousands)</text>
+<rect x="20" y="120" width="440" height="40" rx="6" class="bx"/><text x="32" y="145" class="t-xs t-b">local NVMe: the tenant catalogue for this pool</text>
+<rect x="20" y="170" width="520" height="40" rx="6" class="bx3"/><text x="32" y="195" class="t-xs t-b">object storage: every adapter version (canonical)</text>
+<text x="335" y="45" class="t-xs">≈ 0 ms</text>
+<text x="395" y="95" class="t-xs">≈ 1–5 ms over PCIe</text>
+<text x="475" y="145" class="t-xs">≈ 10–50 ms</text>
+<text x="555" y="195" class="t-xs">≈ 100–500 ms</text>
+<text x="600" y="40" class="t-xs t-b">router prefers</text>
+<text x="600" y="56" class="t-xs">replicas whose</text>
+<text x="600" y="72" class="t-xs">HBM holds the</text>
+<text x="600" y="88" class="t-xs">request's adapter</text>
+<text x="360" y="230" text-anchor="middle" class="t-xs">Load times are for a ≈ 50–100 MB rank-16 adapter of a 7–8B model; eviction is LRU with pinning of heavy tenants.</text>
+</svg>
+<figcaption><b>Figure 8.3 — Where adapters live.</b> A multi-LoRA platform caches adapters across tiers just as Chapter 5 caches weights, so that the thousands of rarely used fine-tunes share a small number of base-model replicas.</figcaption>
+</figure>
+
+<p>Figure 8.3 turns the platform's capacity problem into a caching problem with a simple cost model. If adapter requests follow a skewed popularity distribution—as they nearly always do, with a few heavy tenants and a long tail—then a replica whose HBM holds the top few dozen adapters serves most requests with no load at all, host memory catches most of the rest at a cost of milliseconds, and only the rare cold tenant pays a visible delay. Full fine-tunes are harder, since each is a whole model: the platform can keep popular ones resident, park others in sleep mode or host memory for second-scale swaps (§5.7), and scale rarely used ones to zero, accepting a cold start on first use. The platform's job is to choose these placements continuously from observed demand, and this is one of the features that distinguishes LLM platforms from general ones.</p>
+
+<h2 id="s8-4">8.4 Choosing a replica: routing as scoring</h2>
+<p>Vol. I §27.2 analysed load balancing with queueing theory and showed that the power of two choices and join-the-shortest-queue cut tail latency dramatically compared with random assignment, and that cache affinity can save most of a request's prefill. A production picker must combine these objectives, which often conflict: the replica with the shortest queue rarely holds the request's prefix, and the replica that holds it may be busy. The standard approach is to filter and score, as cluster schedulers do (§7.1), but per request and in a millisecond.</p>
+<p><strong>Filtering</strong> removes replicas that cannot serve the request at all: they do not have the requested adapter and cannot load it quickly, they are not ready, their KV cache is too full to admit the request's context, or they are in the wrong region for the tenant's data (Chapter 12). <strong>Scoring</strong> estimates, for each remaining replica \(j\), the cost of serving the request there, and picks the cheapest. A useful form is an estimate of the request's time to first token:</p>
+\[
+\widehat{\text{TTFT}}_j\approx\frac{n_{\text{q},j}}{\Phi_{P,j}}+\frac{n_{\text{in}}-n_{\text{hit},j}}{\Phi_{P,j}}+t_{\text{kv}}\,\mathbb 1[u^{\text{kv}}_j>u^{\text{kv}}_{\max}]+t_{\text{lora}}\,\mathbb 1[\text{adapter not loaded}],
+\]
+<p>where \(n_{\text{q},j}\) is the number of prefill tokens already queued at the replica, \(\Phi_{P,j}\) its prefill rate, \(n_{\text{hit},j}\) the length of the longest prefix of the request the replica already has cached, \(u^{\text{kv}}_j\) its KV-cache utilisation (above a threshold, admitting the request risks preemption of running sequences, Vol. I §11.5), and \(t_{\text{kv}},t_{\text{lora}}\) time penalties for those risks and for loading an adapter. The first term is queueing delay, the second the request's own uncached prefill, and the last two the cost of pushing a replica into trouble. Pickers in practice use simpler weighted sums of normalised metrics, but writing the score as an estimated latency makes the weights meaningful.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — which replica should take this request?</div>
+<p><strong>Request.</strong> A tenant's next chat turn: \(n_{\text{in}}=6{,}000\) tokens, of which the first 5,600 are the conversation so far; adapter <i>a</i>.</p>
+<p><strong>Replicas</strong> (as in Figure 8.2), each with \(\Phi_P=25{,}000\) prefill tokens/s. Replica 1: queue 4,000 tokens, KV 61%, holds the 5,600-token prefix, adapter <i>a</i> loaded. Replica 2: queue 0, KV 35%, no prefix, adapter not loaded (load cost 0.3 s). Replica 3: queue 30,000 tokens, KV 93% (above an 85% threshold, penalty 1 s), adapter <i>a</i> loaded, no prefix.</p>
+<p><strong>Scores.</strong> Replica 1: \(4000/25{,}000+400/25{,}000=0.16+0.016\approx0.18\) s. Replica 2: \(0+6000/25{,}000+0.3=0.54\) s. Replica 3: \(30{,}000/25{,}000+6000/25{,}000+1=2.44\) s.</p>
+<p><strong>Decision.</strong> Replica 1, despite having a longer queue than replica 2, because its cached prefix saves 5,600 tokens of prefill. A least-loaded router would have chosen replica 2 and spent three times the latency and fifteen times the prefill compute. A pure prefix-affinity router would also have chosen replica 1 here, but in a burst of turns from the same tenant it would pile them all onto replica 1 until its queue grew long; the score handles that trade-off automatically, because \(n_{\text{q},j}\) rises with each assignment.</p>
+</div>
+
+<p>Two refinements matter at scale. First, the picker's view of replica state is always slightly stale—metrics are scraped every tens of milliseconds, and many gateway instances route concurrently—so pure "pick the minimum score" can herd: every gateway sends its next requests to the same momentarily best replica. Sampling a few candidates and choosing the best among them (the power of \(n_c\) choices, Vol. I §27.2), or adding the picker's own recent assignments to each replica's queue estimate, prevents herding. Second, prefix ownership can be tracked cheaply without querying engines: if the router itself assigns requests by hashing the first block of the prompt (system prompt plus tenant) with bounded-load consistent hashing, it knows where each prefix lives, and engines' prefix caches naturally specialise. Both techniques appear in the control planes of Table 8.1.</p>
+
+<details class="drill">
+<summary>Drill 8.1 — How much does prefix-aware routing save Atlas?</summary>
+<p>Atlas's 70B tier receives 3,500 requests/s at peak with 2,000 input tokens, of which 1,200 are a reusable prefix (system prompt and history). With 233 replicas and random routing, a request's prefix is cached on the chosen replica only if it was recently served there; suppose the per-replica hit rate is then 15%. With prefix-aware routing it is 60%. How much prefill compute per second does routing save, and how many replica-equivalents is that?</p>
+<p><em>Solution.</em> Random routing: uncached tokens per request \(2000-0.15\times1200=1820\); prefix-aware: \(2000-0.6\times1200=1280\). Saved: 540 tokens per request, \(3500\times540\approx1.9\times10^{6}\) prefill tokens/s. At 25,000 prefill tokens/s per replica, that is about 76 replica-equivalents of prefill capacity. Whether it saves 76 replicas depends on which phase binds (Chapter 1: decode binds for this tier at 60% hits); with random routing, prefill demand rises to \(3500\times1820/25{,}000\approx255\) replicas, overtaking decode's 233, so prefix-aware routing saves at least 22 replicas and keeps TTFT far lower.</p>
+</details>
+
+<h2 id="s8-5">8.5 How many replicas: autoscaling on the right signal</h2>
+<p>The autoscaler decides how many replicas each pool should run. Kubernetes' Horizontal Pod Autoscaler (HPA), and event-driven extensions such as KEDA, implement a simple rule: measure a metric \(m\) averaged over the current replicas, compare it with a target \(m^*\), and set</p>
+\[
+n_{\text{desired}}=\Bigl\lceil n_{\text{current}}\cdot\frac{m}{m^*}\Bigr\rceil ,
+\]
+<p>with a tolerance band to avoid reacting to noise and stabilisation windows that limit how fast replicas are removed. The rule assumes that the metric is proportional to load per replica, so that scaling the replica count by \(m/m^*\) brings the metric back to target. Everything depends on choosing a metric for which that assumption holds and which reflects the service's objectives.</p>
+<p>For LLM serving, several obvious metrics are wrong. <em>CPU utilisation</em>, the HPA default, measures the engine's host process, which is busy whether the GPU is or not. <em>GPU utilisation</em> as reported by the driver is the fraction of time at least one kernel is running, not how much of the GPU is used, so a replica with a single sequence decoding can show near 100% while doing a few percent of its possible work; DCGM's SM-activity and tensor-pipe metrics are better but still do not reflect latency targets. <em>Request rate</em> is closer, but requests differ in cost by orders of magnitude. Better signals measure the engine's own load in its own units: the number of <em>running and waiting sequences</em>, <em>queued prefill tokens</em>, <em>KV-cache utilisation</em> (which approaches 100% just before the engine starts preempting), and, best of all, the quantity the service is judged on—<em>SLO attainment</em>, the fraction of recent requests meeting their TTFT and TPOT targets, or a high percentile of TTFT relative to its target. Production autoscalers combine a load signal for steady-state sizing with an SLO signal as a safety override.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — the autoscaler as a feedback controller with delay</div>
+<p>The proportional rule is a discrete-time controller: at each step \(k\) it observes the load and sets a capacity target. If the observed load per replica is computed only over replicas that are <em>serving</em>, and new replicas take \(d\) steps to start (the cold start of Chapter 5), then during those \(d\) steps the controller sees the same overload and keeps adding replicas, as if the ones it already requested did not exist. The closed loop then overshoots by a factor of roughly \(d\) times the per-step correction. The fix is to count <em>requested</em> capacity (serving plus pending) when computing the correction, which Kubernetes' HPA does for pods but custom autoscalers built on engine metrics often do not. More generally, a feedback loop whose actuation delay is long compared with its sampling interval oscillates unless its gain is reduced in proportion; this is the classical stability problem of control with dead time, and it is why autoscalers for slow-starting replicas need either low gain, explicit accounting for pending capacity, or a predictive (feed-forward) component based on demand forecasts.</p>
+</div>
+
+<p>Figure 8.4 shows the effect in a simulation. Demand steps from a level needing 14 replicas to one needing 40; replicas take six steps (say, six minutes) to start. An autoscaler that counts pending replicas requests 26 more once and reaches 40. One that sizes from serving replicas only keeps requesting 26 more every step until the first new replicas arrive, ending with 170—more than four times the need—which a scale-down policy must then slowly undo.</p>
+
+<figure class="chart" id="fig-8-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Provisioned replicas after a demand step, with a 6-step cold start (simulation)","height":320,
+ "x":{"label":"Time step (e.g. minutes)","min":0,"max":24,"ticks":[0,4,8,12,16,20,24]},
+ "y":{"label":"Replicas requested (serving + pending)","min":0,"max":180,"ticks":[0,40,80,120,160]},
+ "series":[
+  {"name":"Sizing from serving replicas only","color":"s2","points":[[0,14],[3,14],[4,40],[5,66],[6,92],[7,118],[8,144],[9,170],[16,170],[24,170]]},
+  {"name":"Counting pending replicas","color":"s3","points":[[0,14],[3,14],[4,40],[24,40]]}
+ ],
+ "hlines":[{"y":40,"text":"needed after step"}]}
+</script>
+<figcaption><b>Figure 8.4 — Ignoring pending capacity makes slow-starting fleets overshoot.</b> Each step the naive controller sees the same overload on the same serving replicas and orders the same correction again; the overshoot grows with the cold-start delay. Scale-down stabilisation then keeps the excess for a while.</figcaption>
+</figure>
+
+<p>Autoscaling LLM replicas has three further subtleties. <em>Asymmetry</em>: scaling up late breaks latency targets for everyone, while scaling down late only costs money, so policies scale up quickly and down slowly, with stabilisation windows of many minutes for scale-down. <em>Prediction</em>: because cold starts take tens of seconds to minutes, purely reactive scaling always lags a ramp; adding a forecast of demand from yesterday and last week (Chapter 9) lets the autoscaler start replicas before they are needed. <em>Disaggregation</em>: with separate prefill and decode pools, the autoscaler must size both, each on its own signal—prefill on queued prompt tokens and TTFT, decode on running sequences, KV utilisation and TPOT—and keep their ratio near the optimum of Vol. I §13.5 as the mix of prompt and output lengths changes. Dynamo's planner and llm-d's autoscaling components implement this two-pool control.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — choosing autoscaling targets for Atlas's 8B tier</div>
+<p><strong>Capacity per replica.</strong> At the 25 ms TPOT target, a replica sustains about 128 concurrent decoding sequences and 15,000 prefill tokens/s (Chapter 1).</p>
+<p><strong>Load signal.</strong> Use running plus waiting sequences per replica, target 96 (75% of 128). With 30,000 concurrent sequences fleet-wide, \(n_{\text{desired}}=\lceil30{,}000/96\rceil=313\).</p>
+<p><strong>Prefill guard.</strong> Also compute desired replicas from queued plus arriving prefill tokens at 75% of 15,000 tokens/s, and take the larger of the two answers—prefill binds this tier at peak (Chapter 1).</p>
+<p><strong>SLO override.</strong> If the 90th-percentile TTFT over the last minute exceeds 80% of its target, add 10% capacity immediately regardless of the load signals.</p>
+<p><strong>Dynamics.</strong> Count pending replicas; scale up with no stabilisation and scale down with a 15-minute window; add a forecast term that pre-provisions for the next 10 minutes of the daily ramp; keep a floor of replicas for failover (Chapter 13).</p>
+</div>
+
+<h2 id="s8-6">8.6 Managed endpoints, token APIs and serverless GPUs</h2>
+<p>Teams that do not want to operate any of the layers above can buy them. The options form a spectrum, matching Figure 1.3. <strong>Managed model endpoints</strong> on the hyperscalers—Amazon SageMaker endpoints, Google Vertex AI endpoints, Azure Machine Learning and AI Foundry managed online endpoints—deploy a customer's model container onto provider-managed instances with autoscaling, traffic splitting and monitoring; the customer chooses instance types and pays for instance-hours. <strong>Model-as-a-service APIs</strong>—Amazon Bedrock, Vertex AI's model garden, Azure's model catalogue, and the APIs of model labs and inference platforms (Together, Fireworks and others)—expose models by name and charge per million input and output tokens, with options to buy <em>provisioned throughput</em>, a reserved rate of tokens per minute for predictable latency. <strong>Serverless GPU platforms</strong>—Modal, Replicate, RunPod, Baseten and similar—run a customer's container on demand, bill by the second of GPU time, scale to zero when idle, and use the snapshotting and caching techniques of Chapter 5 to start containers in seconds.</p>
+<p>The choice among them is mostly a function of utilisation and control. A dedicated replica costs its hourly price whether busy or idle. A serverless replica costs a higher price per second, but only while it is busy (plus cold-start time), so it wins when the workload is idle most of the time. If the dedicated price is \(c_{\text{ded}}\) per GPU-hour, the serverless price is \(c_{\text{sls}}>c_{\text{ded}}\) per busy GPU-hour, and the replica is busy a fraction \(u\) of the time with a cold-start overhead fraction \(o\) of busy time, serverless is cheaper when \(c_{\text{sls}}(1+o)u<c_{\text{ded}}\), that is, below a break-even utilisation \(u^*=c_{\text{ded}}/(c_{\text{sls}}(1+o))\). Figure 8.5 illustrates with illustrative prices.</p>
+
+<figure class="chart" id="fig-8-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Monthly cost of one H100's worth of serving: dedicated versus serverless (illustrative prices)","height":320,
+ "x":{"label":"Busy fraction u","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "y":{"label":"Dollars per month","min":0,"max":3600,"ticks":[0,1000,2000,3000]},
+ "series":[
+  {"name":"Dedicated, $2.50/GPU-h, always on","color":"s1","points":[[0,1825],[1,1825]],"markers":false},
+  {"name":"Serverless, $4.50/busy GPU-h, 5% cold-start overhead","color":"s2","points":[[0,0],[0.2,690],[0.4,1380],[0.53,1825],[0.6,2069],[0.8,2759],[1,3449]]}
+ ],
+ "vlines":[{"x":0.53,"text":"break-even ≈ 53%"}]}
+</script>
+<figcaption><b>Figure 8.5 — Serverless wins for spiky, mostly idle workloads.</b> With these prices, a replica busy less than about half the time is cheaper on a serverless platform; a steadily loaded one is cheaper dedicated. Real fleets combine the two: dedicated capacity for the base load and serverless or on-demand capacity for bursts.</figcaption>
+</figure>
+
+<p>Token APIs move the comparison from GPU-hours to tokens. A model-as-a-service price per million tokens includes the provider's utilisation, margin and engine optimisations. Vol. I §27.7 derived when self-hosting beats an API: only at high, steady utilisation and with an engine as efficient as the provider's. In practice organisations mix: token APIs for frontier proprietary models and for new or low-volume use cases, managed endpoints or serverless for moderate-volume custom models, and self-hosted platforms for the highest-volume models where the savings justify a team. Data governance can override cost: a regulated customer may require that prompts never leave its own cloud account, which rules out shared multi-tenant APIs unless they offer private deployment (Chapter 14).</p>
+
+<details class="drill">
+<summary>Drill 8.2 — Serverless or dedicated for an internal tool?</summary>
+<p>An internal code-review assistant runs a fine-tuned 8B model. It receives bursts of requests during working hours, keeping a single H100 busy about 20% of those ten hours on weekdays and idle otherwise. Using Figure 8.5's prices, compare the monthly cost of one dedicated H100 with serverless, assuming cold starts add 10% to busy time.</p>
+<p><em>Solution.</em> Busy time per month: about 22 working days × 10 h × 0.2 = 44 GPU-hours, so \(u\approx44/730\approx6\%\). Dedicated: $1,825 a month. Serverless: \(44\times1.1\times\$4.50\approx\$218\) a month, about eight times cheaper—provided that the users tolerate the occasional cold start of a few seconds, or a warm instance is kept during working hours (\(220\) h × $4.50 = $990, still cheaper than dedicated).</p>
+</details>
+
+<h2 id="s8-7">8.7 The model lifecycle: from registry to rollback</h2>
+<p>Models change more often than engines. A provider ships new base versions every few months, fine-tunes weekly, adapters daily, and system-prompt or sampling-parameter changes continuously. Each change can improve quality or silently break it, and the serving platform must make changes safe. Figure 8.6 shows a lifecycle that mature platforms follow.</p>
+
+<figure class="diagram" id="fig-8-6">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="Model lifecycle from registry to rollback">
+<defs><marker id="a85" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="60" width="105" height="64" rx="8" class="bx4"/><text x="62" y="84" text-anchor="middle" class="t-xs t-b">register</text><text x="62" y="100" text-anchor="middle" class="t-xs">digest, config,</text><text x="62" y="114" text-anchor="middle" class="t-xs">provenance</text>
+<rect x="130" y="60" width="105" height="64" rx="8" class="bx"/><text x="182" y="84" text-anchor="middle" class="t-xs t-b">offline gates</text><text x="182" y="100" text-anchor="middle" class="t-xs">evals, safety,</text><text x="182" y="114" text-anchor="middle" class="t-xs">perf benchmarks</text>
+<rect x="250" y="60" width="105" height="64" rx="8" class="bx"/><text x="302" y="84" text-anchor="middle" class="t-xs t-b">shadow</text><text x="302" y="100" text-anchor="middle" class="t-xs">mirror live traffic,</text><text x="302" y="114" text-anchor="middle" class="t-xs">discard answers</text>
+<rect x="370" y="60" width="105" height="64" rx="8" class="bx2"/><text x="422" y="84" text-anchor="middle" class="t-xs t-b">canary</text><text x="422" y="100" text-anchor="middle" class="t-xs">1–5% of traffic,</text><text x="422" y="114" text-anchor="middle" class="t-xs">compare metrics</text>
+<rect x="490" y="60" width="105" height="64" rx="8" class="bx3"/><text x="542" y="84" text-anchor="middle" class="t-xs t-b">progressive</text><text x="542" y="100" text-anchor="middle" class="t-xs">by failure domain</text><text x="542" y="114" text-anchor="middle" class="t-xs">and tenant tier</text>
+<rect x="610" y="60" width="100" height="64" rx="8" class="bx5"/><text x="660" y="84" text-anchor="middle" class="t-xs t-b">steady state</text><text x="660" y="100" text-anchor="middle" class="t-xs">old version kept</text><text x="660" y="114" text-anchor="middle" class="t-xs">cached</text>
+<line x1="115" y1="92" x2="128" y2="92" class="ln" marker-end="url(#a85)"/><line x1="235" y1="92" x2="248" y2="92" class="ln" marker-end="url(#a85)"/><line x1="355" y1="92" x2="368" y2="92" class="ln" marker-end="url(#a85)"/><line x1="475" y1="92" x2="488" y2="92" class="ln" marker-end="url(#a85)"/><line x1="595" y1="92" x2="608" y2="92" class="ln" marker-end="url(#a85)"/>
+<path d="M542,126 C542,180 182,180 182,128" class="ln ln-s2" fill="none" marker-end="url(#a85)"/>
+<text x="362" y="196" text-anchor="middle" class="t-xs t-s2">automatic rollback on regression: quality, latency, errors, safety, cost per token</text>
+<text x="362" y="40" text-anchor="middle" class="t-xs">every stage is gated by metrics; the deployment references an immutable digest</text>
+</svg>
+<figcaption><b>Figure 8.6 — A model's path to production.</b> Offline gates catch obvious regressions; shadow traffic tests behaviour on real prompts without user impact; canaries and progressive rollout expose a growing fraction of users while comparing metrics; rollback is a change of digest.</figcaption>
+</figure>
+
+<p>Each stage of Figure 8.6 guards against a different failure. <em>Registration</em> records the model's immutable digest, serving configuration (precision, parallelism, tokenizer, chat template, context limit) and provenance, so that every later stage tests exactly the bytes that will be served (§5.6). <em>Offline gates</em> run evaluation suites for quality and safety (Vol. I Chapter 28) and performance benchmarks for throughput and latency at the target configuration, catching both "the model got worse" and "the model got slower". <em>Shadow traffic</em> mirrors a sample of live requests to the new version and records its responses without returning them, revealing behaviour on the real prompt distribution—including the pathological prompts no evaluation suite contains—at the cost of the extra GPU time. <em>Canaries</em> route a small fraction of real users to the new version and compare its metrics with the old: latency, error rates, response lengths, refusal rates, user feedback signals and cost per token. <em>Progressive rollout</em> expands by failure domain and by tenant tier, so that a problem that escaped the canary is still contained. Throughout, the old version remains cached on nodes, so <em>rollback</em> is a fast change of digest rather than a slow re-deployment.</p>
+<p>Two features distinguish model rollouts from code rollouts. Model regressions are often <em>statistical</em>—slightly more refusals, slightly longer answers, a drop in quality on one language—so canary analysis needs enough traffic and time for statistical tests to detect the effect sizes that matter, and the comparison should be between concurrent cohorts rather than before and after. And model changes can change <em>cost</em> as well as quality: a version that answers in 20% more tokens raises the fleet's decode load by 20% (Drill 1.1), so cost per request is a rollout metric alongside quality.</p>
+
+<h2 id="s8-8">8.8 Build, adopt or buy</h2>
+<p>Every layer of Figure 8.1 can be built in-house, adopted from open source, or bought as a managed service, and the right answer differs by layer and by organisation. Engines are almost always adopted (vLLM, SGLang, TensorRT-LLM) and modified only at the margins, because their pace of improvement is set by large communities and vendors. Routing and autoscaling were mostly built in-house until 2025, because nothing off the shelf understood LLMs; the arrival of llm-d, Dynamo, AIBrix and the Gateway API Inference Extension made adoption realistic, and many organisations now adopt one and extend its scoring and scaling policies. API gateways, rate limiting and metering are often bought or adopted from general web infrastructure, with LLM-specific token accounting added (Chapter 11). The lifecycle tooling—registry, evaluation pipelines, rollout analysis—is usually built, because it encodes the organisation's own quality bar.</p>
+<p>Three questions decide each case. How differentiating is the layer: does doing it better than the default give a measurable advantage in cost, latency or quality? (For a model lab serving billions of tokens, a 10% better router is worth millions; for an enterprise serving one internal tool, it is not.) How fast is the layer changing: building on a moving target is expensive, but so is depending on a project that may not fit next year's architecture. And who will operate it at 3 a.m.? A managed service hands that question to the provider, at a price. The chapters of Part III quantify the price side of these decisions: what capacity costs, how to buy it, and how to account for it.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Part II has taken us from containers to Kubernetes, from scheduling to serving platforms. We can now deploy models, route requests to good replicas and scale the fleet with demand. But the autoscaler can only add replicas if there are GPUs to put them on, and in the cloud GPUs are bought under very different terms—reserved for years, rented on demand, booked in blocks or taken as spot capacity that can vanish with two minutes' notice—at prices that differ by a factor of three or more. How much capacity should be bought on which terms, how should demand be forecast, and how should a fleet use spot capacity without hurting users? Chapter 9 opens Part III with these questions.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>A serving platform adds deployment, endpoint management, routing, autoscaling, lifecycle, multi-tenancy and observability to an engine; products cover different layers.</li>
+<li>General model servers (Triton, KServe, Ray Serve, BentoML) introduced repositories, backends, dynamic batching, InferenceService CRDs, scale to zero and composition, but assumed short, uniform, stateless requests.</li>
+<li>LLM-native control planes (NVIDIA Dynamo, llm-d, AIBrix, vLLM production stack) add token- and cache-aware routing, LLM autoscaling, disaggregation with KV transfer, LoRA management and tiered KV storage; the Gateway API Inference Extension standardises replica selection through an endpoint picker.</li>
+<li>Replica selection is filter-and-score per request; scoring by estimated TTFT combines queued prefill, uncached prompt length, KV pressure and adapter loading; sampling a few candidates and tracking own assignments prevents herding.</li>
+<li>Autoscale on engine-native and SLO signals (running/waiting sequences, queued prefill tokens, KV utilisation, TTFT percentiles), not CPU or driver "GPU utilisation"; count pending capacity to avoid overshoot; scale up fast, down slowly; add forecasts; size prefill and decode pools separately.</li>
+<li>Managed endpoints, token APIs, provisioned throughput and serverless GPUs trade control for convenience; serverless wins below a break-even utilisation \(u^*=c_{\text{ded}}/(c_{\text{sls}}(1+o))\).</li>
+<li>Model lifecycle: immutable registration, offline gates, shadow traffic, statistical canaries, progressive rollout by failure domain, cost per request as a gate, rollback by digest.</li>
+<li>Adopt engines; adopt-and-extend LLM control planes; build what encodes your differentiation and quality bar.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci08-mcq-01" data-topic="§8.1 Platform">
+<p class="q">Which responsibilities belong to a serving platform rather than an inference engine? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Choosing a replica for each request</li><li data-correct>Deciding how many replicas to run</li><li>Continuous batching within a replica</li><li data-correct>Rolling out model versions</li></ol>
+<div class="explain">Continuous batching is the engine's job.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-02" data-topic="§8.2 General servers">
+<p class="q">Triton Inference Server's "dynamic batching" means:</p>
+<ol class="opts"><li>Token-level continuous batching</li><li data-correct>Collecting individual requests into batches up to a size or time limit</li><li>Changing model size at runtime</li><li>Batching across regions</li></ol>
+<div class="explain">LLM engines batch per step inside the engine instead.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-03" data-topic="§8.2 General servers">
+<p class="q">KServe's central abstraction is:</p>
+<ol class="opts"><li>A Ray actor</li><li data-correct>The InferenceService custom resource</li><li>A model repository directory</li><li>A Slurm partition</li></ol>
+<div class="explain">Its controller turns it into deployments, services and routes.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-04" data-topic="§8.2 General servers">
+<p class="q">Which assumptions of general model servers break for LLMs? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Requests are short and similar in cost</li><li data-correct>Replicas are stateless and interchangeable</li><li data-correct>Batching happens in the server, per request</li><li>Models need GPUs</li></ol>
+<div class="explain">LLM replicas hold prefix caches, and cost varies a thousand-fold.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-05" data-topic="§8.2 General servers">
+<p class="q">Ray Serve is best suited to:</p>
+<ol class="opts"><li>Configuring NVSwitch</li><li data-correct>Composing several models with custom Python logic, with replicas scheduled across a Ray cluster</li><li>Replacing etcd</li><li>Packing MIG slices</li></ol>
+<div class="explain">It is also widely used for batch inference.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-06" data-topic="§8.3 LLM control planes">
+<p class="q">What does the Gateway API Inference Extension's endpoint picker do?</p>
+<ol class="opts"><li>Terminates TLS</li><li data-correct>Chooses which model-server replica should serve each request, using replica state</li><li>Trains routers</li><li>Schedules pods</li></ol>
+<div class="explain">The gateway handles generic HTTP; the picker the LLM-specific choice.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-07" data-topic="§8.3 LLM control planes">
+<p class="q">NVIDIA Dynamo's planner:</p>
+<ol class="opts"><li>Compiles kernels</li><li data-correct>Resizes prefill and decode pools of a disaggregated deployment from their queues</li><li>Plans datacenter power</li><li>Chooses GPU types</li></ol>
+<div class="explain">A dynamic version of Vol. I §13.5's pool sizing.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-08" data-topic="§8.3 LLM control planes">
+<p class="q">Which capabilities are common to LLM-native control planes? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Cache-aware routing</li><li data-correct>Disaggregated prefill/decode with KV transfer</li><li data-correct>LoRA adapter management</li><li>Replacing the inference engine's kernels</li></ol>
+<div class="explain">They orchestrate engines rather than replace them.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-09" data-topic="§8.4 Routing">
+<p class="q">In the worked example, why did replica 1 win despite a longer queue than replica 2?</p>
+<ol class="opts"><li>It had more GPUs</li><li data-correct>Its cached 5,600-token prefix saved far more prefill time than its queue cost</li><li>It was in a closer zone</li><li>Replica 2 was unhealthy</li></ol>
+<div class="explain">0.18 s versus 0.54 s estimated TTFT.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-10" data-topic="§8.4 Routing">
+<p class="q">Why should a router penalise replicas whose KV-cache utilisation is very high?</p>
+<ol class="opts"><li>They are slower to tokenise</li><li data-correct>Admitting more context risks preempting running sequences</li><li>They are about to crash</li><li>They use more power</li></ol>
+<div class="explain">See Vol. I §11.5 on preemption.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-11" data-topic="§8.4 Routing">
+<p class="q">"Herding" in request routing refers to:</p>
+<ol class="opts"><li>Requests timing out</li><li data-correct>Many routers with stale state sending requests to the same momentarily best replica</li><li>Replicas restarting together</li><li>Tenants sharing prefixes</li></ol>
+<div class="explain">Sampling a few candidates or counting own recent assignments prevents it.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-12" data-topic="§8.4 Routing">
+<p class="q">How can a router know where prefixes are cached without querying engines?</p>
+<ol class="opts"><li>It cannot</li><li data-correct>By assigning requests via consistent hashing (with bounded load) on the prompt's leading block</li><li>By reading etcd</li><li>By DNS</li></ol>
+<div class="explain">Engines' caches then specialise naturally.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-13" data-topic="§8.4 Routing">
+<p class="q">In Drill 8.1, raising the prefix hit rate from 15% to 60% saves about how many prefill tokens per request?</p>
+<ol class="opts"><li>180</li><li data-correct>540</li><li>1,200</li><li>2,000</li></ol>
+<div class="explain">\(0.45\times1200\).</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-14" data-topic="§8.5 Autoscaling">
+<p class="q">The HPA scaling rule sets desired replicas to:</p>
+<ol class="opts"><li>\(n+1\) when overloaded</li><li data-correct>\(\lceil n_{\text{current}}\,m/m^*\rceil\)</li><li>A fixed schedule</li><li>The number of GPUs</li></ol>
+<div class="explain">With tolerance and stabilisation windows.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-15" data-topic="§8.5 Autoscaling">
+<p class="q">Why is driver-reported "GPU utilisation" a poor autoscaling signal for LLMs?</p>
+<ol class="opts"><li>It is not exported</li><li data-correct>It measures the fraction of time any kernel runs, so a lightly loaded replica can read near 100%</li><li>It counts CPU time</li><li>It is always zero</li></ol>
+<div class="explain">Use engine-native and SLO signals.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-16" data-topic="§8.5 Autoscaling">
+<p class="q">Which are good autoscaling signals for an LLM replica pool? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Running plus waiting sequences per replica</li><li data-correct>Queued prefill tokens</li><li data-correct>P90 TTFT relative to target</li><li>Host CPU utilisation</li></ol>
+<div class="explain">CPU is busy regardless of GPU load.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-17" data-topic="§8.5 Autoscaling">
+<p class="q">In Figure 8.4, why does the naive autoscaler end at 170 replicas instead of 40?</p>
+<ol class="opts"><li>Demand rose to 170</li><li data-correct>It sized from serving replicas only, re-ordering the same correction each step until new replicas became ready</li><li>Replicas crashed</li><li>The tolerance band was too wide</li></ol>
+<div class="explain">Overshoot grows with cold-start delay.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-18" data-topic="§8.5 Autoscaling">
+<p class="q">Why do LLM autoscalers scale up quickly but down slowly?</p>
+<ol class="opts"><li>Scale-down is not supported</li><li data-correct>Late scale-up breaks latency for everyone, while late scale-down only costs money; slow starts make reversals expensive</li><li>To save power</li><li>Kubernetes requires it</li></ol>
+<div class="explain">Asymmetric costs justify asymmetric policies.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-19" data-topic="§8.5 Autoscaling">
+<p class="q">For disaggregated serving, the autoscaler must:</p>
+<ol class="opts"><li>Scale only decode</li><li data-correct>Size prefill and decode pools separately on their own signals and keep their ratio near optimal</li><li>Merge the pools at night</li><li>Use request counts only</li></ol>
+<div class="explain">Prefill on queued prompt tokens and TTFT; decode on sequences, KV and TPOT.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-20" data-topic="§8.5 Autoscaling">
+<p class="q">A control loop with long actuation delay relative to its sampling interval tends to:</p>
+<ol class="opts"><li>Converge faster</li><li data-correct>Overshoot and oscillate unless its gain is reduced or pending actions are accounted for</li><li>Ignore load</li><li>Be unaffected</li></ol>
+<div class="explain">Classical dead-time instability.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-21" data-topic="§8.6 Managed">
+<p class="q">Provisioned throughput on a model-as-a-service API provides:</p>
+<ol class="opts"><li>Free tokens</li><li data-correct>A reserved rate of tokens for predictable latency, paid whether used or not</li><li>Access to model weights</li><li>Spot pricing</li></ol>
+<div class="explain">The API analogue of reserved capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-22" data-topic="§8.6 Managed">
+<p class="q">The break-even busy fraction below which serverless GPUs are cheaper is:</p>
+<ol class="opts"><li>\(c_{\text{sls}}/c_{\text{ded}}\)</li><li data-correct>\(c_{\text{ded}}/(c_{\text{sls}}(1+o))\)</li><li>Always 50%</li><li>\(o\)</li></ol>
+<div class="explain">With \(o\) the cold-start overhead fraction.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-23" data-topic="§8.6 Managed">
+<p class="q">With dedicated $2.50/h and serverless $4.50/busy-hour at 5% overhead, break-even utilisation is about:</p>
+<ol class="opts"><li>25%</li><li data-correct>53%</li><li>75%</li><li>95%</li></ol>
+<div class="explain">\(2.5/(4.5\times1.05)\).</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-24" data-topic="§8.6 Managed">
+<p class="q">Which considerations can override cost in choosing a token API over self-hosting? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Data residency and governance requirements</li><li data-correct>Access to proprietary frontier models</li><li data-correct>Team capacity to operate infrastructure</li><li>The colour of the console</li></ol>
+<div class="explain">Governance can rule out shared multi-tenant APIs.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-25" data-topic="§8.7 Lifecycle">
+<p class="q">Shadow traffic means:</p>
+<ol class="opts"><li>Sending all traffic to the new version</li><li data-correct>Mirroring live requests to the new version and discarding its answers</li><li>Routing at night only</li><li>Encrypting traffic</li></ol>
+<div class="explain">It tests real prompts without user impact, at extra GPU cost.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-26" data-topic="§8.7 Lifecycle">
+<p class="q">Why do model canaries need concurrent comparison cohorts and statistical tests?</p>
+<ol class="opts"><li>Models are deterministic</li><li data-correct>Regressions are often small statistical shifts (refusals, lengths, quality) that before/after comparisons confound with traffic changes</li><li>Canaries are free</li><li>Users cannot see differences</li></ol>
+<div class="explain">Traffic mix changes over the day.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-27" data-topic="§8.7 Lifecycle">
+<p class="q">Why is cost per request a rollout gate for new model versions?</p>
+<ol class="opts"><li>Billing requires it</li><li data-correct>A version that answers with more tokens raises decode load and fleet size proportionally</li><li>It measures quality</li><li>It is legally required</li></ol>
+<div class="explain">20% longer answers mean about 20% more decode capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-28" data-topic="§8.7 Lifecycle">
+<p class="q">Rollback is fastest when:</p>
+<ol class="opts"><li>The old image is deleted</li><li data-correct>The deployment references immutable digests and the previous version's weights remain cached on nodes</li><li>A new cluster is built</li><li>Users are notified first</li></ol>
+<div class="explain">Rollback becomes a change of digest.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-29" data-topic="§8.8 Build vs buy">
+<p class="q">Which layer is almost always adopted rather than built?</p>
+<ol class="opts"><li>The organisation's quality gates</li><li data-correct>The inference engine</li><li>The model registry policy</li><li>Tenant pricing</li></ol>
+<div class="explain">Engines improve too fast for most teams to maintain their own.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-30" data-topic="§8.4 Routing">
+<p class="q">Which replicas should the picker filter out before scoring? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Not ready</li><li data-correct>Without the needed adapter and unable to load it quickly</li><li data-correct>In a region not allowed for the tenant's data</li><li>With the longest cached prefix</li></ol>
+<div class="explain">Cached prefixes make a replica more attractive, not infeasible.</div>
+</div>
+
+<div class="mcq" data-id="ci08-mcq-31" data-topic="§8.5 Autoscaling">
+<p class="q">With 30,000 concurrent sequences and a per-replica target of 96, the desired replica count is:</p>
+<ol class="opts"><li>235</li><li data-correct>313</li><li>96</li><li>3,000</li></ol>
+<div class="explain">\(\lceil30{,}000/96\rceil\).</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci08-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What does a serving platform add to vLLM?</summary>
+<div class="answer">
+<p>vLLM serves one model on one replica: batching, KV cache, kernels, an HTTP API. A platform adds: declarative deployment of replica pools from a registry; endpoint and model-name management for many models and adapters; per-request replica selection (load, cache, adapter aware); autoscaling on token and SLO signals with warm pools; disaggregation and KV transfer across replicas; lifecycle (evaluation gates, shadow, canary, progressive rollout, rollback); multi-tenancy (auth, quotas, rate limits, metering); and observability (latency, tokens, cost, errors per tenant and model).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Why did LLM-specific control planes such as llm-d and Dynamo appear?</summary>
+<div class="answer">
+<p>General model servers assumed short, uniform, stateless requests batched by the server and balanced by request counts. LLM requests vary by orders of magnitude in cost, stream tokens for seconds to minutes, are batched continuously inside the engine, and leave reusable KV state on replicas; prefill and decode have different resource needs and can be split across machines; many adapters share a base model. New control planes add token- and cache-aware routing, autoscaling on LLM signals, disaggregation with KV transfer (NIXL), LoRA management and tiered KV caches, plus a standard routing hook (Gateway API Inference Extension).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Which metrics would you autoscale an LLM pool on, and which would you avoid?</summary>
+<div class="answer">
+<p>Use: running plus waiting sequences per replica (decode load), queued prefill tokens (prefill load), KV-cache utilisation (headroom before preemption), and SLO attainment or TTFT/TPOT percentiles as an override; for disaggregated pools, separate signals per pool. Avoid: host CPU (busy regardless), driver GPU utilisation (time any kernel is active, saturates at low load), and raw request rate (costs vary). Count pending replicas, scale up fast and down slowly, and add forecasts for predictable ramps.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-04">
+<summary><span class="lvl core">Core</span> Design the replica-selection logic for a multi-tenant LLM pool with LoRA adapters and prefix caching.</summary>
+<div class="answer">
+<p>Filter: ready replicas in allowed regions, KV capacity for the request's context, adapter loaded or loadable within a budget. Score each candidate by estimated TTFT: queued prefill tokens divided by prefill rate, plus uncached prompt tokens (request length minus the replica's cached prefix length) divided by prefill rate, plus penalties for high KV utilisation (preemption risk) and adapter loading. Choose the minimum among a sample of a few candidates (power of \(n_c\) choices) to avoid herding, and add own recent assignments to queue estimates. Track prefix ownership via bounded-load consistent hashing on the prompt's leading block, or via engine-published block indexes. Fall back gracefully when metrics are stale. Measure with A/B tests on TTFT and prefill compute.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-05">
+<summary><span class="lvl core">Core</span> Your autoscaler overshoots massively during ramps. Diagnose.</summary>
+<div class="answer">
+<p>Likely the controller computes desired replicas from load observed on serving replicas and ignores pending ones: during the cold start it sees the same overload each interval and repeats the correction, overshooting by roughly cold-start time divided by the evaluation interval. Other causes: metrics lag, too-high gain, no stabilisation, signals that saturate (GPU utilisation). Fix: count requested (serving plus pending) capacity; lower gain or add damping; use stabilisation windows; add a forecast term for predictable ramps; shorten cold starts (Chapter 5); simulate the closed loop with realistic delays before deploying policy changes.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-06">
+<summary><span class="lvl core">Core</span> When would you choose a serverless GPU platform over dedicated replicas? Quantify.</summary>
+<div class="answer">
+<p>Serverless bills only busy time (plus cold starts) at a premium; dedicated bills every hour. Break-even busy fraction \(u^*=c_{\text{ded}}/(c_{\text{sls}}(1+o))\); with $2.50/h dedicated and $4.50/busy-hour serverless with 5% overhead, about 53%. Spiky, mostly idle workloads (internal tools, prototypes, many low-traffic fine-tunes) favour serverless—an internal tool busy 6% of the month costs about $220 versus $1,825. Steady high-volume traffic favours dedicated or reserved capacity. Also weigh cold-start latency tolerance, data governance, GPU availability on the platform, and lock-in. Combine: dedicated base, serverless burst.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-07">
+<summary><span class="lvl core">Core</span> Describe a safe rollout process for a new model version.</summary>
+<div class="answer">
+<p>Register immutable digest plus serving config and provenance. Offline gates: quality and safety evals, performance benchmarks at target config (throughput, TTFT/TPOT, cost per request). Shadow: mirror a sample of live traffic, compare outputs and lengths, look for pathological prompts. Canary: 1–5% of traffic with concurrent control cohort; compare latency, errors, response length, refusal rate, user signals, cost; statistical tests sized to detect relevant effects. Progressive rollout by failure domain and tenant tier with automated pause and rollback triggers. Keep old version cached; rollback by digest. Post-rollout monitoring for slow-emerging issues.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-08">
+<summary><span class="lvl core">Core</span> Explain the Gateway API Inference Extension and why it is a useful abstraction.</summary>
+<div class="answer">
+<p>It extends Kubernetes' Gateway API with an InferencePool (a set of model-server pods for a base model) and model-level objectives (e.g. criticality), and defines an endpoint-picker protocol: for each request, the gateway asks an extension service which pod to use. The picker scrapes engine metrics (queues, KV utilisation, loaded adapters) and may track prefixes, implementing LLM-aware selection. Benefit: separation of concerns—any conforming gateway (Envoy-based and others) handles TLS, auth, retries and streaming, while routing intelligence is a pluggable, swappable component shared across projects like llm-d and KServe.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Analyse the stability of a proportional autoscaler with cold-start delay.</summary>
+<div class="answer">
+<p>Model: at interval \(k\), demand \(D_k\); serving capacity \(S_k\); the controller orders \(a_k=\max(0,D_k/u^*-C_k)\) where \(C_k\) is the capacity it believes it has; orders arrive after \(d\) intervals. If \(C_k=S_k\) (serving only), after a step in demand the same deficit is ordered for \(d\) consecutive intervals, giving roughly \(d\)-fold overshoot; with scale-down also proportional and delayed, the system oscillates. If \(C_k=S_k+\) pending, the deficit is ordered once: deadbeat response. With noisy metrics, a gain \(<1\) plus stabilisation reduces chatter at the cost of slower response; dead time limits achievable bandwidth (a controller cannot usefully react faster than the delay). Feed-forward from forecasts handles predictable ramps without high feedback gain.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How do prefix-aware routing and load balancing conflict, and how do you resolve it?</summary>
+<div class="answer">
+<p>Affinity sends related requests (same tenant/system prompt/conversation) to the replica holding their prefix, saving prefill; but popular prefixes then overload a few replicas, raising queueing delay and tail latency, and hurting fairness. Pure load balancing spreads load but discards cache reuse. Resolve with a cost model in common units (estimated TTFT or GPU-seconds): queueing delay plus uncached prefill plus penalties, so the router accepts a longer queue only when the prefix saving exceeds it; bounded-load consistent hashing caps any replica's share (e.g. 1.25× average) and spills to the next; replicate hot prefixes to several replicas; sample candidates to avoid herding; and measure both TTFT and prefill compute.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> How would you autoscale a disaggregated prefill/decode deployment?</summary>
+<div class="answer">
+<p>Two pools with separate signals: prefill sized on queued and arriving uncached prompt tokens per second relative to per-replica prefill rate, guarded by TTFT percentiles; decode sized on running sequences and KV utilisation relative to targets, guarded by TPOT percentiles. Keep the pool ratio near the optimum implied by the traffic mix (prompt/output lengths, cache hit rate), recomputing as the mix changes (a planner, as in Dynamo). Account for KV-transfer bandwidth and its coupling (prefill bursts create decode admission bursts). Count pending capacity in each pool, scale up fast and down slowly, and allow role switching if engines can change roles faster than cold starts.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-12">
+<summary><span class="lvl design">Design</span> Design a serving platform for 300 enterprise customers, each with a fine-tuned 8B or 70B model.</summary>
+<div class="answer">
+<p>Classify customers: LoRA fine-tunes (most) served via multi-LoRA base pools (8B and 70B) with adapter-aware routing and an adapter cache hierarchy (HBM, host, NVMe, object store); full fine-tunes on dedicated pools; isolation-requiring customers on MIG slices or dedicated replicas. Control plane: model registry with per-customer digests and configs; Gateway with auth, per-customer rate limits and metering; endpoint picker scoring by load, KV, adapter presence and prefix; autoscaling per base pool on sequences/prefill/SLO, with scale-to-zero (and fast reload) for idle full fine-tunes; serverless-style warm pool. Lifecycle per customer with eval gates and canaries. Observability per tenant (cost per token for chargeback). Capacity: reserved base, on-demand burst.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-13">
+<summary><span class="lvl design">Design</span> Would you build or adopt your LLM serving control plane? Argue it.</summary>
+<div class="answer">
+<p>Depends on scale, differentiation and team. Adopt engines (vLLM/SGLang/TensorRT-LLM). For routing and autoscaling, adopt an open control plane (llm-d, Dynamo, AIBrix, KServe with the inference extension) to get standard capabilities quickly, then extend scoring and scaling policies where measurements show gains—worth it at billions of tokens per day where 10% efficiency is millions per year. Build what encodes the organisation's own quality bar and business: registry policies, evaluation gates, rollout analysis, tenant pricing. Buy gateways, rate limiting and observability infrastructure where good products exist. Revisit as the ecosystem matures; avoid forks that cannot follow upstream.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-14">
+<summary><span class="lvl core">Core</span> Compare managed endpoints, model-as-a-service APIs and self-hosting for a 70B open model.</summary>
+<div class="answer">
+<p>Managed endpoint (SageMaker, Vertex, Azure): your container on provider-managed instances; pay instance-hours; provider handles scaling, rollout, monitoring; you choose engine and hardware; costs like self-hosting plus a margin, less ops. Model-as-a-service (Bedrock, Vertex model garden, Together, Fireworks): pay per token or provisioned throughput; no infrastructure; provider's optimisations and utilisation included; less control over versions, latency and data handling. Self-hosting on Kubernetes: lowest unit cost at high, steady utilisation with a strong team; highest operational burden. Decide on volume and utilisation, latency and governance needs, and team capacity; many organisations start with MaaS and move high-volume, steady models to self-hosting.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> What makes canary analysis for LLM model versions hard, and how would you design it?</summary>
+<div class="answer">
+<p>Regressions are statistical and multi-dimensional (quality, refusal rate, response length, latency, cost, safety), often small, and outputs are stochastic; traffic mix varies over the day, confounding before/after comparisons; quality signals are delayed or sparse (user feedback). Design: concurrent randomised cohorts (by user or session, sticky), pre-registered metrics with minimum detectable effects and sample-size calculations, sequential testing with error control, LLM-judge or reference-based quality sampling on canary vs control, guardrail metrics (safety classifier rates), latency and cost per request, automated pause thresholds, and stratification by tenant and task type. Run long enough to cover diurnal patterns where needed.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci08-qa-16">
+<summary><span class="lvl core">Core</span> How does a router avoid sending requests to replicas with stale metrics?</summary>
+<div class="answer">
+<p>Metrics are scraped every tens of milliseconds and many gateway instances route concurrently, so state is always stale. Techniques: add the router's own in-flight assignments to each replica's queue estimate until the next scrape reflects them; use power-of-\(n_c\)-choices sampling rather than global minimum; apply short-lived penalties after assigning to a replica; prefer engines that push load updates or piggyback load on responses; cap per-replica share (bounded load); and detect unhealthy replicas by response errors and latency, not only metrics. These keep the system from herding and from oscillating between replicas.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li>NVIDIA. Triton Inference Server documentation, 2018–2025; TensorRT-LLM backend.</li>
+<li>KServe project (formerly KFServing). KServe documentation and Open Inference Protocol, 2019–2025.</li>
+<li>P. Moritz et al. Ray: A Distributed Framework for Emerging AI Applications. <em>OSDI</em>, 2018. <a href="https://arxiv.org/abs/1712.05889">arXiv:1712.05889</a>.</li>
+<li>NVIDIA. Dynamo: a datacenter-scale distributed inference serving framework. 2025. <a href="https://github.com/ai-dynamo/dynamo">github.com/ai-dynamo/dynamo</a>.</li>
+<li>llm-d project. llm-d: Kubernetes-native distributed inference. 2025. <a href="https://github.com/llm-d/llm-d">github.com/llm-d/llm-d</a>.</li>
+<li>AIBrix Team. AIBrix: Towards Scalable, Cost-Effective Large Language Model Inference Infrastructure. 2025. <a href="https://arxiv.org/abs/2504.03648">arXiv:2504.03648</a>.</li>
+<li>Kubernetes SIG Network. Gateway API Inference Extension. 2024–2025. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension">github.com/kubernetes-sigs/gateway-api-inference-extension</a>.</li>
+<li>Y. Sheng et al. S-LoRA: Serving Thousands of Concurrent LoRA Adapters. <em>MLSys</em>, 2024. <a href="https://arxiv.org/abs/2311.03285">arXiv:2311.03285</a>.</li>
+<li>L. Zheng et al. SGLang: Efficient Execution of Structured Language Model Programs. 2023. <a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a>.</li>
+<li>Y. Fu et al. ServerlessLLM: Low-Latency Serverless Inference for Large Language Models. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2401.14351">arXiv:2401.14351</a>.</li>
+<li>K. J. Åström, R. M. Murray. <em>Feedback Systems: An Introduction for Scientists and Engineers</em>, 2nd ed. Princeton University Press, 2021.</li>
+<li>R. Kohavi, D. Tang, Y. Xu. <em>Trustworthy Online Controlled Experiments</em>. Cambridge University Press, 2020.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

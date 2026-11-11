@@ -52,7 +52,7 @@
     { id: 'ci05', n: 5, part: 'I', title: 'Storage, Weights and Cold Starts', sub: 'Object storage, safetensors, weight streaming, caching tiers, peer-to-peer distribution', file: 'cloud/ci05.html', ready: true },
     { id: 'ci06', n: 6, part: 'II', title: 'Containers and Kubernetes for Accelerators', sub: 'Processes, cgroups, pods, device plugins, DRA, the GPU operator', file: 'cloud/ci06.html', ready: true },
     { id: 'ci07', n: 7, part: 'II', title: 'Scheduling a GPU Cluster', sub: 'Bin packing, gang and topology-aware scheduling, quotas, preemption, fragmentation', file: 'cloud/ci07.html', ready: true },
-    { id: 'ci08', n: 8, part: 'II', title: 'Serving Platforms and Control Planes', sub: 'KServe, Ray Serve, Triton, Dynamo, llm-d, managed endpoints and serverless GPUs', file: 'cloud/ci08.html', ready: false },
+    { id: 'ci08', n: 8, part: 'II', title: 'Serving Platforms and Control Planes', sub: 'KServe, Ray Serve, Triton, Dynamo, llm-d, managed endpoints and serverless GPUs', file: 'cloud/ci08.html', ready: true },
     { id: 'ci09', n: 9, part: 'III', title: 'Capacity, Procurement and Autoscaling', sub: 'Reserved, on-demand and spot capacity, forecasting, capacity mix as an optimisation', file: 'cloud/ci09.html', ready: false },
     { id: 'ci10', n: 10, part: 'III', title: 'The Economics of Inference', sub: 'TCO, build versus buy, pricing tokens, FinOps and cost attribution', file: 'cloud/ci10.html', ready: false },
     { id: 'ci11', n: 11, part: 'IV', title: 'The Front Door: Gateways, Streaming and Rate Limits', sub: 'HTTP/2, SSE, gRPC, WebSockets, distributed rate limiting, admission control', file: 'cloud/ci11.html', ready: false },
