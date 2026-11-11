@@ -49,7 +49,7 @@
     { id: 'ci02', n: 2, part: 'I', title: 'The AI Datacenter: Power, Cooling and Space', sub: 'Watts per token, PUE, liquid cooling, rack density and the grid', file: 'cloud/ci02.html', ready: true },
     { id: 'ci03', n: 3, part: 'I', title: 'Accelerators as Cloud Products', sub: 'Instance families, GPU sharing (MIG, MPS), TPUs and Trainium, price–performance', file: 'cloud/ci03.html', ready: true },
     { id: 'ci04', n: 4, part: 'I', title: 'Datacenter Networks for AI', sub: 'Front-end and back-end fabrics, fat trees, rail-optimised designs, RDMA, congestion', file: 'cloud/ci04.html', ready: true },
-    { id: 'ci05', n: 5, part: 'I', title: 'Storage, Weights and Cold Starts', sub: 'Object storage, safetensors, weight streaming, caching tiers, peer-to-peer distribution', file: 'cloud/ci05.html', ready: false },
+    { id: 'ci05', n: 5, part: 'I', title: 'Storage, Weights and Cold Starts', sub: 'Object storage, safetensors, weight streaming, caching tiers, peer-to-peer distribution', file: 'cloud/ci05.html', ready: true },
     { id: 'ci06', n: 6, part: 'II', title: 'Containers and Kubernetes for Accelerators', sub: 'Processes, cgroups, pods, device plugins, DRA, the GPU operator', file: 'cloud/ci06.html', ready: false },
     { id: 'ci07', n: 7, part: 'II', title: 'Scheduling a GPU Cluster', sub: 'Bin packing, gang and topology-aware scheduling, quotas, preemption, fragmentation', file: 'cloud/ci07.html', ready: false },
     { id: 'ci08', n: 8, part: 'II', title: 'Serving Platforms and Control Planes', sub: 'KServe, Ray Serve, Triton, Dynamo, llm-d, managed endpoints and serverless GPUs', file: 'cloud/ci08.html', ready: false },

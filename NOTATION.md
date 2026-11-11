@@ -246,3 +246,11 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(k_{\text{sw}}\) | switch radix (ports per switch) |
 | \(H\), \(r\) | number of hosts on a fabric; link rate per host |
 | \(n_f\), \(n_{\text{path}}\), \(c_{\max}\) | flows in a collective step; equal-cost paths; largest number of flows on one path |
+
+## Storage and cold starts (Vol. II Ch. 5)
+| Symbol | Meaning |
+|---|---|
+| \(t_{\text{cold}}\) | cold-start time of a replica \(=t_{\text{node}}+t_{\text{sched}}+t_{\text{image}}+t_{\text{weights}}+t_{\text{init}}+t_{\text{warm}}\) |
+| \(W_{\text{bytes}}\) | bytes of model weights, \(Nb_w\) (\(W\) alone in Ch. 5 propositions; never the waiting time \(W\) when ambiguous) |
+| \(n_{\text{conn}}\), \(\beta_{\text{conn}}\), \(\beta_{\text{NIC}}\), \(\beta_{\text{svc}}\) | concurrent storage requests; throughput of one; client NIC bandwidth; service-side limit |
+| \(c\) | chunk size of a pipelined transfer or broadcast (bytes) |

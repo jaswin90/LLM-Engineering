@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 5 · Storage, Weights and Cold Starts — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 5 of Cloud AI Infrastructure: the anatomy of an LLM replica's cold start, the storage hierarchy for model weights, pickle versus safetensors versus GGUF, streaming weights into GPU memory, caching tiers and peer-to-peer distribution with a chain-broadcast analysis, container images and lazy pulling, engine initialisation and snapshots, and cold-start budgets for 8B, 70B and 671B models.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci05" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part I · The Physical Cloud — Chapter 5</div>
+<h1 id="top">Storage, Weights and Cold Starts</h1>
+<p class="lede">Before a new replica can produce its first token it must obtain a machine, a container image of several gigabytes, and tens to hundreds of gigabytes of weights, and then initialise an engine that compiles kernels and captures graphs. Done naively this takes ten minutes or more, which makes autoscaling slow, failures expensive and scale-to-zero impossible. This chapter takes the cold start apart, derives how fast each piece can be made, and shows how storage tiers, file formats, streaming loaders, peer-to-peer distribution and snapshots bring it down to seconds.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Volume I treated cold-start time as a parameter of autoscaling: in Vol. I §27.3 we argued that because a large replica took minutes to start, the autoscaler had to keep headroom for the demand growth that could occur during one cold start. We did not ask why it took minutes, or how much shorter it could be. The question matters more than it appears. Cold-start time determines how much idle capacity a fleet must hold (Chapter 9), how long a fleet runs degraded after a failure (Chapter 13), whether a platform can scale a rarely used model to zero and back (Chapter 8), and how quickly a new model version can be rolled out. A fleet whose replicas start in thirty seconds instead of ten minutes can run with far less headroom, and headroom is GPUs.</p>
+<p>The cold start is also a good example of a systems problem with a quantitative core. Each of its steps moves bytes from one tier of a storage hierarchy to another, and each tier has a bandwidth, a capacity and a cost. The design question is which bytes should be where, and the answer follows from the same kind of reasoning as Volume I's analysis of HBM and caches—only the tiers are now object storage, network file systems, local disks, host memory, and the HBM of other GPUs.</p>
+<p>We begin by timing each step of a naive cold start (§5.1). We then survey where weights can live and how fast each tier delivers them (§5.2), the file formats in which they are stored and why the format matters for both speed and security (§5.3), and how to stream bytes from storage into GPU memory at the hardware's limit (§5.4). We analyse the distribution of weights to many new replicas at once, including peer-to-peer and chain broadcast (§5.5), the container image (§5.6), and engine initialisation and snapshotting (§5.7). We end with complete cold-start budgets for the three running models (§5.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>List the steps of a replica's cold start and estimate the time of each from sizes and bandwidths.</li>
+<li>Describe the storage tiers for model weights (object storage, shared file systems, local NVMe, host DRAM, peer HBM) and model their throughput.</li>
+<li>Explain the differences between pickle checkpoints, safetensors, GGUF and compiled engine files, including the security risk of pickle.</li>
+<li>Design a loader that streams weights into GPU memory at the bandwidth of the slowest link, and say where GPUDirect Storage helps.</li>
+<li>Derive the time to distribute weights to many replicas by a central store, peer-to-peer swarming and pipelined chain broadcast, including the optimal chunk size.</li>
+<li>Explain lazy image pulling, compilation caches, sleep modes and process snapshots, and build a cold-start budget for a given model.</li>
+</ol>
+<p class="small muted">Uses: weight and KV sizes (Vol. I §2.10, §3.4), autoscaling (Vol. I §27.3), engine internals (Vol. I Chapter 12), the α–β model (Vol. I §17.2) and Chapters 3–4 of this volume.</p>
+</div>
+
+<h2 id="s5-1">5.1 Anatomy of a cold start</h2>
+<p>Suppose Atlas's autoscaler decides at 08:00 that the Llama 3 70B tier needs another replica. What must happen before that replica serves its first request? Figure 5.1 lays out the steps of a straightforward implementation on a cloud Kubernetes cluster, with typical durations, and the same steps after the optimisations of this chapter.</p>
+
+<figure class="diagram" id="fig-5-1">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Timeline of a naive and an optimised cold start for a 70B replica">
+<text x="20" y="24" class="t-sm t-b">Naive cold start, Llama 3 70B FP8 on a new 8-GPU node (≈ 10–15 min)</text>
+<rect x="20" y="36" width="160" height="30" rx="4" class="bx"/><text x="100" y="55" text-anchor="middle" class="t-xs">provision node 3–5 min</text>
+<rect x="180" y="36" width="40" height="30" rx="4" class="bx4"/><text x="200" y="55" text-anchor="middle" class="t-xs">sched.</text>
+<rect x="220" y="36" width="130" height="30" rx="4" class="bx3"/><text x="285" y="55" text-anchor="middle" class="t-xs">pull 15 GB image 2–3 min</text>
+<rect x="350" y="36" width="170" height="30" rx="4" class="bx2"/><text x="435" y="55" text-anchor="middle" class="t-xs">load 70 GB weights 2–4 min</text>
+<rect x="520" y="36" width="120" height="30" rx="4" class="bx5"/><text x="580" y="55" text-anchor="middle" class="t-xs">init, compile, graphs</text>
+<rect x="640" y="36" width="60" height="30" rx="4" class="bx"/><text x="670" y="55" text-anchor="middle" class="t-xs">warm-up</text>
+<text x="20" y="110" class="t-sm t-b">Optimised: warm node pool, cached image, peer weights, cached compilation (≈ 30–60 s)</text>
+<rect x="20" y="122" width="14" height="30" rx="4" class="bx4"/>
+<rect x="34" y="122" width="24" height="30" rx="4" class="bx3"/>
+<rect x="58" y="122" width="36" height="30" rx="4" class="bx2"/>
+<rect x="94" y="122" width="40" height="30" rx="4" class="bx5"/>
+<rect x="134" y="122" width="20" height="30" rx="4" class="bx"/>
+<text x="165" y="135" class="t-xs">warm node · lazy image from local cache · weights from peers or NVMe</text><text x="165" y="150" class="t-xs">· cached kernels and graphs · warm-up</text>
+<line x1="20" y1="180" x2="700" y2="180" class="ln"/>
+<g class="t-xs"><text x="20" y="196">0</text><text x="150" y="196">2 min</text><text x="290" y="196">5 min</text><text x="430" y="196">8 min</text><text x="570" y="196">11 min</text><text x="680" y="196">14 min</text></g>
+<text x="20" y="228" class="t-xs">The naive timeline is dominated by obtaining capacity and moving bytes (image and weights). Every optimisation either</text>
+<text x="20" y="244" class="t-xs">removes a step (warm pools, snapshots), moves bytes from a faster tier (local cache, peers), or moves fewer bytes (lazy pulls,</text>
+<text x="20" y="260" class="t-xs">pre-sharded checkpoints, FP8/FP4 weights).</text>
+</svg>
+<figcaption><b>Figure 5.1 — The cold start, before and after.</b> Bars are drawn to an approximate common time scale. Durations vary widely by cloud, region and implementation; the order of magnitude and the dominant terms are what matter.</figcaption>
+</figure>
+
+<p>Read Figure 5.1 from left to right. First, the cluster may have no idle GPU node, so the cluster autoscaler must ask the cloud for one: the cloud finds capacity, boots a VM or bare-metal server, starts its operating system, installs or verifies the GPU driver, and joins it to the cluster—three to five minutes is typical, longer for bare metal, and it may fail outright if the region has no capacity (Chapter 9). Second, the cluster scheduler places the replica's pod on the node (Chapter 6), which takes seconds. Third, the node pulls the container image: CUDA libraries, PyTorch, the inference engine and its dependencies, often 10–20 GB compressed, from a registry, at a few hundred megabytes per second, so one to three minutes. Fourth, the engine loads the weights—about 70 GB for Llama 3 70B in FP8—from wherever they are stored. Fifth, the engine initialises: it creates NCCL communicators among its eight GPUs, allocates the KV-cache pool, compiles or loads kernels, runs <code>torch.compile</code>, captures CUDA graphs for many batch sizes (Vol. I §7.7), and profiles memory. Sixth, it warms up with a few requests and passes health checks, after which the router starts sending it traffic.</p>
+<p>The total, which we can write as</p>
+\[
+t_{\text{cold}}=t_{\text{node}}+t_{\text{sched}}+t_{\text{image}}+t_{\text{weights}}+t_{\text{init}}+t_{\text{warm}},
+\]
+<p>is ten to fifteen minutes in the naive case. Two features of the sum guide everything that follows. Its largest terms are <em>obtaining capacity</em> and <em>moving bytes</em>, not computation. And its terms are <em>not inherently sequential</em>: an image can be pulled while weights are fetched, weights can be loaded while kernels compile, and the node can exist before it is needed. The rest of this chapter takes the byte-moving terms one at a time; Chapter 9 deals with \(t_{\text{node}}\) through warm pools and capacity planning.</p>
+
+<h2 id="s5-2">5.2 Where weights live: the storage hierarchy</h2>
+<p>A model's weights have a canonical home and several caches. The canonical home is almost always <strong>object storage</strong>: Amazon S3, Google Cloud Storage, Azure Blob Storage or an S3-compatible service. Object storage keeps immutable objects (files) addressed by a bucket and a key, replicated across devices and often across zones, with effectively unlimited capacity at a few cents per gigabyte-month. It is accessed over HTTP from the front-end network. Its performance model is unusual and worth understanding: a single request (a GET of an object or of a byte range of one) is served at perhaps 50–100 MB/s, but the service handles enormous numbers of requests in parallel, so the throughput a client sees is roughly</p>
+\[
+\beta_{\text{obj}}\approx\min\bigl(n_{\text{conn}}\,\beta_{\text{conn}},\ \beta_{\text{NIC}},\ \beta_{\text{svc}}\bigr),
+\]
+<p>where \(n_{\text{conn}}\) is the number of concurrent range requests, \(\beta_{\text{conn}}\) the throughput of each, \(\beta_{\text{NIC}}\) the client's network bandwidth, and \(\beta_{\text{svc}}\) whatever limit the service imposes for that bucket or key prefix (S3, for example, documents per-prefix request-rate limits of several thousand GETs per second). A loader that reads a 70 GB checkpoint with one sequential stream gets 100 MB/s and takes twelve minutes; the same loader with 64 parallel range requests gets about 5 GB/s and takes fourteen seconds. Parallelism is the first and largest optimisation.</p>
+<p>Between object storage and the GPU sit faster tiers, shown in Figure 5.2. A <strong>shared file system</strong>—a parallel file system such as Lustre (offered as Amazon FSx for Lustre), or a high-performance NAS such as WEKA, VAST or Google's Filestore and Managed Lustre—presents a POSIX file interface backed by many storage servers, delivering tens of gigabytes per second to a cluster, at a much higher price per gigabyte than object storage. <strong>Local NVMe</strong> drives in each GPU server deliver 7–14 GB/s each, so a server with eight drives in a RAID-0 stripe can read at 25–50 GB/s; capacity is tens of terabytes per server, enough to cache many models. <strong>Host DRAM</strong>, 1–2 TB per server, can hold one or two large models in the operating system's page cache or in a pinned buffer, and transfers to the GPUs over PCIe Gen5 at roughly 50 GB/s per GPU, several hundred GB/s per server. And the <strong>HBM of other GPUs</strong>—replicas that already have the weights loaded—can supply them over NVLink or the back-end RDMA network at 50–900 GB/s per GPU.</p>
+
+<figure class="diagram" id="fig-5-2">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="The storage hierarchy for model weights">
+<rect x="20" y="20" width="440" height="38" rx="6" class="bx2"/><text x="32" y="44" class="t-xs t-b">HBM of the replica's own GPUs</text><text x="450" y="44" text-anchor="end" class="t-xs">destination</text>
+<rect x="20" y="66" width="440" height="38" rx="6" class="bx3"/><text x="32" y="90" class="t-xs t-b">peer GPUs' HBM (NVLink / RDMA)</text><text x="450" y="90" text-anchor="end" class="t-xs">50–900 GB/s per GPU</text>
+<rect x="20" y="112" width="440" height="38" rx="6" class="bx4"/><text x="32" y="136" class="t-xs t-b">host DRAM (page cache, pinned buffers)</text><text x="450" y="136" text-anchor="end" class="t-xs">≈ 50 GB/s per GPU over PCIe</text>
+<rect x="20" y="158" width="440" height="38" rx="6" class="bx"/><text x="32" y="182" class="t-xs t-b">local NVMe (RAID-0 of several drives)</text><text x="450" y="182" text-anchor="end" class="t-xs">25–50 GB/s per server</text>
+<rect x="20" y="204" width="440" height="38" rx="6" class="bx5"/><text x="32" y="228" class="t-xs t-b">shared file system (Lustre, WEKA, VAST…)</text><text x="450" y="228" text-anchor="end" class="t-xs">tens of GB/s per cluster</text>
+<rect x="20" y="250" width="440" height="38" rx="6" class="bx"/><text x="32" y="274" class="t-xs t-b">object storage (S3, GCS, Blob) — canonical copy</text><text x="450" y="274" text-anchor="end" class="t-xs">≈ 0.1 GB/s per stream; scales out</text>
+<text x="480" y="44" class="t-xs">capacity: 80–288 GB per GPU</text>
+<text x="480" y="90" class="t-xs">only while replicas run</text>
+<text x="480" y="136" class="t-xs">1–2 TB per server; volatile</text>
+<text x="480" y="182" class="t-xs">10–60 TB per server; per-node</text>
+<text x="480" y="228" class="t-xs">PB; expensive per GB</text>
+<text x="480" y="274" class="t-xs">unlimited; cheapest per GB;</text>
+<text x="480" y="288" class="t-xs">durable, multi-zone</text>
+</svg>
+<figcaption><b>Figure 5.2 — Tiers from which weights can be loaded.</b> Moving up, bandwidth rises and capacity, durability and sharing fall. A good loader reads from the highest tier that has a copy, and populates the faster tiers for next time.</figcaption>
+</figure>
+
+<p>The tiers also differ in cost, though less than one might expect from their speeds. Object storage costs roughly two cents per gigabyte-month, so keeping a terabyte of model versions costs about $20 a month. Local NVMe and host DRAM are already paid for as part of the GPU server, so using them as caches is essentially free. High-performance shared file systems cost perhaps ten times more per gigabyte than object storage and are the only tier whose cost needs justifying. Next to a GPU fleet that costs millions of dollars a month, every caching tier is cheap; the real constraint is capacity on the faster tiers and the engineering needed to keep them consistent.</p>
+<p>Figure 5.2 is the familiar shape of a memory hierarchy, and the same reasoning applies. If a fraction \(p_i\) of cold starts find the weights first in tier \(i\), whose effective bandwidth is \(\beta_i\), the expected weight-loading time for a model of \(W_{\text{bytes}}=Nb_w\) bytes is \(\mathbb E[t_{\text{weights}}]=\sum_ip_iW_{\text{bytes}}/\beta_i\). Because the bandwidths span three orders of magnitude, the expectation is dominated by the rare loads from the slowest tier unless its hit probability is driven very low. A fleet that caches its top models on every node's NVMe, and falls back to object storage only for rarely used ones, gets the NVMe time for almost every cold start. Figure 5.3 shows load time against model size for each tier.</p>
+
+<figure class="chart" id="fig-5-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Time to load weights onto one 8-GPU server, by source tier (effective per-server throughput)","height":330,
+ "x":{"label":"Weights (GB, log)","log":true,"min":12,"max":900,"ticks":[16,70,141,405,700]},
+ "y":{"label":"Seconds (log)","log":true,"min":0.04,"max":200,"ticks":[0.1,0.3,1,3,10,30,100]},
+ "series":[
+  {"name":"Object storage, 64 streams (≈ 5 GB/s)","color":"s2","points":[[16,3.2],[70,14],[141,28.2],[405,81],[700,140]]},
+  {"name":"Local NVMe RAID-0 (≈ 25 GB/s)","color":"s4","points":[[16,0.64],[70,2.8],[141,5.64],[405,16.2],[700,28]]},
+  {"name":"Host DRAM over PCIe (≈ 150 GB/s)","color":"s1","points":[[16,0.107],[70,0.467],[141,0.94],[405,2.7],[700,4.67]]},
+  {"name":"Peer GPUs over RDMA (≈ 300 GB/s)","color":"s3","points":[[16,0.053],[70,0.233],[141,0.47],[405,1.35],[700,2.33]]}
+ ],
+ "vlines":[{"x":16,"text":"8B BF16"},{"x":70,"text":"70B FP8"},{"x":700,"text":"671B FP8"}]}
+</script>
+<figcaption><b>Figure 5.3 — Where the bytes come from decides the load time.</b> Each line is size divided by the tier's effective throughput into one server. Object storage at good parallelism is fine for an 8B model and painful for DeepSeek-V3; peer RDMA loads even 700 GB in a few seconds.</figcaption>
+</figure>
+
+<p>Figure 5.3 makes the economics of caching concrete. For an 8B model, even object storage delivers the weights in a few seconds, and caching hardly matters. For a 70B model, the difference between object storage and local NVMe is the difference between a quarter-minute and three seconds. For DeepSeek-V3 in FP8, object storage takes over two minutes per server even with good parallelism—and a DeepSeek-V3 replica spans many servers, all loading at once—while peers can supply it in a few seconds. The faster tiers cost money (NVMe and DRAM are already in the servers; a shared file system is expensive), so the design question is which models to cache where. Before we answer it, we should look at what is actually stored, because the file format determines how efficiently the bytes can be read.</p>
+
+<h2 id="s5-3">5.3 File formats: pickle, safetensors, GGUF and engines</h2>
+<p>For years the default way to save a PyTorch model was <code>torch.save</code>, which serialises the model's state dictionary with Python's <strong>pickle</strong> format into a <code>.bin</code> or <code>.pt</code> file. Pickle is a general object-serialisation format: a pickle file is a small program for a stack-based virtual machine that reconstructs Python objects, and that program may call arbitrary Python functions while it runs. Loading an untrusted pickle file can therefore execute arbitrary code on the loading machine. This is not a hypothetical concern: researchers and security firms have repeatedly found malicious pickle files uploaded to public model hubs. For an inference platform that loads models from customers or the internet, pickle is a remote-code-execution vulnerability by design (Chapter 14 returns to the model supply chain).</p>
+<p>Pickle is also slow to load: its tensors are reconstructed by the Python interpreter, often with extra copies, and a file must generally be read in full and in order. In 2022 Hugging Face introduced <strong>safetensors</strong>, a deliberately simple format that fixes both problems<span class="cite"><a href="#r-safetensors">[1]</a></span>. Figure 5.4 shows its layout: an 8-byte integer giving the length of a header; a JSON header listing, for each tensor, its name, data type, shape and byte offsets; and then the raw tensor data, contiguous and aligned. There is no code to execute—parsing the header is parsing JSON—and because each tensor's location is known from the header, a loader can memory-map the file and read any tensor, or any slice of one, without touching the rest. An independent security audit of the format was published in 2023, and safetensors has since become the standard distribution format for open-weight models.</p>
+
+<figure class="diagram" id="fig-5-4">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Layout of a safetensors file">
+<rect x="20" y="40" width="70" height="50" rx="4" class="bx4"/><text x="55" y="62" text-anchor="middle" class="t-xs t-b">8 bytes</text><text x="55" y="78" text-anchor="middle" class="t-xs">header size</text>
+<rect x="90" y="40" width="200" height="50" rx="4" class="bx"/><text x="190" y="62" text-anchor="middle" class="t-xs t-b">JSON header</text><text x="190" y="78" text-anchor="middle" class="t-xs">name → dtype, shape, [start, end)</text>
+<rect x="290" y="40" width="130" height="50" rx="4" class="bx2"/><text x="355" y="70" text-anchor="middle" class="t-xs">tensor A bytes</text>
+<rect x="420" y="40" width="160" height="50" rx="4" class="bx3"/><text x="500" y="70" text-anchor="middle" class="t-xs">tensor B bytes</text>
+<rect x="580" y="40" width="120" height="50" rx="4" class="bx5"/><text x="640" y="70" text-anchor="middle" class="t-xs">tensor C …</text>
+<path d="M190,92 C190,130 355,130 355,94" class="ln ln-acc" fill="none"/>
+<path d="M210,92 C210,150 500,150 500,94" class="ln ln-acc" fill="none"/>
+<text x="20" y="28" class="t-xs">no executable content; offsets let a loader read any tensor (or row range) directly</text>
+<text x="20" y="178" class="t-xs">"model.layers.0.self_attn.q_proj.weight": {"dtype": "F8_E4M3", "shape": [8192, 8192], "data_offsets": [s, e]}</text>
+<text x="20" y="198" class="t-xs">Large models are split into shards (model-00001-of-00030.safetensors …) plus an index mapping tensor names to shard files.</text>
+</svg>
+<figcaption><b>Figure 5.4 — The safetensors format.</b> A length, a JSON table of contents and raw, aligned tensor bytes. Because loading is "read these byte ranges into these buffers", it can be parallelised, memory-mapped and pointed at the GPU.</figcaption>
+</figure>
+
+<p>Figure 5.4's design has a consequence for distributed serving that is easy to miss. A replica with tensor parallelism of degree \(n_{\text{TP}}\) gives each GPU a slice of each weight matrix—a block of rows or columns (Vol. I §18.2). With a pickle file, each rank must deserialise the whole checkpoint and discard \((n_{\text{TP}}-1)/n_{\text{TP}}\) of it, so the eight ranks of a TP8 replica together read eight times the model's size. With safetensors and row-sharded tensors, each rank can read exactly the byte ranges of its slice; column slices are strided but can still be read selectively, or the checkpoint can be <strong>pre-sharded</strong>—re-saved once in the serving layout, one file per rank—so that each rank reads one contiguous file of \(W_{\text{bytes}}/n_{\text{TP}}\) bytes. Pre-sharding a 140 GB BF16 checkpoint for TP8 cuts the bytes each rank reads from 140 GB to 17.5 GB.</p>
+<p>Two other formats are common. <strong>GGUF</strong>, the format of llama.cpp (Vol. I Chapter 29), packs a model's architecture metadata, tokenizer and quantised tensors (in its many block-quantisation formats) into a single memory-mappable file, designed for local and edge inference. <strong>Compiled engine files</strong>, such as TensorRT-LLM engines, store not only weights but kernels and execution plans specialised to one GPU type, parallel layout and set of maximum shapes; they skip compilation at start-up but must be rebuilt for each hardware and configuration change. The general lesson is that the serving format should be chosen for loading, not for training: what was convenient to save is rarely what is fastest to load.</p>
+
+<h2 id="s5-4">5.4 Reading fast: streaming weights into GPU memory</h2>
+<p>Once the weights are in a loadable format on some tier, they must travel to HBM. The path, for a load from object storage or NVMe, is storage → network or NVMe controller → host DRAM → PCIe → GPU HBM. A naive loader runs these hops sequentially: download the files to local disk, then read each tensor into host memory, then copy it to the GPU, waiting for each stage to finish before starting the next. The time is the <em>sum</em> of the stages. A streaming loader pipelines them, so that while one chunk is crossing PCIe, the next is being read from storage; its time approaches the <em>maximum</em> of the stages, that is, the size divided by the slowest link's bandwidth.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — pipelining turns a sum into a maximum</div>
+<p>Let a transfer of \(W\) bytes pass through \(n_s\) stages with bandwidths \(\beta_1,\dots,\beta_{n_s}\). Done stage by stage, the time is \(\sum_jW/\beta_j\). Split the data into chunks of \(c\) bytes and let each stage work on chunk \(i+1\) while the next stage works on chunk \(i\). Chunk \(i\) leaves the last stage at time \(\sum_jc/\beta_j+(i-1)\max_jc/\beta_j\), so all \(W/c\) chunks are done at \(\sum_jc/\beta_j+(W/c-1)\max_jc/\beta_j\approx W/\min_j\beta_j\) when \(c\ll W\). The pipeline's throughput is the bottleneck stage's bandwidth, and the other stages cost only a fill-and-drain latency proportional to \(c\). This is the same algebra as the pipeline-parallel bubble of Vol. I §18.4, and it reappears in the chain broadcast of §5.5.</p>
+</div>
+
+<p>Several open-source loaders implement streaming for LLM weights. The Run:ai Model Streamer reads safetensors files from object storage or file systems with many concurrent range requests and copies tensors into GPU memory as they arrive, without first writing them to disk; vLLM integrates it as a load format. CoreWeave's Tensorizer serialises models into a format designed for streaming over HTTP or from S3. Other loaders read safetensors directly from NVMe into GPU memory with parallel I/O. All exploit the same two ideas: many concurrent reads to saturate the source, and overlap of reading and copying so that the slowest link sets the pace.</p>
+<p>Which link is the slowest? PCIe rarely is: each GPU has its own PCIe Gen5 x16 link of about 64 GB/s per direction, roughly 50 GB/s achievable with pinned (page-locked) host buffers, so eight GPUs can absorb several hundred GB/s in aggregate if the host's memory and PCIe topology allow it. The front-end NIC, at 100–400 Gb/s (12.5–50 GB/s), often is, as is the storage service's per-object or per-prefix throughput. Local NVMe at 25–50 GB/s per server is often the binding link for cached loads. <strong>GPUDirect Storage</strong> (GDS) removes a hop for NVMe and some network file systems: the storage device writes directly into GPU memory by DMA, bypassing the host DRAM bounce buffer, which saves CPU and memory bandwidth and helps most when the host's memory system, not the drive, is the limit.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — loading Llama 3 70B onto eight GPUs</div>
+<p><strong>Setup.</strong> Llama 3 70B in FP8 (70.6 GB), TP8, on an H100 instance with a 200 Gb/s front-end NIC (25 GB/s), eight local NVMe drives (about 25 GB/s together after RAID overhead) and PCIe Gen5 to each GPU (about 50 GB/s each with pinned buffers).</p>
+<p><strong>Naive.</strong> One stream downloads the whole checkpoint (not pre-sharded) from object storage at 100 MB/s to local disk: about 12 minutes. Then each of eight ranks reads the full 70.6 GB from disk and keeps an eighth: 565 GB of disk reads at 25 GB/s, about 23 s. Copy to GPUs: under 1 s. Total about 12.5 minutes.</p>
+<p><strong>Parallel streaming from object storage.</strong> A streaming loader with 64 concurrent range requests at about 80 MB/s each reaches about 5 GB/s, and with a pre-sharded checkpoint each rank streams only its 8.8 GB slice. Aggregate 70.6 GB at 5 GB/s: about 14 s. If the bucket and NIC allow more concurrency, the 25 GB/s NIC becomes the limit: about 3 s.</p>
+<p><strong>From the local NVMe cache.</strong> 70.6 GB at 25 GB/s: about 2.8 s, pipelined to the GPUs.</p>
+<p><strong>From host DRAM</strong> (e.g. after a process restart, with weights still in the page cache): eight parallel PCIe streams of 8.8 GB at about 50 GB/s each: about 0.2 s, in practice perhaps a second with allocation overheads.</p>
+<p><strong>Lesson.</strong> Format and parallelism take the load from twelve minutes to fifteen seconds; caching takes it to three; keeping the weights in host memory takes it to one. The remaining cold-start time is elsewhere.</p>
+</div>
+
+<h2 id="s5-5">5.5 Caching tiers and peer-to-peer distribution</h2>
+<p>Loading one replica quickly is a matter of bandwidth. Loading many replicas at once is a matter of <em>contention</em>, and it is the case that matters for autoscaling and recovery. When Atlas's morning ramp requires 170 new 70B replicas within half an hour, or when a rollout restarts every replica of a model with new weights, or when a zone fails and its replicas must be recreated elsewhere, hundreds of servers ask for the same tens of gigabytes at the same moment. A central store that delivers 5 GB/s to one client may deliver only its aggregate limit—perhaps 50–100 GB/s for one bucket and prefix—to all of them together, and that limit is shared. Two hundred servers each needing 70 GB from a store limited to 50 GB/s in aggregate wait \(200\times70/50=280\) seconds, however fast each server's NIC is.</p>
+<p>The remedy is to stop treating the central store as the only source. Once one server has the weights, it can serve them to others, and those to more. There are three standard patterns, sketched in Figure 5.5. In a <strong>star</strong>, every server fetches from the central store; time grows linearly with the number of servers once the store's aggregate limit binds. In a <strong>swarm</strong>, as in BitTorrent or container-distribution systems such as Uber's Kraken and the CNCF project Dragonfly, the weights are split into chunks and servers exchange chunks with each other, so that every server's upload bandwidth contributes; time grows only logarithmically. In a <strong>chain</strong> or <strong>tree broadcast</strong> over the back-end RDMA network, servers are arranged in a pipeline (or a tree of pipelines) and each forwards chunks to the next as soon as it receives them; with pipelining, the time is almost independent of the number of servers.</p>
+
+<figure class="diagram" id="fig-5-5">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Star, swarm and chain distribution of weights">
+<defs><marker id="a55" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="110" y="24" text-anchor="middle" class="t-sm t-b">Star (central store)</text>
+<rect x="80" y="40" width="60" height="32" rx="5" class="bx4"/><text x="110" y="60" text-anchor="middle" class="t-xs">store</text>
+<g><circle cx="40" cy="150" r="16" class="bx"/><circle cx="85" cy="170" r="16" class="bx"/><circle cx="135" cy="170" r="16" class="bx"/><circle cx="180" cy="150" r="16" class="bx"/></g>
+<line x1="100" y1="72" x2="44" y2="134" class="ln" marker-end="url(#a55)"/><line x1="105" y1="72" x2="87" y2="153" class="ln" marker-end="url(#a55)"/><line x1="115" y1="72" x2="133" y2="153" class="ln" marker-end="url(#a55)"/><line x1="120" y1="72" x2="176" y2="134" class="ln" marker-end="url(#a55)"/>
+<text x="110" y="215" text-anchor="middle" class="t-xs">time ≈ n·W / β_svc</text>
+<text x="360" y="24" text-anchor="middle" class="t-sm t-b">Swarm (peer-to-peer chunks)</text>
+<rect x="330" y="40" width="60" height="32" rx="5" class="bx4"/><text x="360" y="60" text-anchor="middle" class="t-xs">seed</text>
+<g><circle cx="290" cy="120" r="16" class="bx"/><circle cx="430" cy="120" r="16" class="bx"/><circle cx="310" cy="180" r="16" class="bx"/><circle cx="410" cy="180" r="16" class="bx"/></g>
+<line x1="345" y1="72" x2="300" y2="106" class="ln" marker-end="url(#a55)"/><line x1="375" y1="72" x2="420" y2="106" class="ln" marker-end="url(#a55)"/>
+<line x1="306" y1="120" x2="412" y2="120" class="ln ln-s3"/><line x1="296" y1="136" x2="306" y2="163" class="ln ln-s3"/><line x1="424" y1="136" x2="414" y2="163" class="ln ln-s3"/><line x1="326" y1="180" x2="394" y2="180" class="ln ln-s3"/><line x1="302" y1="132" x2="398" y2="170" class="ln ln-s3"/>
+<text x="360" y="215" text-anchor="middle" class="t-xs">time ≈ W/β + O(log n) chunk times</text>
+<text x="600" y="24" text-anchor="middle" class="t-sm t-b">Pipelined chain (RDMA)</text>
+<rect x="490" y="105" width="44" height="32" rx="5" class="bx4"/><text x="512" y="125" text-anchor="middle" class="t-xs">src</text>
+<g><circle cx="565" cy="121" r="16" class="bx"/><circle cx="615" cy="121" r="16" class="bx"/><circle cx="665" cy="121" r="16" class="bx"/><circle cx="705" cy="121" r="10" class="bx"/></g>
+<line x1="534" y1="121" x2="547" y2="121" class="ln ln-s2" marker-end="url(#a55)"/><line x1="581" y1="121" x2="597" y2="121" class="ln ln-s2" marker-end="url(#a55)"/><line x1="631" y1="121" x2="647" y2="121" class="ln ln-s2" marker-end="url(#a55)"/><line x1="681" y1="121" x2="693" y2="121" class="ln ln-s2" marker-end="url(#a55)"/>
+<text x="600" y="170" text-anchor="middle" class="t-xs">each node forwards chunk i</text>
+<text x="600" y="185" text-anchor="middle" class="t-xs">while receiving chunk i+1</text>
+<text x="600" y="215" text-anchor="middle" class="t-xs">time ≈ (W + (n−1)c) / β</text>
+</svg>
+<figcaption><b>Figure 5.5 — Three ways to deliver one model to \(n\) servers.</b> The star is limited by the store's aggregate throughput; the swarm adds every server's upload capacity; the pipelined chain over the back-end delivers the whole model to every server in roughly the time one server needs.</figcaption>
+</figure>
+
+<div class="box thm">
+<div class="box-title">Proposition 5.1 — Pipelined chain broadcast</div>
+<p>A source holds \(W\) bytes and \(n\) receivers are arranged in a chain, each link having bandwidth \(\beta\) and per-chunk latency \(\alpha\). If the data are sent in chunks of \(c\) bytes and each receiver forwards a chunk as soon as it has received it, the last receiver finishes at</p>
+\[
+t_{\text{chain}}(c)=\Bigl(\frac{W}{c}+n-1\Bigr)\Bigl(\alpha+\frac{c}{\beta}\Bigr),
+\]
+<p>which is minimised at \(c^*=\sqrt{W\alpha\beta/(n-1)}\), giving \(t^*_{\text{chain}}=\bigl(\sqrt{W/\beta}+\sqrt{(n-1)\alpha}\bigr)^2\).</p>
+<p><em>Proof.</em> Each chunk takes \(\alpha+c/\beta\) per hop. The last chunk leaves the source after \(W/c\) chunk times and needs \(n-1\) further hops to reach the last receiver, giving the product. Writing \(f(c)=(W/c+n-1)(\alpha+c/\beta)\), \(f'(c)=-W\alpha/c^2+(n-1)/\beta\), which vanishes at \(c^*\). Substituting, \(f(c^*)=W/\beta+(n-1)\alpha+2\sqrt{W\alpha(n-1)/\beta}=(\sqrt{W/\beta}+\sqrt{(n-1)\alpha})^2\). \(\square\)</p>
+</div>
+
+<p>Proposition 5.1 is the same trade-off as Vol. I's α–β analysis of collectives: small chunks fill the pipeline quickly but pay the per-chunk latency many times; large chunks pay it rarely but leave the pipeline empty for longer. For realistic numbers the second term is tiny. With \(W=70\) GB, \(\beta=300\) GB/s per server over eight RDMA NICs, \(\alpha=50\) µs and \(n=255\) receivers, \(c^*\approx\sqrt{70\times10^9\times5\times10^{-5}\times3\times10^{11}/254}\approx64\) MB and \(t^*\approx(0.483+0.113)^2\approx0.36\) s. Every one of 255 servers receives the full 70 GB in about a third of a second—the time to deliver it to one server, plus a few milliseconds. Figure 5.6 compares the three patterns as the number of new replicas grows.</p>
+
+<figure class="chart" id="fig-5-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Time to deliver 70 GB of weights to n new servers (at least one replica already running)","height":330,
+ "x":{"label":"Servers receiving the model, n (log)","log":true,"min":1,"max":256,"ticks":[1,4,16,64,256]},
+ "y":{"label":"Seconds (log)","log":true,"min":0.1,"max":500,"ticks":[0.3,1,3,10,30,100,300]},
+ "series":[
+  {"name":"Star: object store, 5 GB/s per client, 50 GB/s aggregate","color":"s2","points":[[1,14],[4,14],[10,14],[16,22.4],[64,89.6],[256,358]]},
+  {"name":"Swarm over front-end, 25 GB/s per server, 1 GB chunks","color":"s4","points":[[1,2.8],[4,2.88],[16,2.96],[64,3.04],[256,3.12]]},
+  {"name":"Pipelined chain over back-end RDMA, 300 GB/s per server","color":"s3","points":[[1,0.233],[4,0.243],[16,0.283],[64,0.443],[256,1.08]]}
+ ]}
+</script>
+<figcaption><b>Figure 5.6 — Peer distribution removes contention.</b> The star's time grows linearly once the store's aggregate limit binds; the swarm's grows logarithmically; the chain's (with a fixed 1 GB chunk here, not the optimum) barely grows. The chain assumes servers share a back-end fabric with the source.</figcaption>
+</figure>
+
+<p>Figure 5.6 explains why large serving platforms distribute weights peer to peer. With a central store, scaling from 16 to 256 new replicas makes each wait sixteen times longer; with peers, it makes almost no difference. The chain over the back-end is fastest but needs the source and the receivers on the same RDMA fabric and a coordinator to build the chain; the swarm works over the ordinary front-end network and tolerates churn. Research systems have pushed the idea further. ServerlessLLM (2024) loads checkpoints through a multi-tier cache (GPU, DRAM, SSD) with a loading-optimised format and chooses servers by where weights are already cached, reporting large reductions in start-up latency<span class="cite"><a href="#r-serverlessllm">[2]</a></span>; later systems multicast parameters over the RDMA network and even let a new replica begin serving before it has all of its layers, by executing early layers locally and late layers on a peer until the copy completes.</p>
+<p>Caching policy decides which models are present on which tier. A sensible default for a fleet like Atlas is: every model in active service has its weights on the NVMe of every node in its pool, written by a background agent when the model is registered; host DRAM keeps the weights of the models currently loaded on the node, so that a crashed engine can restart from memory; the central object store is used only for new models and cache misses, and then seeds a swarm. Because NVMe capacity per node is tens of terabytes, even a large catalogue of models fits, and the cost of caching is small next to the GPU time it saves. Weights, however, are only one of the two big downloads of a cold start.</p>
+
+<details class="drill">
+<summary>Drill 5.1 — Atlas's morning ramp</summary>
+<p>Between 07:30 and 09:00 UTC, Atlas's 70B tier grows from about 140 to 311 replicas (eight GPUs each). If weights come from object storage with a 50 GB/s aggregate limit, how long does the weight loading of the 171 new replicas take in total, and how does that compare with the swarm and with chain broadcast from existing replicas? What does this imply for autoscaling headroom?</p>
+<p><em>Solution.</em> 171 replicas × 70.6 GB ≈ 12.1 TB. Star: if the replicas start at once, \(12{,}100/50\approx242\) s for the last one; spread over 90 minutes at about two replicas per minute, the store is not saturated and each takes about 14 s. Swarm: about 3 s each regardless of concurrency. Chain from running replicas: under a second. The difference matters most for bursts and recoveries: if a zone with 60 replicas fails, re-creating them from object storage takes \(60\times70.6/50\approx85\) s of weight loading alone, versus seconds with peers. Faster recovery means less spare capacity must be held to meet the SLO during it (Chapter 13), and faster scale-up lets the autoscaler hold less headroom for the ramp (Vol. I §27.3).</p>
+</details>
+
+<h2 id="s5-6">5.6 Container images: the other big download</h2>
+<p>An inference replica runs inside a <strong>container</strong> (Chapter 6 explains what that is): a process with its own view of the file system, populated from an <strong>image</strong>. An image is a stack of read-only <em>layers</em>, each a compressed archive of files, identified by a cryptographic hash of its contents and stored in a <strong>registry</strong>. Starting a container conventionally requires downloading and decompressing every layer not already on the node. LLM serving images are large: a CUDA runtime and its math libraries, cuDNN, NCCL, PyTorch, the inference engine, Triton and FlashInfer kernels, and Python dependencies easily total 10–20 GB uncompressed, several gigabytes compressed. Pulled at a few hundred megabytes per second and decompressed on a few CPU cores, that is one to three minutes.</p>
+<p>Most of those bytes are never read. Harter and colleagues measured container start-up in 2016 and found that pulling images accounted for 76% of container start time, while only 6.4% of the pulled data was actually read during start-up<span class="cite"><a href="#r-slacker">[3]</a></span>. The observation led to <strong>lazy pulling</strong>: start the container as soon as its file-system metadata is available, and fetch file contents on demand when the process first reads them. Formats and snapshotters that support this include eStargz (seekable compressed layers), Nydus, AWS's SOCI (seekable OCI indexes that work with unmodified images), and the image-streaming features of managed Kubernetes services. With lazy pulling the image term of the cold start shrinks to seconds, though first accesses to large libraries then pay a small latency during initialisation.</p>
+<p>Three simpler techniques also help, and are often combined with lazy pulling. <strong>Pre-pulling</strong> the serving image onto every node of a GPU pool, by a background process or by baking it into the node's machine image, removes the pull entirely for the common case. <strong>Layer discipline</strong>—putting the large, rarely changing CUDA and framework layers at the bottom of the image and the frequently changing engine code at the top—means that a new engine version changes only a small top layer, so only that layer must be pulled. And keeping <strong>weights out of the image</strong> lets images and models change independently and lets weights use the specialised tiers of §5.5; baking weights into images makes every model update a multi-gigabyte image push and pull.</p>
+
+<p>The idea that makes container layers cacheable—naming each artefact by a cryptographic hash of its contents—applies equally to model weights, and mature platforms adopt it. A <strong>model registry</strong> records, for each model version, the content hashes of its shard files, its serving configuration (precision, parallel layout, tokenizer, chat template, maximum context) and its provenance (training run, evaluation results, approvals). Deployments refer to a model by its immutable version or digest rather than by a mutable name such as "latest", so that every replica of a deployment is guaranteed to load the same bytes, caches can be keyed by digest and shared safely across tenants who use the same base model, and a rollback is simply a reference to an older digest whose files are probably still cached. Loaders verify each shard's hash after download, which catches corrupted transfers and tampering at the same time.</p>
+<p>Content addressing also simplifies the cache invalidation problem that plagues every caching system. A cache keyed by digest never needs invalidation: a new model version has a new digest and therefore new cache entries, and old entries are evicted by ordinary LRU when space runs low. The only mutable state is the mapping from deployment to digest, which lives in the control plane (Chapter 8) and changes only through a rollout. This is the same separation of mutable references from immutable content that version-control systems such as Git use, and for the same reasons.</p>
+
+<details class="drill">
+<summary>Drill 5.2 — Pulling an image onto 500 nodes</summary>
+<p>A serving image is 18 GB uncompressed and 7 GB compressed. A node pulls from the registry at 500 MB/s and decompresses at about 600 MB/s of output using a few cores. (a) How long does a full pull take on one node? (b) With lazy pulling, start-up reads 6.4% of the image; how long is the image step? (c) A new image version must reach 500 nodes; the registry serves 20 GB/s in aggregate. How long does a simultaneous full pull take, and what would you do instead?</p>
+<p><em>Solution.</em> (a) Download 7 GB at 0.5 GB/s is 14 s; decompressing 18 GB at 0.6 GB/s is 30 s; if pipelined, the pull takes about 30 s, sequentially about 44 s—and real pulls often take longer because layers are fetched and unpacked one at a time. (b) About 1.2 GB of uncompressed data, fetched on demand: a few seconds, plus latency on first access to each file. (c) 500 × 7 GB = 3.5 TB at 20 GB/s is 175 s for the last node, during which every node competes. Instead: pre-pull in the background before the rollout, use a regional pull-through mirror or a peer-to-peer distribution layer (the swarm of §5.5 works for image layers too), and structure layers so that only a small top layer changes between versions.</p>
+</details>
+
+<h2 id="s5-7">5.7 Initialisation, compilation caches and snapshots</h2>
+<p>With the image and weights in place, the engine still has to initialise, and modern engines do a lot at start-up because it makes them faster later. Creating NCCL communicators for tensor parallelism takes seconds within a server and longer across servers. Allocating and initialising the KV-cache pool is fast, but profiling memory to decide its size runs a dummy forward pass at the largest batch. JIT-compiled kernels—Triton kernels, FlashInfer's attention variants, <code>torch.compile</code>'s generated code—may be compiled on first use, and autotuning tries several configurations of each kernel to find the fastest. CUDA graph capture (Vol. I §7.7) records the decode step for each of dozens of batch sizes. Together, these can take from tens of seconds to several minutes, especially for large models with many layer types.</p>
+<p>The cure is to do the work once and reuse it. Compilation and autotuning results are deterministic functions of the model, engine version, GPU type and configuration, so they can be <strong>cached</strong>—written to a persistent directory or a shared store keyed by those inputs—and loaded on subsequent starts; vLLM, SGLang and PyTorch all support caches for compiled artefacts. CUDA graph capture can be limited to the batch sizes that matter, or deferred until traffic needs them. Within a running process, the cheapest cold start is the one that never happens: an engine can release its GPU memory while keeping its weights in host memory and its compiled state alive, and resume in seconds. vLLM calls this <strong>sleep mode</strong>; it is useful when GPUs are time-shared between models (several models on one pool, only some active) and between inference and training (reinforcement-learning systems that alternate rollouts and updates, Chapter 19).</p>
+<p>The most complete form of reuse is a <strong>process snapshot</strong>: freeze a fully initialised engine—host memory, GPU memory, open files—to storage, and restore it on a new machine, skipping every step after the image pull. CPU process checkpointing has existed for years (CRIU on Linux); NVIDIA released a <code>cuda-checkpoint</code> utility in 2024 that makes a CUDA process's GPU state checkpointable, and some serverless GPU platforms restore snapshots of initialised engines to start replicas in seconds. Snapshots have caveats—they are tied to GPU type and driver version, they contain the weights (so they are large, and must be secured like the weights), and restoring multi-GPU communicators is delicate—but they turn \(t_{\text{init}}\) into a load of bytes, which the techniques of §5.4–5.5 make fast.</p>
+
+<h2 id="s5-8">5.8 Cold-start budgets for the running models</h2>
+<p>We can now assemble cold-start budgets for the three running models. Table 5.1 compares a naive implementation with one using the techniques of this chapter, assuming the node is already in a warm pool (Chapter 9 discusses the cost of keeping one). The numbers are representative, not universal; what matters is which terms dominate and how much each technique removes.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 5.1 — Representative cold-start budgets, excluding node provisioning</caption>
+<thead><tr><th>Step</th><th>Llama 3 8B (1 GPU)</th><th>Llama 3 70B (8 GPUs, TP8)</th><th>DeepSeek-V3 (e.g. 32 decode GPUs)</th></tr></thead>
+<tbody>
+<tr><td>Image: naive pull → lazy / pre-pulled</td><td>90 s → 3 s</td><td>90 s → 3 s</td><td>90 s → 3 s (per node, in parallel)</td></tr>
+<tr><td>Weights: one stream from object storage</td><td>16 GB: ≈ 3 min</td><td>70 GB: ≈ 12 min</td><td>≈ 700 GB: hours</td></tr>
+<tr><td>Weights: parallel streaming / NVMe cache / peers</td><td>3 s / 1 s / &lt; 1 s</td><td>14 s / 3 s / &lt; 1 s</td><td>2–3 min / 7 s / 2–3 s per node</td></tr>
+<tr><td>Engine init: cold → cached compilation, limited graphs</td><td>60 s → 10 s</td><td>120 s → 20 s</td><td>300 s → 45 s (multi-node communicators)</td></tr>
+<tr><td>Warm-up and health checks</td><td>5 s</td><td>10 s</td><td>20 s</td></tr>
+<tr><td><b>Total: naive → optimised</b></td><td><b>≈ 5 min → ≈ 20 s</b></td><td><b>≈ 15 min → ≈ 35 s</b></td><td><b>≫ 15 min → ≈ 75 s</b></td></tr>
+</tbody></table></div>
+
+<p>Two lessons stand out in Table 5.1. The first is that after optimisation the remaining time is dominated by engine initialisation, not by bytes, so further gains come from snapshots and from keeping initialised engines alive (sleep mode, warm standby replicas). The second is that the large model benefits most: DeepSeek-V3 is barely operable with naive loading—a cold start that takes over an hour makes failures catastrophic and autoscaling impossible—and becomes manageable only with caching and peer distribution. For the largest models, these techniques are not optimisations but prerequisites.</p>
+<p>What a faster cold start buys can be quantified with the headroom model of Vol. I §27.3. If demand can grow at a rate \(\dot\lambda\) during a ramp, an autoscaler that reacts after a cold start of duration \(t_{\text{cold}}\) must hold enough spare capacity to absorb \(\dot\lambda\,t_{\text{cold}}\) of growth. Cutting \(t_{\text{cold}}\) from fifteen minutes to thirty-five seconds cuts that headroom by a factor of about 25. For a recovery from the loss of a zone, the period of degraded service shrinks in the same ratio, and with it the spare capacity needed to meet the availability target. In both cases the saving is measured in GPUs, which is why the unglamorous engineering of this chapter pays for itself many times over.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — headroom saved by a faster cold start</div>
+<p><strong>Setup.</strong> Atlas's 70B tier ramps from 140 to 311 replicas over 90 minutes each morning, roughly linearly: about 1.9 replicas' worth of demand per minute. The autoscaler adds replicas when utilisation exceeds its target, and a new replica serves traffic only after \(t_{\text{cold}}\).</p>
+<p><strong>Naive, \(t_{\text{cold}}=15\) min.</strong> During one cold start demand grows by about \(1.9\times15\approx29\) replicas' worth, so the autoscaler must hold about 29 replicas (232 GPUs) of headroom throughout the ramp to avoid breaching the SLO.</p>
+<p><strong>Optimised, \(t_{\text{cold}}\approx35\) s.</strong> Growth during one cold start is about 1.1 replicas' worth: headroom of one or two replicas (8–16 GPUs).</p>
+<p><strong>Value.</strong> About 220 GPUs fewer held idle during the ramp. If headroom is held only during the ramp (90 minutes a day) the saving is modest; but fleets that cannot scale quickly usually keep the headroom all day, and then 220 H100s at $2.50 per GPU-hour are worth about $4.8 million a year—for a single tier.</p>
+</div>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Part I has built the physical cloud from the bottom up: power and cooling (Chapter 2), accelerators as products (Chapter 3), the networks that join them (Chapter 4), and the storage from which weights and images reach them (this chapter). Throughout we have spoken of "starting a replica" on "a node" as if something decided where each replica should go and kept it running. That something is the orchestration layer: containers that package an engine and its dependencies, and a cluster manager—usually Kubernetes—that places them on machines, gives them GPUs, restarts them when they fail and scales them as demand changes. What exactly is a container, how does Kubernetes manage accelerators, and what changes when one replica spans several machines? Chapter 6 begins Part II with these questions.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>A cold start is \(t_{\text{node}}+t_{\text{sched}}+t_{\text{image}}+t_{\text{weights}}+t_{\text{init}}+t_{\text{warm}}\); naively 10–15 minutes for a 70B replica, dominated by obtaining capacity and moving bytes.</li>
+<li>Weights live canonically in object storage, whose throughput is \(\min(n_{\text{conn}}\beta_{\text{conn}},\beta_{\text{NIC}},\beta_{\text{svc}})\): parallel range reads are essential. Faster tiers: shared file systems, local NVMe (25–50 GB/s per server), host DRAM, and peer HBM over RDMA.</li>
+<li>Pickle checkpoints can execute arbitrary code on load; safetensors (JSON header plus raw aligned bytes) is safe, memory-mappable and supports selective reads. Pre-sharding for the serving layout cuts per-rank I/O by \(n_{\text{TP}}\).</li>
+<li>Streaming loaders pipeline storage, network, PCIe and HBM so time approaches size divided by the slowest link; PCIe (≈ 50 GB/s per GPU) rarely binds; GPUDirect Storage removes the host bounce buffer.</li>
+<li>Many simultaneous loads contend for a central store; swarms add every server's upload; pipelined chain broadcast takes \((W/c+n-1)(\alpha+c/\beta)\), optimal \(c^*=\sqrt{W\alpha\beta/(n-1)}\), nearly independent of \(n\).</li>
+<li>Container images are 10–20 GB but only a few percent is read at start-up: lazy pulling, pre-pulling and layer discipline remove most of \(t_{\text{image}}\); keep weights out of images.</li>
+<li>Engine initialisation (communicators, compilation, autotuning, CUDA graphs) is cut by persistent compilation caches, limited graph capture, sleep modes and process snapshots.</li>
+<li>Optimised cold starts are about 20 s (8B), 35 s (70B) and 75 s (DeepSeek-V3) on warm nodes; faster cold starts reduce autoscaling headroom and recovery capacity in proportion.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci05-mcq-01" data-topic="§5.1 Anatomy">
+<p class="q">Which terms usually dominate a naive cold start of a 70B replica? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Provisioning a node</li><li data-correct>Pulling the container image</li><li data-correct>Loading the weights</li><li>Scheduling the pod</li></ol>
+<div class="explain">Scheduling takes seconds; the others take minutes each in a naive implementation.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-02" data-topic="§5.1 Anatomy">
+<p class="q">Why is it important that the cold-start steps are not inherently sequential?</p>
+<ol class="opts"><li>They can be skipped</li><li data-correct>Image pulls, weight loads and compilation can overlap, so the total approaches the longest step rather than the sum</li><li>Kubernetes requires it</li><li>It makes GPUs faster</li></ol>
+<div class="explain">Pipelining and overlap are the general remedy.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-03" data-topic="§5.2 Tiers">
+<p class="q">A loader reads a 70 GB checkpoint from object storage with one sequential stream at 100 MB/s. Roughly how long does it take?</p>
+<ol class="opts"><li>14 s</li><li>70 s</li><li data-correct>12 minutes</li><li>2 hours</li></ol>
+<div class="explain">\(70{,}000/100=700\) s.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-04" data-topic="§5.2 Tiers">
+<p class="q">What most increases the throughput a single client gets from object storage?</p>
+<ol class="opts"><li>Larger objects</li><li data-correct>Many concurrent range requests</li><li>Smaller NICs</li><li>Compressing the weights with gzip</li></ol>
+<div class="explain">Per-request throughput is modest; the service scales out.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-05" data-topic="§5.2 Tiers">
+<p class="q">A server with eight NVMe drives in RAID-0 can typically read at about:</p>
+<ol class="opts"><li>0.5 GB/s</li><li data-correct>25–50 GB/s</li><li>500 GB/s</li><li>3.35 TB/s</li></ol>
+<div class="explain">Each drive gives roughly 7–14 GB/s before overheads.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-06" data-topic="§5.2 Tiers">
+<p class="q">Why can rare loads from the slowest tier dominate the expected load time?</p>
+<ol class="opts"><li>They are always first</li><li data-correct>Tier bandwidths differ by orders of magnitude, so a small probability times a very long time is large</li><li>They use more GPUs</li><li>They are retried</li></ol>
+<div class="explain">\(\mathbb E[t]=\sum_ip_iW/\beta_i\).</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-07" data-topic="§5.3 Formats">
+<p class="q">Why is loading an untrusted pickle checkpoint dangerous?</p>
+<ol class="opts"><li>It may be corrupted</li><li data-correct>Unpickling runs a program that can call arbitrary functions, enabling code execution</li><li>It is too large</li><li>It requires root</li></ol>
+<div class="explain">Malicious pickles have been found on public hubs.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-08" data-topic="§5.3 Formats">
+<p class="q">The safetensors format consists of:</p>
+<ol class="opts"><li>A pickle with a signature</li><li data-correct>An 8-byte header length, a JSON header of tensor names, dtypes, shapes and offsets, then raw tensor bytes</li><li>A zip archive of NumPy files</li><li>Compiled kernels</li></ol>
+<div class="explain">No code; selective, memory-mapped reads are possible.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-09" data-topic="§5.3 Formats">
+<p class="q">For a TP8 replica, pre-sharding a 140 GB BF16 checkpoint changes the bytes each rank reads from 140 GB to:</p>
+<ol class="opts"><li>70 GB</li><li data-correct>17.5 GB</li><li>8 GB</li><li>1.4 GB</li></ol>
+<div class="explain">\(140/8\).</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-10" data-topic="§5.3 Formats">
+<p class="q">A drawback of compiled engine files (e.g. TensorRT-LLM engines) is that they:</p>
+<ol class="opts"><li>Execute arbitrary code</li><li data-correct>Must be rebuilt for each GPU type, parallel layout and shape limits</li><li>Cannot hold quantised weights</li><li>Are slower than pickle</li></ol>
+<div class="explain">They skip compilation at start-up in exchange for specialisation.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-11" data-topic="§5.3 Formats">
+<p class="q">GGUF is primarily the format of:</p>
+<ol class="opts"><li>TensorRT-LLM</li><li data-correct>llama.cpp, packing metadata, tokenizer and block-quantised tensors in one mmap-able file</li><li>Object storage</li><li>Kubernetes</li></ol>
+<div class="explain">It is designed for local and edge inference.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-12" data-topic="§5.4 Streaming">
+<p class="q">Pipelining a multi-stage transfer makes its time approach:</p>
+<ol class="opts"><li>The sum of stage times</li><li data-correct>Size divided by the slowest stage's bandwidth</li><li>Size divided by the fastest stage's bandwidth</li><li>Zero</li></ol>
+<div class="explain">Other stages cost only fill-and-drain time.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-13" data-topic="§5.4 Streaming">
+<p class="q">Which link is least likely to bind when loading weights onto an 8-GPU server?</p>
+<ol class="opts"><li>The front-end NIC</li><li>Object storage per-prefix throughput</li><li data-correct>PCIe from host to GPUs (≈ 50 GB/s per GPU in aggregate)</li><li>Local NVMe</li></ol>
+<div class="explain">Eight PCIe links absorb several hundred GB/s together.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-14" data-topic="§5.4 Streaming">
+<p class="q">GPUDirect Storage allows:</p>
+<ol class="opts"><li>GPUs to act as NVMe drives</li><li data-correct>Storage devices to DMA directly into GPU memory, bypassing the host bounce buffer</li><li>Encryption of weights</li><li>NVLink across racks</li></ol>
+<div class="explain">It saves CPU and host memory bandwidth.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-15" data-topic="§5.4 Streaming">
+<p class="q">Why are pinned (page-locked) host buffers used for host-to-GPU copies?</p>
+<ol class="opts"><li>They are encrypted</li><li data-correct>The GPU's DMA engines can read them directly at full PCIe speed without an extra staging copy</li><li>They are larger</li><li>They prevent pickle attacks</li></ol>
+<div class="explain">Pageable memory requires staging through a pinned buffer.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-16" data-topic="§5.5 Distribution">
+<p class="q">Two hundred servers each need 70 GB from a store limited to 50 GB/s in aggregate. The last finishes after about:</p>
+<ol class="opts"><li>1.4 s</li><li>14 s</li><li data-correct>280 s</li><li>2,800 s</li></ol>
+<div class="explain">\(200\times70/50\).</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-17" data-topic="§5.5 Distribution">
+<p class="q">In a pipelined chain broadcast, the completion time is approximately:</p>
+<ol class="opts"><li>\(nW/\beta\)</li><li data-correct>\((W+(n-1)c)/\beta\) ignoring per-chunk latency</li><li>\(W\log n/\beta\)</li><li>\(W/(n\beta)\)</li></ol>
+<div class="explain">Each node forwards a chunk while receiving the next.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-18" data-topic="§5.5 Distribution">
+<p class="q">The optimal chunk size in Proposition 5.1 is:</p>
+<ol class="opts"><li>\(W/n\)</li><li data-correct>\(\sqrt{W\alpha\beta/(n-1)}\)</li><li>\(\alpha\beta\)</li><li>\(W\)</li></ol>
+<div class="explain">It balances pipeline fill against per-chunk latency.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-19" data-topic="§5.5 Distribution">
+<p class="q">Why does a peer-to-peer swarm scale better than a central store?</p>
+<ol class="opts"><li>Peers have faster disks</li><li data-correct>Every server that has chunks contributes upload bandwidth, so total supply grows with the number of servers</li><li>It uses compression</li><li>It needs fewer bytes</li></ol>
+<div class="explain">Completion time grows only logarithmically.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-20" data-topic="§5.5 Distribution">
+<p class="q">Which situations create many simultaneous weight loads? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>A morning traffic ramp</li><li data-correct>A rollout of new model weights</li><li data-correct>Recreating replicas after a zone failure</li><li>A single replica restart</li></ol>
+<div class="explain">These are exactly the moments when slow loading hurts most.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-21" data-topic="§5.6 Images">
+<p class="q">Harter et al. found what fraction of pulled image data was read during container start-up?</p>
+<ol class="opts"><li data-correct>About 6%</li><li>About 50%</li><li>About 76%</li><li>100%</li></ol>
+<div class="explain">Pulling took 76% of start time while only 6.4% of the data was read.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-22" data-topic="§5.6 Images">
+<p class="q">Lazy image pulling (eStargz, SOCI, Nydus) works by:</p>
+<ol class="opts"><li>Compressing images more</li><li data-correct>Starting the container from metadata and fetching file contents on first access</li><li>Deleting unused files</li><li>Running containers without images</li></ol>
+<div class="explain">The image term shrinks to seconds.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-23" data-topic="§5.6 Images">
+<p class="q">Why should model weights usually be kept out of container images?</p>
+<ol class="opts"><li>Registries cannot store large files</li><li data-correct>Images and models then change independently, and weights can use specialised caching and distribution tiers</li><li>Weights are secret</li><li>Containers cannot read weights</li></ol>
+<div class="explain">Baking weights in makes every model update a huge image push and pull.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-24" data-topic="§5.6 Images">
+<p class="q">Ordering image layers with stable CUDA/framework layers at the bottom helps because:</p>
+<ol class="opts"><li>Bottom layers load faster</li><li data-correct>A new engine version changes only the small top layer, so only it must be pulled</li><li>It reduces GPU memory</li><li>Registries require it</li></ol>
+<div class="explain">Layers are content-addressed and cached on nodes.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-25" data-topic="§5.7 Init">
+<p class="q">Which engine start-up work can be cached across starts? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>torch.compile and Triton/JIT kernel compilation</li><li data-correct>Kernel autotuning results</li><li>The KV cache contents of past requests</li><li data-correct>Compiled artefacts keyed by model, engine version, GPU and config</li></ol>
+<div class="explain">Past KV contents are request data, not start-up state (though prefix caches can be persisted separately).</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-26" data-topic="§5.7 Init">
+<p class="q">vLLM's sleep mode:</p>
+<ol class="opts"><li>Turns off the GPU</li><li data-correct>Releases GPU memory while keeping weights in host memory and engine state alive, so it can resume in seconds</li><li>Pauses the network</li><li>Deletes the model</li></ol>
+<div class="explain">Useful for time-sharing GPUs among models or between RL rollouts and training.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-27" data-topic="§5.7 Init">
+<p class="q">Which are caveats of restoring process snapshots of an initialised engine? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Tied to GPU type and driver version</li><li data-correct>Contain the weights, so are large and sensitive</li><li data-correct>Multi-GPU communicators are hard to restore</li><li>They always take longer than a cold start</li></ol>
+<div class="explain">Done well they make start-up a fast byte load.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-28" data-topic="§5.8 Budgets">
+<p class="q">After optimisation, what dominates the remaining cold-start time for a 70B replica on a warm node?</p>
+<ol class="opts"><li>Weight loading</li><li>Image pulling</li><li data-correct>Engine initialisation</li><li>DNS</li></ol>
+<div class="explain">Hence snapshots and warm, sleeping engines.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-29" data-topic="§5.8 Budgets">
+<p class="q">If demand grows by 1.9 replicas' worth per minute, a 15-minute cold start requires roughly how much autoscaling headroom?</p>
+<ol class="opts"><li>2 replicas</li><li>8 replicas</li><li data-correct>29 replicas</li><li>140 replicas</li></ol>
+<div class="explain">\(1.9\times15\approx29\).</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-30" data-topic="§5.8 Budgets">
+<p class="q">For which model are fast loading techniques closest to a prerequisite rather than an optimisation?</p>
+<ol class="opts"><li>Llama 3 8B</li><li>Llama 3 70B</li><li data-correct>DeepSeek-V3</li><li>All equally</li></ol>
+<div class="explain">Naive loading of ≈ 700 GB per replica makes failures and scaling unmanageable.</div>
+</div>
+
+<div class="mcq" data-id="ci05-mcq-31" data-topic="§5.5 Distribution">
+<p class="q">Which is a requirement for chain broadcast over RDMA that a swarm over the front-end does not have?</p>
+<ol class="opts"><li>Safetensors format</li><li data-correct>Source and receivers on a shared back-end fabric, plus a coordinator to build the chain</li><li>Object storage</li><li>Lazy pulling</li></ol>
+<div class="explain">Swarms tolerate churn on ordinary networks.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci05-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Walk through what happens when a new LLM replica starts, with rough times.</summary>
+<div class="answer">
+<p>(1) Obtain a node if none is free: cloud provisions a VM or bare-metal server, boots, joins cluster—minutes. (2) Scheduler places the pod—seconds. (3) Pull the container image (10–20 GB of CUDA, PyTorch, engine)—1–3 minutes naive. (4) Load weights (16 GB for 8B BF16, 70 GB for 70B FP8, ~700 GB for DeepSeek-V3 FP8) from storage—seconds to many minutes depending on tier and parallelism. (5) Engine init: NCCL communicators, KV pool, compilation, autotuning, CUDA graph capture—tens of seconds to minutes. (6) Warm-up and health checks, then the router adds it. Naive total 10–15 min for 70B; optimised 30–60 s on a warm node.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Why did the ecosystem move from pickle checkpoints to safetensors?</summary>
+<div class="answer">
+<p>Security: unpickling executes a program that can call arbitrary Python callables, so loading an untrusted checkpoint can run attacker code; malicious pickles were found on model hubs. Performance: pickle reconstructs tensors through the interpreter, often with copies, and generally needs reading the whole file. Safetensors is an 8-byte header length, a JSON table of tensor names, dtypes, shapes and offsets, and raw aligned bytes—no code, memory-mappable, zero-copy, supporting selective reads of tensors or row ranges, which enables parallel and sharded loading. It was audited in 2023 and is now the default distribution format.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is lazy image pulling and why does it work?</summary>
+<div class="answer">
+<p>Container images are stacks of compressed layers; conventionally all must be downloaded and unpacked before start. Measurements show that pulling dominates start time while only a few percent of the data is read during start-up (6.4% in Harter et al. 2016). Lazy pulling starts the container once file-system metadata is available and fetches file contents on demand (seekable formats like eStargz, Nydus, SOCI indexes, cloud image streaming). The image step drops from minutes to seconds; the cost is some latency on first access to files, which pre-fetching of known-hot files mitigates.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-04">
+<summary><span class="lvl core">Core</span> How fast can you load Llama 3 70B onto an 8-GPU node, and what limits it?</summary>
+<div class="answer">
+<p>70.6 GB in FP8. Path: source → NIC or NVMe → host DRAM → PCIe → HBM. PCIe gives about 50 GB/s per GPU (8 × 50 = 400 GB/s), so it is rarely the limit. From object storage, one stream at 100 MB/s takes 12 min; 64 parallel range reads at about 80 MB/s each give 5 GB/s, about 14 s; higher concurrency is capped by the front-end NIC (200 Gb/s = 25 GB/s, about 3 s) or by the bucket's throughput. From local NVMe RAID-0 (about 25 GB/s): about 3 s. From host DRAM (process restart): under a second. From peers over RDMA (8 × 50 GB/s): about 0.25 s. Use a pre-sharded safetensors checkpoint so each TP rank reads only its 8.8 GB, and a streaming loader that overlaps reads and copies.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-05">
+<summary><span class="lvl core">Core</span> 200 replicas must start at once after a zone failure. How do you get them weights quickly?</summary>
+<div class="answer">
+<p>A central store limited to, say, 50 GB/s aggregate would take \(200\times70/50=280\) s for a 70B model, regardless of NIC speed. Options: (1) node-local NVMe caches pre-populated for all active models (each replica loads at 25 GB/s locally, no contention); (2) peer-to-peer swarm (chunks exchanged among servers; total supply grows with servers; time ≈ W/β + O(log n) chunks); (3) pipelined chain or tree broadcast over the back-end RDMA from running replicas in other zones/pools (time ≈ (W + (n−1)c)/β, under a second for 70 GB at 300 GB/s per server). Combine with pre-pulled images and cached compilation. Also rate-limit and prioritise the most critical models, and make sure caches and sources are not in the failed zone.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-06">
+<summary><span class="lvl core">Core</span> Derive the completion time of a pipelined chain broadcast and its optimal chunk size.</summary>
+<div class="answer">
+<p>\(n\) receivers in a chain, per-hop chunk time \(\alpha+c/\beta\). The last of \(W/c\) chunks leaves the source after \(W/c\) chunk times and needs \(n-1\) more hops: \(T(c)=(W/c+n-1)(\alpha+c/\beta)\). Setting \(dT/dc=-W\alpha/c^2+(n-1)/\beta=0\) gives \(c^*=\sqrt{W\alpha\beta/(n-1)}\) and \(T^*=(\sqrt{W/\beta}+\sqrt{(n-1)\alpha})^2\). For \(W=70\) GB, \(\beta=300\) GB/s, \(\alpha=50\) µs, \(n=255\): \(c^*\approx64\) MB, \(T^*\approx0.36\) s—close to the one-receiver time \(W/\beta=0.23\) s. Same structure as α–β collectives and pipeline bubbles: small chunks fill fast but pay α often.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-07">
+<summary><span class="lvl core">Core</span> Why does a faster cold start save GPUs? Quantify it.</summary>
+<div class="answer">
+<p>An autoscaler must hold headroom to absorb demand growth during one cold start: if demand grows at \(\dot\lambda\) replicas' worth per minute, headroom ≈ \(\dot\lambda t_{\text{cold}}\). With Atlas's ramp of about 1.9 replicas/min, 15 minutes needs about 29 replicas (232 GPUs) of headroom; 35 seconds needs one or two. During failures, degraded time ∝ \(t_{\text{cold}}\), so spare capacity to meet availability shrinks too. If headroom is held all day because scaling is slow, 220 H100s ≈ $4.8M/year at $2.50/GPU-h for one tier. Faster cold starts also enable scale-to-zero for rarely used models and faster, safer rollouts.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-08">
+<summary><span class="lvl core">Core</span> Explain how you would cache models across a GPU fleet.</summary>
+<div class="answer">
+<p>Tiers: object storage (canonical, durable), optional shared file system, node-local NVMe, host DRAM, peer HBM. Policy: when a model is registered for serving, a background agent writes its pre-sharded safetensors to the NVMe of every node in its pool (capacity is tens of TB per node, so catalogues fit); host DRAM keeps weights of models currently loaded on the node so a crashed engine restarts in seconds; cache misses (new or rare models) stream from object storage with high parallelism and seed a swarm. Eviction by LRU with pinning of production models; integrity verified by content hashes; access controlled per tenant. Measure hit rate per tier and cold-start time distribution; alert on cold starts that fall back to object storage for hot models.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> What takes time in engine initialisation, and how do you shorten it?</summary>
+<div class="answer">
+<p>NCCL communicator creation (seconds intra-node, longer multi-node); memory profiling via a dummy forward at max batch to size the KV pool; JIT compilation of Triton/FlashInfer/torch.compile kernels; autotuning; CUDA graph capture for many batch sizes; loading tokenizers and LoRA adapters; warm-up. Shorten by persistent compilation and autotune caches keyed by (model, engine version, GPU, config); precomputing memory sizing; capturing graphs for only the needed batch sizes or lazily; ahead-of-time compiled kernels; keeping engines alive across model swaps (sleep mode); and process snapshots (CRIU plus cuda-checkpoint) restored on new nodes, tied to GPU type and driver. Measure each phase in start-up logs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Compare star, swarm and chain distribution for model weights. When would you use each?</summary>
+<div class="answer">
+<p>Star: every node fetches from the central store; simple, robust; time ≈ max(W/β_client, nW/β_svc), linear in n once the store's aggregate limit binds—fine for few nodes or small models. Swarm (BitTorrent-like, Kraken, Dragonfly): chunks exchanged among nodes over the front-end; every node's upload adds supply; time ≈ W/β + O(log n) chunk times; tolerates churn and heterogeneous networks; needs a tracker or coordinator. Chain/tree broadcast over back-end RDMA from running replicas: time ≈ (W + (n−1)c)/β with β of hundreds of GB/s; fastest, but requires shared fabric, a coordinator to build chains, and a live source; fragile if a node in the chain fails (use trees or re-routing). Use star for small scale, swarm as the general mechanism, chain for large models and bursty scale-ups within a fabric.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Your platform must support scale-to-zero for thousands of fine-tuned 8B models. What does the cold-start path look like?</summary>
+<div class="answer">
+<p>Requirement: a request for an idle model should get its first token within a few seconds. Approach: keep a warm pool of GPUs running the base engine (image pulled, compiled, graphs captured); store fine-tunes as LoRA adapters where possible (tens to hundreds of MB, loadable in milliseconds into a running multi-LoRA engine—no cold start at all). For full fine-tunes, cache popular ones on NVMe, keep recently used ones in host DRAM, and swap weights into a sleeping engine (load 16 GB from DRAM over PCIe in well under a second; from NVMe in about a second; from object storage with parallel streams in about 3 s). Route by cache locality: send the request to a node that already has the weights in DRAM or NVMe. Queue the request during load and stream once ready; set SLOs that distinguish warm and cold paths; evict by LRU with per-tenant quotas.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-12">
+<summary><span class="lvl design">Design</span> Design the weight-distribution system for a fleet serving DeepSeek-V3 in three regions.</summary>
+<div class="answer">
+<p>Canonical copy: pre-sharded safetensors (FP8, about 700 GB, laid out per EP/TP rank) in object storage in each region, replicated cross-region on publish with integrity hashes and signatures. Regional: a cache agent on every node of the DeepSeek pools pre-populates NVMe with the current and next versions. Scale-up and recovery: new nodes fetch from peers over back-end RDMA via chain or tree broadcast coordinated by a distribution service; fall back to swarm over front-end and then to object storage. Rollouts: pre-stage new weights on NVMe before switching, so cutover is a fast local load; keep the old version cached for rollback. Monitor cold-start phases, cache hit rates, store throughput; protect the weights (encryption at rest, access control, audit) since they are valuable IP (Chapter 14).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-13">
+<summary><span class="lvl design">Design</span> A new engine version must be rolled out to 2,000 replicas without affecting availability. How do image and weight handling affect the plan?</summary>
+<div class="answer">
+<p>Keep weights out of the image so only the engine image changes; structure image layers so the new version changes only a small top layer; pre-pull the new image onto all nodes in the background before the rollout (or use lazy pulling with pre-fetch of hot files). Pre-warm compilation caches for the new version on a canary node per GPU type and publish them. Roll out progressively by failure domain (Chapter 13): drain a replica, restart with the new image (weights from local DRAM or NVMe: seconds), run warm-up and health checks, compare metrics with old replicas, continue. Keep the old image cached for fast rollback. With these, each replica's restart takes tens of seconds instead of many minutes, so capacity loss during the rollout is small.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-14">
+<summary><span class="lvl core">Core</span> Why does pre-sharding a checkpoint for tensor parallelism matter?</summary>
+<div class="answer">
+<p>Each TP rank holds a slice of each weight matrix. If the checkpoint stores full tensors and the loader cannot read slices selectively (pickle), every rank reads the entire checkpoint and discards most of it: a TP8 replica reads 8× the model size, competing for storage and NIC bandwidth. Safetensors allows reading byte ranges of row-sharded tensors, but column shards are strided. Pre-sharding re-saves the model once in the serving layout, one contiguous file per rank, so each rank reads exactly its \(1/n_{\text{TP}}\) share sequentially—e.g. 17.5 GB instead of 140 GB per rank for a BF16 70B model at TP8—and loads become embarrassingly parallel.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> When is GPUDirect Storage worth it, and when not?</summary>
+<div class="answer">
+<p>GDS lets NVMe (and some network file systems) DMA directly into GPU memory, avoiding the host bounce buffer and CPU copies. It helps when the host's memory bandwidth or CPU is the bottleneck—many GPUs loading simultaneously from fast local NVMe or a parallel file system, or when host memory is busy with other work—and reduces CPU usage and latency. It matters less when the bottleneck is upstream (object storage throughput, front-end NIC), when loads are rare and small, when the storage stack does not support it, or when weights are already in host DRAM (then a pinned-memory copy is equally fast). It also requires driver and file-system support and alignment constraints. Measure the slowest link first.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci05-qa-16">
+<summary><span class="lvl design">Design</span> How would you cut the cold start of an 8B model to under five seconds on a node that has never served it?</summary>
+<div class="answer">
+<p>Remove node provisioning with a warm pool; pre-pull the base engine image on all pool nodes; keep a sleeping or idle base engine with compiled kernels and captured graphs for the 8B architecture; distribute the weights in pre-sharded FP8 safetensors (about 8 GB) to node NVMe when registered, or stream from peers over RDMA (well under a second) or from object storage with high parallelism (about 2–3 s at 5 GB/s); load into the waiting engine's memory without re-initialising; run a minimal warm-up. Alternatively restore a snapshot of an initialised engine for that model. If the model is a LoRA fine-tune of an already-running base, load the adapter into the running engine (milliseconds).</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-safetensors">Hugging Face. safetensors: a simple, safe way to store and distribute tensors. 2022. <a href="https://github.com/huggingface/safetensors">github.com/huggingface/safetensors</a>; Trail of Bits security audit, 2023.</li>
+<li id="r-serverlessllm">Y. Fu et al. ServerlessLLM: Low-Latency Serverless Inference for Large Language Models. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2401.14351">arXiv:2401.14351</a>.</li>
+<li id="r-slacker">T. Harter et al. Slacker: Fast Distribution with Lazy Docker Containers. <em>FAST</em>, 2016.</li>
+<li>W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+<li>B. Cohen. Incentives Build Robustness in BitTorrent. <em>Workshop on Economics of Peer-to-Peer Systems</em>, 2003.</li>
+<li>Uber Engineering. Kraken: a P2P-powered Docker registry. 2019; CNCF Dragonfly project documentation.</li>
+<li>Run:ai (NVIDIA). Run:ai Model Streamer. 2024. <a href="https://github.com/run-ai/runai-model-streamer">github.com/run-ai/runai-model-streamer</a>.</li>
+<li>NVIDIA. GPUDirect Storage Design Guide; <code>cuda-checkpoint</code> utility, 2024.</li>
+<li>Amazon Web Services. Seekable OCI (SOCI) snapshotter, 2022; containerd stargz-snapshotter (eStargz) documentation.</li>
+<li>R. Thakur, R. Rabenseifner, W. Gropp. Optimization of Collective Communication Operations in MPICH. <em>IJHPCA</em> 19(1), 2005.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

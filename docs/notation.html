@@ -241,6 +241,13 @@
 <tr><td>\(H\), \(r\)</td><td>number of hosts on a fabric; link rate per host</td></tr>
 <tr><td>\(n_f\), \(n_{\text{path}}\), \(c_{\max}\)</td><td>flows in a collective step; equal-cost paths; largest number of flows on one path</td></tr>
 </tbody></table></div>
+<h2>Storage and cold starts (Vol. II Ch. 5)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(t_{\text{cold}}\)</td><td>cold-start time of a replica \(=t_{\text{node}}+t_{\text{sched}}+t_{\text{image}}+t_{\text{weights}}+t_{\text{init}}+t_{\text{warm}}\)</td></tr>
+<tr><td>\(W_{\text{bytes}}\)</td><td>bytes of model weights, \(Nb_w\) (\(W\) alone in Ch. 5 propositions; never the waiting time \(W\) when ambiguous)</td></tr>
+<tr><td>\(n_{\text{conn}}\), \(\beta_{\text{conn}}\), \(\beta_{\text{NIC}}\), \(\beta_{\text{svc}}\)</td><td>concurrent storage requests; throughput of one; client NIC bandwidth; service-side limit</td></tr>
+<tr><td>\(c\)</td><td>chunk size of a pipelined transfer or broadcast (bytes)</td></tr>
+</tbody></table></div>
 </div>
 </body>
 </html>
