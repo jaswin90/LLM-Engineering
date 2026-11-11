@@ -316,7 +316,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 11 | The Front Door: Gateways, Streaming and Rate Limits | ✅ v1 |
 | 12 | Multi-Region Serving and Disaster Recovery | ✅ v1 |
 | 13 | Reliability Engineering for AI Services | ✅ v1 |
-| 14 | Security, Isolation and Multi-Tenancy | ⏳ |
+| 14 | Security, Isolation and Multi-Tenancy | ✅ v1 |
 | 15 | Serving Multimodal Models | ⏳ |
 | 16 | Embeddings, Retrieval and Vector Search at Scale | ⏳ |
 | 17 | Agents and Compound AI Systems | ⏳ |

@@ -317,3 +317,8 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(\mathcal A\), MTBF, MTTR | availability; mean time between failures; mean time to repair |
 | \(\epsilon_{\text{SLO}}\), \(T_{\text{win}}\), \(\varrho_b\) | error budget (allowed bad fraction); SLO window; burn rate (not the importance ratio \(\varrho_t\)) |
 | \(e_0\), \(e_1\), \(n\) (Ch. 13 only) | baseline and regressed error rates; canary requests needed |
+
+## Security (Vol. II Ch. 14)
+| Symbol | Meaning |
+|---|---|
+| \(p_c\), \(k\) (Ch. 14 only) | probability a single timing probe is classified correctly; probes per guess |

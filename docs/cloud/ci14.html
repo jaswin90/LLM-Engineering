@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 14 · Security, Isolation and Multi-Tenancy — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 14 of Cloud AI Infrastructure: threat models for LLM services; isolation layers from processes and containers to VMs, MIG and confidential computing; side channels in shared serving including prompt-cache timing and token-length leaks; protecting model weights; securing the model supply chain; data protection and retention; prompt injection as an infrastructure problem; and abuse and resource-exhaustion attacks.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci14" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part IV · The Global Request Path — Chapter 14</div>
+<h1 id="top">Security, Isolation and Multi-Tenancy</h1>
+<p class="lede">An LLM service holds some of the most sensitive data its customers have—their documents, code, conversations and secrets—and some of the most valuable software ever written, its model weights, and it serves many mutually distrusting tenants on shared GPUs that batch their requests together. This chapter builds a threat model for such a service and works through its defences: isolation from processes to confidential computing, side channels unique to shared LLM serving, protection of weights, the model supply chain, data protection, prompt injection and abuse.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Security in conventional cloud services is a mature discipline with well-known controls: authentication, authorisation, encryption, network segmentation, patching, monitoring. All of it applies to LLM services, and none of it is repeated at length here. What this chapter adds are the threats and defences that are <em>specific</em> to serving large models, and that infrastructure engineers—rather than security specialists—are expected to understand because they arise from the architecture of Volume I. Continuous batching puts different tenants' requests into the same forward pass. Prefix caching shares computation across requests, and sharing creates side channels. Token streaming leaks information through packet sizes. Model weights are large, valuable files that must be copied to thousands of machines. Model artefacts can carry executable code. And the model itself can be instructed by its inputs, so that a document retrieved on a user's behalf can try to take over the session.</p>
+<p>These issues reach interviews in several forms: as design constraints ("tenants must not be able to learn each other's prompts—what does that rule out?"), as debugging questions ("a researcher showed they could tell whether another user had sent a prompt; how?"), and as architecture questions ("how would you protect model weights from an insider?", "how do you safely load a model a customer uploads?"). The answers combine systems knowledge with a clear statement of the threat model, which is where we begin.</p>
+<p>We set out assets, adversaries and attack surfaces (§14.1), then the layers of isolation available and what each protects (§14.2). We examine side channels in shared serving (§14.3), the protection of weights (§14.4), the supply chain (§14.5), data protection (§14.6), prompt injection (§14.7) and abuse and resource attacks (§14.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>State a threat model for an LLM service: assets, adversaries and attack surfaces.</li>
+<li>Compare isolation mechanisms (containers, sandboxes, VMs, MIG, confidential computing, separate cells) by strength and cost, and explain what batching implies for tenant isolation.</li>
+<li>Explain prompt-cache timing and token-length side channels, estimate how easily they are exploited, and choose mitigations.</li>
+<li>Describe controls for protecting model weights at rest, in transit and in use, and the role of security levels such as SL1–SL5.</li>
+<li>Secure the model supply chain: formats, signing, provenance and remote code.</li>
+<li>Design data-protection, prompt-injection and abuse defences at the infrastructure level.</li>
+</ol>
+<p class="small muted">Uses: Chapter 3 (MIG), Chapter 5 (formats, caching), Chapter 6 (containers), Chapter 11 (rate limits), Chapter 12 (residency); Vol. I Chapter 10 (prefix caching), Chapter 12 (engines).</p>
+</div>
+
+<h2 id="s14-1">14.1 A threat model for an LLM service</h2>
+<p>A threat model answers three questions: what are we protecting, from whom, and where can they attack? For an LLM service the <strong>assets</strong> are, first, customer data—prompts, uploaded files, retrieved documents, outputs, conversation histories, fine-tuning datasets, and everything derived from them, including KV caches and logs. Second, the provider's <strong>model weights</strong>, which can represent hundreds of millions of dollars of training compute and whose theft would let an attacker serve, modify or remove the safety training of the model. Third, <strong>system prompts and configuration</strong>, which encode product behaviour and sometimes secrets. Fourth, <strong>compute</strong>: GPUs are valuable enough that attackers abuse free tiers and stolen credentials to use them. Fifth, <strong>availability and integrity</strong> of the service itself.</p>
+<p>The <strong>adversaries</strong> range from opportunistic to sophisticated: external attackers probing the API; <em>malicious tenants</em>, who are legitimate customers of the same service and therefore already inside the multi-tenant boundary; compromised or malicious <em>insiders</em> with operational access; attackers who compromise the <em>supply chain</em> of models, containers and dependencies; and, for frontier model weights, well-resourced groups up to nation-state level. The <strong>attack surfaces</strong>, sketched in Figure 14.1, are the API and gateway; the engine and its shared state (batches, caches); storage of weights, logs and conversations; the control plane and its credentials; the build and supply chain; and, uniquely, the model's inputs themselves, which can contain instructions.</p>
+
+<figure class="diagram" id="fig-14-1">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="Attack surfaces of an LLM service">
+<rect x="15" y="20" width="690" height="245" rx="12" class="bx"/>
+<rect x="35" y="40" width="130" height="60" rx="8" class="bx4"/><text x="100" y="64" text-anchor="middle" class="t-xs t-b">API + gateway</text><text x="100" y="80" text-anchor="middle" class="t-xs">credential theft, abuse,</text><text x="100" y="92" text-anchor="middle" class="t-xs">resource exhaustion</text>
+<rect x="185" y="40" width="160" height="60" rx="8" class="bx2"/><text x="265" y="64" text-anchor="middle" class="t-xs t-b">engine shared state</text><text x="265" y="80" text-anchor="middle" class="t-xs">batches, prefix/KV caches:</text><text x="265" y="92" text-anchor="middle" class="t-xs">side channels, leaks</text>
+<rect x="365" y="40" width="160" height="60" rx="8" class="bx2"/><text x="445" y="64" text-anchor="middle" class="t-xs t-b">model inputs</text><text x="445" y="80" text-anchor="middle" class="t-xs">prompt injection via</text><text x="445" y="92" text-anchor="middle" class="t-xs">documents, tools, web</text>
+<rect x="545" y="40" width="145" height="60" rx="8" class="bx4"/><text x="617" y="64" text-anchor="middle" class="t-xs t-b">network streams</text><text x="617" y="80" text-anchor="middle" class="t-xs">token-length leaks</text><text x="617" y="92" text-anchor="middle" class="t-xs">through packet sizes</text>
+<rect x="35" y="120" width="160" height="60" rx="8" class="bx3"/><text x="115" y="144" text-anchor="middle" class="t-xs t-b">storage</text><text x="115" y="160" text-anchor="middle" class="t-xs">weights, logs, threads,</text><text x="115" y="172" text-anchor="middle" class="t-xs">files, fine-tune data</text>
+<rect x="215" y="120" width="160" height="60" rx="8" class="bx3"/><text x="295" y="144" text-anchor="middle" class="t-xs t-b">control plane</text><text x="295" y="160" text-anchor="middle" class="t-xs">credentials, config,</text><text x="295" y="172" text-anchor="middle" class="t-xs">deployment pipeline</text>
+<rect x="395" y="120" width="140" height="60" rx="8" class="bx5"/><text x="465" y="144" text-anchor="middle" class="t-xs t-b">supply chain</text><text x="465" y="160" text-anchor="middle" class="t-xs">models, images,</text><text x="465" y="172" text-anchor="middle" class="t-xs">dependencies, kernels</text>
+<rect x="555" y="120" width="135" height="60" rx="8" class="bx5"/><text x="622" y="144" text-anchor="middle" class="t-xs t-b">insiders</text><text x="622" y="160" text-anchor="middle" class="t-xs">operator access to</text><text x="622" y="172" text-anchor="middle" class="t-xs">data and weights</text>
+<text x="360" y="208" text-anchor="middle" class="t-sm t-b">Adversaries: external attackers · malicious tenants · insiders · supply-chain attackers · nation-states (weights)</text>
+<text x="360" y="232" text-anchor="middle" class="t-xs">Assets: customer data and derivatives · model weights · system prompts · compute · availability and integrity</text>
+<text x="360" y="252" text-anchor="middle" class="t-xs">Highlighted (orange) surfaces are specific to LLM serving; the rest are familiar cloud surfaces with LLM-specific twists.</text>
+</svg>
+<figcaption><b>Figure 14.1 — Where an LLM service can be attacked.</b> Shared engine state, model inputs and token streams are surfaces that ordinary web services do not have; storage, control plane, supply chain and insiders are familiar surfaces holding unusually valuable assets.</figcaption>
+</figure>
+
+<p>Figure 14.1's most important entry for infrastructure design is the malicious tenant. A multi-tenant LLM service puts many customers' requests on the same GPUs, in the same engine process, often in the same batch and sharing the same caches. The isolation between them is therefore not provided by hardware or the operating system but by the correctness of the engine's software—its memory management, its cache keys, its scheduling. The rest of this chapter is largely about how strong that isolation is and how to strengthen it where needed.</p>
+
+<h2 id="s14-2">14.2 Layers of isolation</h2>
+<p>Isolation mechanisms form a ladder, from cheap and weak to expensive and strong, and Figure 14.2 arranges them. At the bottom, <strong>logical isolation within one engine</strong>: requests from different tenants share a process, GPU memory and batches, and are separated only by the engine's bookkeeping—separate KV blocks, separate sequence state, cache keys that include the tenant where caches should not be shared. This is what makes multi-tenant serving efficient (Vol. I Chapter 27), and it is adequate when the engine is correct and tenants are not adversarial towards each other's data. Above it, <strong>separate processes or containers</strong> on the same GPU, sharing it by time-slicing or MPS (§3.4): the operating system and driver separate address spaces, but GPU memory may not be scrubbed between users, and side channels through shared hardware remain. Then <strong>MIG partitions</strong>, which give each tenant hardware-isolated compute, cache and memory slices. Then <strong>separate GPUs or nodes</strong>, and <strong>separate virtual machines</strong> with their own kernels. At the top, <strong>confidential computing</strong> and <strong>separate cells, clusters or accounts</strong>.</p>
+
+<figure class="diagram" id="fig-14-2">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="Isolation ladder for multi-tenant LLM serving">
+<rect x="20" y="230" width="440" height="34" rx="6" class="bx"/><text x="30" y="251" class="t-xs t-b">shared engine, shared batch (logical isolation)</text>
+<rect x="60" y="192" width="440" height="34" rx="6" class="bx"/><text x="70" y="213" class="t-xs t-b">separate processes / containers on one GPU (time-slice, MPS)</text>
+<rect x="100" y="154" width="440" height="34" rx="6" class="bx4"/><text x="110" y="175" class="t-xs t-b">MIG partitions (hardware slices of SMs, cache, memory)</text>
+<rect x="140" y="116" width="440" height="34" rx="6" class="bx4"/><text x="150" y="137" class="t-xs t-b">dedicated GPUs / nodes; sandboxed or separate VMs</text>
+<rect x="180" y="78" width="440" height="34" rx="6" class="bx2"/><text x="190" y="99" class="t-xs t-b">confidential computing: CPU TEE + GPU CC mode, attestation</text>
+<rect x="220" y="40" width="440" height="34" rx="6" class="bx2"/><text x="230" y="61" class="t-xs t-b">separate cells, clusters or cloud accounts per tenant</text>
+<text x="690" y="60" text-anchor="end" class="t-xs">strongest,</text><text x="690" y="74" text-anchor="end" class="t-xs">costliest</text>
+<text x="690" y="245" text-anchor="end" class="t-xs">cheapest,</text><text x="690" y="259" text-anchor="end" class="t-xs">most efficient</text>
+<text x="20" y="25" class="t-xs">Each step up removes a class of shared state (batch, memory, cache, kernel, operator access) at the cost of utilisation.</text>
+</svg>
+<figcaption><b>Figure 14.2 — The isolation ladder.</b> Moving up removes shared state that could leak or be attacked—shared batches and caches, shared GPU memory, a shared kernel, operator visibility—but also removes the sharing that makes LLM serving efficient. Most tenants sit near the bottom; regulated or high-value tenants pay for rungs higher up.</figcaption>
+</figure>
+
+<p><strong>Confidential computing</strong> deserves explanation because it addresses a threat the other rungs do not: the provider itself. A <em>trusted execution environment</em> (TEE) is hardware that runs code in encrypted, integrity-protected memory that even the host operating system, hypervisor and administrators cannot read, and that can prove—by <em>remote attestation</em>, a signed report of exactly what code and configuration are running—to a remote party that it is genuine. CPU TEEs such as AMD SEV-SNP and Intel TDX protect a whole virtual machine. The H100 was the first GPU with a confidential-computing mode: in it, the GPU's memory is protected from the host, data moving between the CPU TEE and the GPU over PCIe is encrypted, and the GPU participates in attestation; Blackwell extended the capabilities and reduced the performance cost. With CPU and GPU together, a customer can verify that its prompts are processed only by attested code, inside hardware the provider's own staff cannot inspect, which matters for regulated data and for protecting model weights in use (§14.4). The costs are throughput (encryption of CPU–GPU transfers, which hurts most for I/O-heavy workloads), operational complexity (attestation services, key release policies) and reduced sharing, since a TEE is a single trust domain.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — where confidential computing costs performance</div>
+<p><strong>What is encrypted.</strong> In GPU confidential-computing mode, data crossing PCIe between the CPU's trusted VM and the GPU is encrypted and passes through bounce buffers; data inside GPU memory, and GPU-to-GPU traffic inside the protected domain, run at normal speed once loaded.</p>
+<p><strong>Decode.</strong> A decode step moves only token IDs in and logits or sampled tokens out—kilobytes per step—across PCIe, while reading tens of gigabytes from HBM. The encryption overhead is therefore a small fraction of each step; benchmark studies of H100 confidential computing reported single-digit percentage overheads for typical LLM inference, larger for very short requests where fixed per-request costs dominate<span class="cite"><a href="#r-ccbench">[9]</a></span>.</p>
+<p><strong>Weight loading.</strong> Loading 70 GB of weights through encrypted bounce buffers at, say, 5 GB/s instead of 50 GB/s over PCIe takes about 14 s instead of 1.4 s—a longer cold start (Chapter 5), but paid once per replica.</p>
+<p><strong>Host-memory KV offload.</strong> Workloads that move KV blocks between GPU and host memory continuously (Vol. I §10.7) pay the encryption cost on every transfer, and can slow markedly. Inside a TEE, keeping KV in HBM and avoiding host offload is the better design.</p>
+</div>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — isolation as noninterference</div>
+<p>Security researchers formalise isolation as <em>noninterference</em>: a system is noninterfering for tenants \(\mathsf A\) and \(\mathsf B\) if everything \(\mathsf B\) can observe—outputs, but also timings, error messages, resource availability—is a function of \(\mathsf B\)'s own inputs alone, independent of \(\mathsf A\)'s. Formally, for any two input histories that agree on \(\mathsf B\)'s inputs, \(\mathsf B\)'s observations have the same distribution. Correct outputs are easy to make noninterfering in an LLM engine: each sequence's tokens depend only on its own prompt (up to the floating-point nondeterminism of batching, Vol. I §4.7, which is itself a tiny interference). Timing is the hard part. When requests share a batch, one tenant's long prompt delays another's tokens; when they share a cache, one tenant's earlier request makes another's faster. Any shared resource whose state depends on \(\mathsf A\) and affects \(\mathsf B\)'s timing is a potential channel, and its capacity—how many bits per observation \(\mathsf B\) can learn about \(\mathsf A\)—is the quantity to bound.</p>
+</div>
+
+<h2 id="s14-3">14.3 Side channels in shared serving</h2>
+<p>The most instructive LLM-specific vulnerability is the <strong>prompt-cache timing side channel</strong>. Prefix caching (Vol. I Chapter 10) makes a request whose prefix is already cached much faster: a 2,000-token prompt whose first 1,800 tokens are cached might have a TTFT of 30 ms instead of 110 ms. If the cache is shared across tenants, then an attacker who sends a guessed prefix and observes a short TTFT learns that <em>someone</em> recently sent that prefix. Repeating with guesses that extend one block at a time, an attacker can in principle reconstruct parts of another user's prompt, or confirm whether a particular document was recently submitted. Figure 14.3 shows the attack.</p>
+
+<figure class="diagram" id="fig-14-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Prompt-cache timing side channel">
+<defs><marker id="a143" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="30" width="140" height="56" rx="8" class="bx3"/><text x="85" y="52" text-anchor="middle" class="t-xs t-b">victim (tenant A)</text><text x="85" y="68" text-anchor="middle" class="t-xs">"Acme Q3 merger with</text><text x="85" y="80" text-anchor="middle" class="t-xs">Zenith at $41/share…"</text>
+<rect x="15" y="160" width="140" height="56" rx="8" class="bx2"/><text x="85" y="182" text-anchor="middle" class="t-xs t-b">attacker (tenant B)</text><text x="85" y="198" text-anchor="middle" class="t-xs">probes guessed prefixes,</text><text x="85" y="210" text-anchor="middle" class="t-xs">measures TTFT</text>
+<rect x="260" y="85" width="190" height="90" rx="10" class="bx4"/><text x="355" y="108" text-anchor="middle" class="t-xs t-b">shared prefix cache</text><text x="355" y="126" text-anchor="middle" class="t-xs">key = hash(block tokens)</text><text x="355" y="142" text-anchor="middle" class="t-xs">(no tenant in key)</text><text x="355" y="160" text-anchor="middle" class="t-xs">hit → fast TTFT</text>
+<line x1="155" y1="58" x2="258" y2="105" class="ln" marker-end="url(#a143)"/>
+<line x1="155" y1="188" x2="258" y2="155" class="ln ln-s2" marker-end="url(#a143)"/>
+<rect x="500" y="40" width="205" height="80" rx="8" class="bx"/><text x="602" y="62" text-anchor="middle" class="t-xs t-b">guess "…with Zenith at $41"</text><text x="602" y="80" text-anchor="middle" class="t-xs">TTFT 31 ms → cache hit</text><text x="602" y="96" text-anchor="middle" class="t-xs">→ someone sent this prefix</text>
+<rect x="500" y="140" width="205" height="80" rx="8" class="bx"/><text x="602" y="162" text-anchor="middle" class="t-xs t-b">guess "…with Zenith at $39"</text><text x="602" y="180" text-anchor="middle" class="t-xs">TTFT 108 ms → miss</text><text x="602" y="196" text-anchor="middle" class="t-xs">→ not sent recently</text>
+<line x1="450" y1="115" x2="498" y2="80" class="ln" marker-end="url(#a143)"/><line x1="450" y1="145" x2="498" y2="180" class="ln" marker-end="url(#a143)"/>
+<text x="360" y="245" text-anchor="middle" class="t-xs">Fix: include the tenant (or a per-tenant salt) in cache keys; share only explicitly public prefixes; consider block sizes and timing noise.</text>
+</svg>
+<figcaption><b>Figure 14.3 — Learning another tenant's prompt through cache timing.</b> When cache keys depend only on token content, a hit for a guessed prefix reveals that some other request contained it. Extending guesses block by block can reconstruct structured secrets such as numbers or names drawn from a small set.</figcaption>
+</figure>
+
+<p>This is not hypothetical. Researchers demonstrated timing side channels in LLM serving systems that share KV and semantic caches in 2024<span class="cite"><a href="#r-earlybird">[1]</a></span>, and an audit of prompt caching in commercial LLM APIs in 2025 found that several providers shared cached prompts across users, measurably so from outside, before some changed their policies<span class="cite"><a href="#r-audit">[2]</a></span>. How practical the attack is depends on how separable the cached and uncached timing distributions are. Network jitter and load blur them, but an attacker can repeat probes: with \(k\) independent probes each classified correctly with probability \(p_c\), a majority vote is correct with probability \(\sum_{j>k/2}\binom kjp_c^{\,j}(1-p_c)^{k-j}\), which approaches one quickly. Figure 14.4 shows how few probes suffice.</p>
+
+<figure class="chart" id="fig-14-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Attacker's accuracy in deciding 'cached or not' by majority vote over repeated probes","height":320,
+ "x":{"label":"Probes per guess, k (log)","log":true,"min":1,"max":55,"ticks":[1,3,5,9,15,25,51]},
+ "y":{"label":"Probability the decision is correct","min":0.55,"max":1,"fmt":"pct","ticks":[0.6,0.7,0.8,0.9,1]},
+ "series":[
+  {"name":"Clear separation (single-probe accuracy 90%)","color":"s2","points":[[1,0.9],[3,0.972],[5,0.991],[9,0.999],[15,1.0],[25,1.0],[51,1.0]]},
+  {"name":"Noisy (70%)","color":"s4","points":[[1,0.7],[3,0.784],[5,0.837],[9,0.901],[15,0.95],[25,0.983],[51,0.999]]},
+  {"name":"Very noisy (60%)","color":"s1","points":[[1,0.6],[3,0.648],[5,0.683],[9,0.733],[15,0.787],[25,0.846],[51,0.926]]}
+ ]}
+</script>
+<figcaption><b>Figure 14.4 — Noise slows a timing attack but does not stop it.</b> Even when a single probe is only 60–70% reliable, a few dozen probes make the decision nearly certain. Mitigations must therefore remove the dependence of timing on other tenants' data, not merely add noise. (Each probe may itself populate the cache, so careful attacks probe once per fresh guess or across many accounts; the principle is the same.)</figcaption>
+</figure>
+
+<p>The mitigations follow from the noninterference view. The decisive one is to <strong>scope caches by tenant</strong>: include the tenant identifier, or a per-tenant secret salt, in the hash that keys each cache block, so that one tenant's requests can only ever hit blocks created by the same tenant. Sharing across tenants should be limited to prefixes that are public by construction—a provider's own published system prompt, a standard tool description—and marked as such. Within a tenant, organisations may want finer scoping (per user or per project) when their own users must not learn each other's prompts. Larger cache block sizes make block-by-block reconstruction coarser but do not remove the channel. Adding random delay to TTFT reduces each probe's accuracy but, as Figure 14.4 shows, must be large to matter, and it costs every user latency. Scoping costs some cache hits—cross-tenant sharing of common prefixes is lost—but for most traffic the dominant reuse is within a tenant's own conversations and system prompts, so the efficiency cost is modest.</p>
+<div class="box example">
+<div class="box-title">Worked example — what tenant-scoped caching costs Atlas</div>
+<p><strong>Where Atlas's cache hits come from.</strong> Of the 1,200 cached tokens in a typical 70B request (Chapter 1), suppose about 300 are Atlas's own published tool and safety preamble, identical for every tenant; about 400 are the tenant's own system prompt; about 450 are the conversation's history; and about 50 are boilerplate that different tenants happen to share (a popular framework's default instructions).</p>
+<p><strong>Scoping.</strong> With tenant-salted cache keys, the provider's preamble is explicitly marked public and stays shared; the tenant's system prompt and history were only ever reused within the tenant; only the 50 tokens of accidental cross-tenant reuse are lost. Uncached tokens per request rise from 800 to 850, about 6% more prefill.</p>
+<p><strong>Capacity.</strong> At 3,500 requests/s, 50 extra tokens each is \(1.75\times10^{5}\) prefill tokens/s, seven replica-equivalents of prefill at 25,000 tokens/s each; but decode binds for this tier (Chapter 1), so the fleet does not grow at all.</p>
+<p><strong>Lesson.</strong> Closing the cross-tenant channel is nearly free when the provider's own shared prompts are deliberately marked public, because almost all valuable reuse is within a tenant.</p>
+</div>
+
+<p>A second LLM-specific channel lives in the network. Token streaming sends each token, or small group of tokens, in its own encrypted record, and encryption hides content but not length. Because tokens are short and their lengths vary, the sequence of record sizes leaks the sequence of token lengths, and researchers showed in 2024 that a passive observer of encrypted traffic to AI assistants could use those lengths, with a model trained to invert them, to reconstruct a substantial fraction of responses' content<span class="cite"><a href="#r-keylog">[3]</a></span>. Providers mitigated it by <strong>padding</strong> streamed events to fixed or random sizes and by coalescing tokens into larger events (§11.2), which also saves overhead. The lesson generalises: any observable—time, size, error type, resource availability—that depends on secret data is a potential channel, and LLM serving creates new ones.</p>
+<p>A third class involves <strong>GPU memory</strong>. GPUs historically did not guarantee that memory freed by one process was cleared before another process received it, and a 2024 disclosure ("LeftoverLocals") showed that on several vendors' GPUs one process could read another's leftover on-chip local memory, including fragments of an LLM's computations<span class="cite"><a href="#r-leftover">[4]</a></span>. Vendors patched the affected drivers, and data-centre GPUs in MIG mode or with memory scrubbing between tenants are not exposed in the same way, but the principle stands: when GPUs are shared across trust boundaries at the process level, memory must be cleared between tenants, and hardware partitioning or dedicated devices are the stronger choice.</p>
+
+<details class="drill">
+<summary>Drill 14.1 — How fast can a cache attack extract a secret?</summary>
+<p>A victim's prompt contains a six-digit account number at a known position after a known prefix. The service shares prefix caches across tenants with a 16-token block size, and a digit is one token. An attacker can make 10 probes per second. How many probes are needed to recover the number if each probe is 90% reliable and the attacker uses 5 probes per guess? What changes with tenant-scoped caches?</p>
+<p><em>Solution.</em> With 16-token blocks, a cache hit requires the whole block to match, so the attacker must guess the six digits together (plus the ten known tokens of the block): up to \(10^{6}\) candidates. At 5 probes per guess, the expected work is about \(2.5\times10^{6}\) probes, roughly three days at 10 per second—feasible for a determined attacker using many accounts in parallel. If the block boundary happened to fall so that digits could be guessed in smaller groups, it would be far faster. With tenant-scoped caches, the attacker's probes can only hit blocks created by the attacker's own requests, so the channel is closed regardless of block size.</p>
+</details>
+
+<h2 id="s14-4">14.4 Protecting model weights</h2>
+<p>For a frontier model provider, the weights are the crown jewels: the product of training runs that cost hundreds of millions of dollars, and an asset whose theft would let an attacker serve the model without paying for it, study it for weaknesses, or fine-tune away its safety training. Open-weight models need no such protection, but closed models do, and the infrastructure that serves them must copy the weights to thousands of GPUs across many regions (Chapter 5)—each copy a potential point of theft. A 2024 RAND Corporation study of securing AI model weights catalogued dozens of attack vectors, from exploiting vulnerabilities in serving software to insider threats, supply-chain compromise and physical access, and proposed security levels SL1 through SL5, corresponding to defences adequate against progressively more capable attackers, from amateurs to the most capable nation-state operations<span class="cite"><a href="#r-rand">[5]</a></span>.</p>
+<p>The controls fall into four groups. <em>Access</em>: least privilege, so that only the serving system—not engineers' laptops—can read weights; two-person rules for any human access; short-lived credentials; and complete audit logs. <em>Encryption</em>: weights encrypted at rest with keys in hardware security modules or a key-management service, decrypted only inside the serving process, and encrypted in transit between storage, caches and nodes. <em>Exposure reduction</em>: fewer copies in fewer places, weights loaded directly into GPU memory rather than staged on disk where possible, and caches (§5.5) treated as part of the protected perimeter. <em>Confidential computing</em>: running the serving stack inside attested TEEs with GPU confidential-computing mode, so that weights are decrypted only inside hardware that the host and its operators cannot inspect, and keys are released only to attested code.</p>
+<p>One quantitative property of weights works in the defender's favour: they are large. Exfiltrating them requires moving tens to thousands of gigabytes out of the environment, and egress can be monitored and rate-limited. Figure 14.5 shows the time needed to move weights of various sizes at various egress rates. A serving environment whose nodes have no general internet egress, and whose permitted egress is capped and monitored, turns weight theft from a quick copy into a long, conspicuous transfer.</p>
+
+<figure class="chart" id="fig-14-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Time to exfiltrate model weights at a sustained egress rate","height":320,
+ "x":{"label":"Sustained egress rate (Gb/s, log)","log":true,"min":0.1,"max":100,"ticks":[0.1,1,10,100]},
+ "y":{"label":"Hours (log)","log":true,"min":0.001,"max":50,"ticks":[0.01,0.1,1,10]},
+ "series":[
+  {"name":"70 GB (70B in FP8)","color":"s3","points":[[0.1,1.556],[1,0.156],[10,0.0156],[100,0.00156]]},
+  {"name":"700 GB (≈ 671B MoE in FP8)","color":"s1","points":[[0.1,15.56],[1,1.556],[10,0.156],[100,0.0156]]},
+  {"name":"1.4 TB (≈ 700B-parameter model in BF16)","color":"s2","points":[[0.1,31.1],[1,3.11],[10,0.311],[100,0.0311]]}
+ ]}
+</script>
+<figcaption><b>Figure 14.5 — Egress limits make theft slow and visible.</b> Unrestricted datacenter networking could move a frontier model's weights in minutes; capping and monitoring egress from serving environments to well under a gigabit per second stretches any exfiltration to hours or days of anomalous traffic.</figcaption>
+</figure>
+
+<p>Weights can also be attacked without being copied. <strong>Model extraction</strong> or distillation through the API—querying the model at scale and training a copy on its outputs—is limited by rate limits, usage monitoring for systematic querying patterns, and terms of service; it cannot be prevented entirely for a public API. <strong>Insider</strong> risk is reduced by the access controls above and by separation of duties: the engineers who operate the fleet should not need, and should not have, the ability to read the weights they serve.</p>
+
+<h2 id="s14-5">14.5 The model supply chain</h2>
+<p>A serving fleet runs artefacts produced elsewhere: model weights and tokenizers from training pipelines or public hubs, container images, inference engines and their dependencies, CUDA libraries and custom kernels. Each is a link in a <strong>supply chain</strong>, and a compromised link runs code on the fleet. Chapter 5 described the most direct risk: pickle-based checkpoints execute code when loaded, and malicious ones have been found on public hubs. Safetensors removes code from weights, but other artefacts can still carry it. Hugging Face's <code>transformers</code> library, for example, can download and execute Python code that accompanies a model repository when <code>trust_remote_code</code> is enabled—a convenience for new architectures and a risk when the repository is not trusted. Tokenizer and configuration files are parsed by complex code. Container images pull in thousands of packages, any of which could be malicious (dependency confusion and typosquatting attacks have affected many ecosystems). Figure 14.6 shows the chain and its controls.</p>
+
+<figure class="diagram" id="fig-14-6">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="The model supply chain and its controls">
+<defs><marker id="a146" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="40" width="120" height="60" rx="8" class="bx"/><text x="70" y="64" text-anchor="middle" class="t-xs t-b">sources</text><text x="70" y="80" text-anchor="middle" class="t-xs">training runs, hubs,</text><text x="70" y="92" text-anchor="middle" class="t-xs">customers, packages</text>
+<rect x="150" y="40" width="130" height="60" rx="8" class="bx4"/><text x="215" y="64" text-anchor="middle" class="t-xs t-b">ingest + scan</text><text x="215" y="80" text-anchor="middle" class="t-xs">convert to safetensors,</text><text x="215" y="92" text-anchor="middle" class="t-xs">no remote code</text>
+<rect x="300" y="40" width="130" height="60" rx="8" class="bx4"/><text x="365" y="64" text-anchor="middle" class="t-xs t-b">sign + record</text><text x="365" y="80" text-anchor="middle" class="t-xs">digests, signatures,</text><text x="365" y="92" text-anchor="middle" class="t-xs">provenance, SBOM</text>
+<rect x="450" y="40" width="120" height="60" rx="8" class="bx2"/><text x="510" y="64" text-anchor="middle" class="t-xs t-b">registry</text><text x="510" y="80" text-anchor="middle" class="t-xs">immutable versions</text><text x="510" y="92" text-anchor="middle" class="t-xs">(Ch. 5, 8)</text>
+<rect x="590" y="40" width="120" height="60" rx="8" class="bx3"/><text x="650" y="64" text-anchor="middle" class="t-xs t-b">deploy</text><text x="650" y="80" text-anchor="middle" class="t-xs">verify signature +</text><text x="650" y="92" text-anchor="middle" class="t-xs">digest at load</text>
+<line x1="130" y1="70" x2="148" y2="70" class="ln" marker-end="url(#a146)"/><line x1="280" y1="70" x2="298" y2="70" class="ln" marker-end="url(#a146)"/><line x1="430" y1="70" x2="448" y2="70" class="ln" marker-end="url(#a146)"/><line x1="570" y1="70" x2="588" y2="70" class="ln" marker-end="url(#a146)"/>
+<rect x="10" y="130" width="700" height="100" rx="8" class="bx"/>
+<text x="25" y="152" class="t-xs t-b">Threats and controls</text>
+<text x="25" y="172" class="t-xs">• pickle checkpoints execute code → refuse pickle in production; convert in an isolated sandbox</text>
+<text x="25" y="190" class="t-xs">• model repositories with custom code (trust_remote_code) → review and vendor the code, never execute at load from untrusted sources</text>
+<text x="25" y="208" class="t-xs">• malicious or typosquatted packages, compromised images → pinned dependencies, private mirrors, image signing, minimal base images</text>
+<text x="25" y="224" class="t-xs">• tampered artefacts in transit or cache → content digests checked at every load; signatures tied to the build that produced them</text>
+</svg>
+<figcaption><b>Figure 14.6 — Securing the path from source to serving.</b> Untrusted artefacts are converted and scanned in isolation, signed with records of how they were produced, stored immutably, and verified at every load.</figcaption>
+</figure>
+
+<p>The controls in Figure 14.6 apply ideas from software supply-chain security to models. <strong>Content addressing and digest verification</strong> (§5.6) ensure that every replica loads exactly the bytes that were approved. <strong>Signing</strong> ties artefacts to the identity and build that produced them; open-source tools such as Sigstore, and a model-signing specification published by the OpenSSF in 2025, bring this to model files. <strong>Provenance</strong> records, in the spirit of the SLSA framework, describe how an artefact was built from which inputs, so that a deployment can require, for example, that weights came from an approved training pipeline. And customer-supplied models—fine-tunes uploaded for serving—are treated as untrusted input: converted to a code-free format in a sandbox, scanned, and served in isolation appropriate to their source.</p>
+
+<h2 id="s14-6">14.6 Protecting customer data</h2>
+<p>Customer data passes through and comes to rest in many places, as the residency map of §12.4 showed, and each needs protection. In transit, TLS covers the client connection, and internal traffic between gateways, routers, engines and stores should be encrypted and mutually authenticated too, so that a compromised node cannot impersonate a service. At rest, conversation stores, uploaded files, vector stores, fine-tuning datasets, logs and backups are encrypted, ideally with keys the customer can control or revoke ("customer-managed keys"). In use, data sits in GPU memory and caches, protected by the isolation of §14.2 and, for the most sensitive cases, confidential computing.</p>
+<p>Two practices matter more than encryption for most incidents. The first is <strong>minimisation and retention</strong>: keep as little customer content as possible, for as short a time as possible. Many enterprise LLM offerings provide "zero data retention" options under which prompts and outputs are not stored beyond the request (except where abuse monitoring or law requires), and clear statements of whether customer data is used for training. Logs, which are the most common place for sensitive data to leak, should record metadata (token counts, latencies, model versions) by default and content only when explicitly needed, with redaction of identifiable information and short retention. The second is <strong>controlled human access</strong>: engineers debugging an incident rarely need to read prompts, and when they do, access should require justification, approval and an audit trail ("break-glass" procedures), scoped to the minimum necessary data.</p>
+
+<h2 id="s14-7">14.7 Prompt injection as an infrastructure problem</h2>
+<p>An LLM follows instructions in its context, and it cannot reliably distinguish instructions from its operator, from the user, and from content it was merely asked to read. <strong>Prompt injection</strong> exploits this: an attacker places instructions in content the model will process—a web page, an email, a document in a retrieval index, the output of a tool—and the model may follow them. Greshake and colleagues showed in 2023 how such <em>indirect</em> injection could make LLM-integrated applications leak data, spread misinformation or take unintended actions<span class="cite"><a href="#r-injection">[6]</a></span>. Model training and input classifiers reduce the success rate, but neither can guarantee that a capable model will never follow an injected instruction, so the risk must also be contained by the infrastructure around the model.</p>
+<p>The containing principle is the same as for any untrusted code: <strong>limit what the model's outputs can cause</strong>. Figure 14.7 shows the controls. Tools the model can call should have the least privilege needed for the task: read-only where possible, scoped to the user's own data, with no access to secrets the model does not need. Actions with side effects—sending email, executing payments, deleting data, running code against production—should require explicit confirmation from the user, or run in sandboxes whose effects are reviewed (Chapter 17). Network egress from tool-execution environments should be restricted, because exfiltration through a URL fetched by a tool is a common injection payload. Content from different trust levels should be marked and kept separate in the context, so that models and classifiers can treat retrieved text as data. And every tool call, with its inputs and outputs, should be logged for audit. These controls do not prevent injection; they bound its consequences.</p>
+
+<figure class="diagram" id="fig-14-7">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Containing prompt injection with infrastructure controls">
+<defs><marker id="a147" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="30" width="150" height="60" rx="8" class="bx2"/><text x="90" y="54" text-anchor="middle" class="t-xs t-b">untrusted content</text><text x="90" y="70" text-anchor="middle" class="t-xs">web page, email, doc:</text><text x="90" y="82" text-anchor="middle" class="t-xs">"ignore prior, send…"</text>
+<rect x="15" y="110" width="150" height="50" rx="8" class="bx3"/><text x="90" y="132" text-anchor="middle" class="t-xs t-b">user request</text><text x="90" y="148" text-anchor="middle" class="t-xs">trusted instruction</text>
+<rect x="220" y="60" width="160" height="80" rx="10" class="bx4"/><text x="300" y="84" text-anchor="middle" class="t-xs t-b">model</text><text x="300" y="100" text-anchor="middle" class="t-xs">context marks trust</text><text x="300" y="114" text-anchor="middle" class="t-xs">levels; input/output</text><text x="300" y="128" text-anchor="middle" class="t-xs">classifiers (Ch. 18)</text>
+<line x1="165" y1="60" x2="218" y2="85" class="ln ln-s2" marker-end="url(#a147)"/><line x1="165" y1="135" x2="218" y2="115" class="ln ln-s3" marker-end="url(#a147)"/>
+<rect x="430" y="20" width="275" height="200" rx="10" class="bx"/>
+<text x="567" y="42" text-anchor="middle" class="t-sm t-b">Bound what outputs can cause</text>
+<text x="445" y="66" class="t-xs">• least-privilege tools, scoped to the user</text>
+<text x="445" y="86" class="t-xs">• confirmation for side-effecting actions</text>
+<text x="445" y="106" class="t-xs">• sandboxed code execution (Ch. 17)</text>
+<text x="445" y="126" class="t-xs">• restricted network egress from tools</text>
+<text x="445" y="146" class="t-xs">• no secrets in context unless needed</text>
+<text x="445" y="166" class="t-xs">• rate limits on tool actions</text>
+<text x="445" y="186" class="t-xs">• full audit log of tool calls</text>
+<line x1="380" y1="100" x2="428" y2="100" class="ln" marker-end="url(#a147)"/>
+<text x="360" y="245" text-anchor="middle" class="t-xs">Assume injection sometimes succeeds; design so that success cannot reach secrets, money or production systems unchecked.</text>
+</svg>
+<figcaption><b>Figure 14.7 — Containing prompt injection.</b> Classifiers and training lower the chance that injected instructions are followed; infrastructure controls on tools, actions, egress and secrets bound the damage when they are.</figcaption>
+</figure>
+
+<h2 id="s14-8">14.8 Abuse and resource-exhaustion attacks</h2>
+<p>Because LLM requests are expensive, an LLM service is an attractive target for attacks on its resources. <strong>Denial of service by expensive requests</strong> sends prompts designed to maximise cost: maximum context lengths (a million-token prompt consumes a large share of a replica's KV memory and prefill compute), requests for maximum output length, or inputs that trigger long reasoning. A small number of such requests can degrade service for others on the same replicas. <strong>Denial of wallet</strong> targets the customer rather than the provider: an attacker who obtains a customer's API key, or abuses a customer's public-facing application, runs up the customer's bill. <strong>Compute theft</strong> abuses free tiers, trial credits and stolen credentials to obtain GPU time for the attacker's own purposes. And <strong>automated abuse</strong>—spam generation, fraud, bulk scraping of model outputs for distillation—uses the service as intended but at a scale and for purposes that violate its terms.</p>
+<p>The defences are mostly the front-door mechanisms of Chapter 11, applied with security in mind. Rate limits must be stated in tokens and concurrency, not requests, and must cap the <em>expensive dimensions</em> separately: maximum context per tier, maximum output per request, concurrency limits that bound KV memory per tenant. Admission control should account for a request's cost so that a few huge requests cannot starve many small ones (bulkheads per tenant or per size class, §13.6). Spend limits and alerts protect customers from denial of wallet; keys should be scoped, rotated and revocable, and leaked keys detected (scanning public code repositories is standard). Free tiers need verification and anomaly detection to deter compute theft. And usage analytics—unusual token patterns, systematic prompt templates, high-volume accounts created in bursts—identify automated abuse for review. Abuse defences shade into content safety, the policies about what the model should and should not produce, whose infrastructure is the subject of Chapter 18.</p>
+
+<details class="drill">
+<summary>Drill 14.2 — How much can one tenant's long prompts hurt others?</summary>
+<p>An Atlas 70B replica has about 489 GB of KV capacity across its eight GPUs (Llama 3 70B in FP8 with 160 KiB of FP8 KV per token). A tenant sends 1-million-token prompts (allowed on its tier) at a rate that keeps four of them resident per replica. What fraction of the replica's KV capacity do they occupy, and what happens to other tenants' batch sizes? What limits would you set?</p>
+<p><em>Solution.</em> One million tokens × 160 KiB ≈ 164 GB per request; four would need about 655 GB—more than the replica's 489 GB—so at most two fit, occupying two-thirds of the cache and leaving little room for anyone else: the decode batch for other tenants collapses, and their requests queue or are preempted. Limits: a per-tenant concurrency cap on very long contexts (e.g. at most one resident million-token request per replica), routing of long-context requests to a dedicated pool sized for them, a per-tenant cap on resident KV bytes, and pricing that reflects the capacity such requests consume (§10.4). Without these, a single customer using its tier as documented can deny service to everyone else on the same replicas.</p>
+</details>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Part IV has followed the request path from the front door to the region, through reliability and security. Together with Parts I–III, we now have a complete picture of the infrastructure that serves a text-in, text-out language model. But production AI traffic is increasingly not text alone. Users send images, screenshots, PDFs, audio and video; assistants speak as well as write; and models that see and hear have encoders, token counts and latency requirements that change the cost model of Volume I. How are multimodal models served, what do image tokens cost, where should the vision encoder run, and what does real-time speech demand of the infrastructure? Chapter 15 opens Part V with these questions.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Threat model: assets (customer data and derivatives, weights, system prompts, compute, availability), adversaries (external attackers, malicious tenants, insiders, supply chain, nation-states), surfaces (API, shared engine state, model inputs, streams, storage, control plane, supply chain, insiders).</li>
+<li>Isolation ladder: shared engine (logical), separate processes on a GPU, MIG, dedicated GPUs/VMs, confidential computing (CPU TEE + GPU CC mode with attestation), separate cells or accounts; each step trades efficiency for less shared state.</li>
+<li>Noninterference: a tenant's observations, including timing, should not depend on others' data; shared batches and caches create timing channels.</li>
+<li>Prompt-cache timing attacks reveal whether others sent a prefix; repeated probes defeat noise. Fix: tenant-scoped cache keys (salts), sharing only public prefixes. Token-length leaks through encrypted streams: pad and coalesce. GPU memory leaks across processes: scrub, partition.</li>
+<li>Weights: least privilege, two-person rules, encryption with HSM/KMS keys, fewer copies, confidential computing, egress caps and monitoring (large files make theft slow and visible), rate limits against extraction; RAND SL1–SL5 frame attacker capability.</li>
+<li>Supply chain: no pickle, no untrusted remote code, convert and scan in sandboxes, digests verified at load, signing and provenance, pinned dependencies and signed images.</li>
+<li>Data protection: encryption in transit, at rest and in use; minimisation, zero-retention options, metadata-only logs with redaction, break-glass human access.</li>
+<li>Prompt injection cannot be fully prevented; bound its consequences with least-privilege tools, confirmation of side effects, sandboxes, egress limits, trust marking and audit.</li>
+<li>Abuse: token- and concurrency-based limits, caps on expensive dimensions, per-tenant KV bulkheads, spend limits, key hygiene, free-tier verification, anomaly detection.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci14-mcq-01" data-topic="§14.1 Threat model">
+<p class="q">Why is the malicious tenant an especially important adversary for multi-tenant LLM serving?</p>
+<ol class="opts"><li>Tenants are always malicious</li><li data-correct>Tenants are already inside the sharing boundary: their requests share engines, batches and caches with others</li><li>They control the hardware</li><li>They can read the weights directly</li></ol>
+<div class="explain">Isolation between them rests on the engine's software.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-02" data-topic="§14.1 Threat model">
+<p class="q">Which attack surfaces are specific to LLM serving? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Shared prefix/KV caches</li><li data-correct>Instructions embedded in model inputs</li><li data-correct>Token-length patterns in encrypted streams</li><li>TLS certificates</li></ol>
+<div class="explain">TLS is a generic surface.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-03" data-topic="§14.2 Isolation">
+<p class="q">Requests from different tenants in the same continuous batch are isolated by:</p>
+<ol class="opts"><li>Hardware partitioning</li><li>Separate kernels</li><li data-correct>The engine's software bookkeeping (separate KV blocks and sequence state)</li><li>Confidential computing</li></ol>
+<div class="explain">Logical isolation at the bottom of the ladder.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-04" data-topic="§14.2 Isolation">
+<p class="q">What does confidential computing protect against that MIG does not?</p>
+<ol class="opts"><li>Noisy neighbours</li><li data-correct>The host OS, hypervisor and provider staff reading data or weights in use</li><li>Network congestion</li><li>Model bugs</li></ol>
+<div class="explain">TEEs encrypt memory and prove what runs via attestation.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-05" data-topic="§14.2 Isolation">
+<p class="q">Remote attestation provides:</p>
+<ol class="opts"><li>Encryption of the network</li><li data-correct>A signed report of exactly what code and configuration a TEE is running, verifiable by a remote party</li><li>Faster inference</li><li>Key rotation</li></ol>
+<div class="explain">Keys can be released only to attested code.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-06" data-topic="§14.2 Isolation">
+<p class="q">Which was the first NVIDIA GPU with a confidential-computing mode?</p>
+<ol class="opts"><li>V100</li><li>A100</li><li data-correct>H100</li><li>L4</li></ol>
+<div class="explain">Blackwell extended the capability.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-07" data-topic="§14.2 Isolation">
+<p class="q">Noninterference requires that tenant B's observations:</p>
+<ol class="opts"><li>Are encrypted</li><li data-correct>Have a distribution independent of tenant A's inputs, including timing</li><li>Are identical to A's</li><li>Are logged</li></ol>
+<div class="explain">Timing through shared resources is the hard part.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-08" data-topic="§14.3 Side channels">
+<p class="q">How does a prompt-cache timing attack work?</p>
+<ol class="opts"><li>It decrypts TLS</li><li data-correct>A fast TTFT for a guessed prefix reveals that someone else recently sent that prefix to a shared cache</li><li>It reads GPU memory</li><li>It brute-forces API keys</li></ol>
+<div class="explain">Extending guesses block by block can reconstruct secrets.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-09" data-topic="§14.3 Side channels">
+<p class="q">The decisive mitigation for cross-tenant cache timing leaks is:</p>
+<ol class="opts"><li>Disabling caching entirely</li><li data-correct>Including the tenant (or a per-tenant salt) in cache keys and sharing only public prefixes</li><li>Smaller block sizes</li><li>Faster GPUs</li></ol>
+<div class="explain">Noise alone is defeated by repeated probes.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-10" data-topic="§14.3 Side channels">
+<p class="q">With single-probe accuracy 70%, roughly how many probes give 95% accuracy by majority vote?</p>
+<ol class="opts"><li>3</li><li>5</li><li data-correct>15</li><li>500</li></ol>
+<div class="explain">From Figure 14.4.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-11" data-topic="§14.3 Side channels">
+<p class="q">Why is adding random delay to TTFT a weak defence?</p>
+<ol class="opts"><li>It is illegal</li><li data-correct>Repeated probes average the noise away, so delays must be large, costing every user latency</li><li>It breaks streaming</li><li>It increases cache hits</li></ol>
+<div class="explain">Remove the dependence instead.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-12" data-topic="§14.3 Side channels">
+<p class="q">The token-length side channel in streaming responses arises because:</p>
+<ol class="opts"><li>TLS is broken</li><li data-correct>Encryption hides content but not record sizes, which track token lengths</li><li>Tokens are sent in plain text</li><li>Caches leak</li></ol>
+<div class="explain">Padding and coalescing mitigate it.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-13" data-topic="§14.3 Side channels">
+<p class="q">The "LeftoverLocals" disclosure concerned:</p>
+<ol class="opts"><li>KV caches</li><li data-correct>One process reading another's leftover GPU local memory on some GPUs</li><li>Prompt injection</li><li>DNS</li></ol>
+<div class="explain">Scrub memory or partition hardware across trust boundaries.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-14" data-topic="§14.3 Side channels">
+<p class="q">In Drill 14.1, a 16-token cache block forces the attacker to guess six digits together, giving up to how many candidates?</p>
+<ol class="opts"><li>60</li><li>10⁴</li><li data-correct>10⁶</li><li>10¹⁶</li></ol>
+<div class="explain">Coarser blocks slow but do not stop the attack.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-15" data-topic="§14.4 Weights">
+<p class="q">What do the RAND SL1–SL5 levels describe?</p>
+<ol class="opts"><li>Service-level objectives</li><li data-correct>Security levels adequate against progressively more capable attackers on model weights</li><li>Model sizes</li><li>Datacenter tiers</li></ol>
+<div class="explain">From amateurs to top nation-state operations.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-16" data-topic="§14.4 Weights">
+<p class="q">At a sustained 1 Gb/s, exfiltrating 700 GB of weights takes about:</p>
+<ol class="opts"><li>9 minutes</li><li data-correct>1.6 hours</li><li>16 hours</li><li>6 days</li></ol>
+<div class="explain">\(700\times8/1\) seconds.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-17" data-topic="§14.4 Weights">
+<p class="q">Which controls protect weights? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Least privilege and two-person rules for human access</li><li data-correct>Encryption with keys in an HSM or KMS</li><li data-correct>Egress caps and monitoring</li><li>Storing copies on engineers' laptops for debugging</li></ol>
+<div class="explain">Fewer copies, fewer places.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-18" data-topic="§14.4 Weights">
+<p class="q">Model extraction through the API is mitigated mainly by:</p>
+<ol class="opts"><li>Encryption at rest</li><li data-correct>Rate limits, monitoring for systematic querying, and terms of service</li><li>MIG</li><li>Faster GPUs</li></ol>
+<div class="explain">It cannot be fully prevented for a public API.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-19" data-topic="§14.5 Supply chain">
+<p class="q">Why is <code>trust_remote_code</code> a supply-chain risk?</p>
+<ol class="opts"><li>It slows loading</li><li data-correct>It downloads and executes Python code shipped with a model repository</li><li>It disables safetensors</li><li>It leaks prompts</li></ol>
+<div class="explain">Review and vendor such code instead.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-20" data-topic="§14.5 Supply chain">
+<p class="q">Which supply-chain controls apply to model artefacts? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Content digests verified at every load</li><li data-correct>Signatures and provenance records</li><li data-correct>Conversion of untrusted checkpoints to safetensors in a sandbox</li><li>Loading pickles from any hub</li></ol>
+<div class="explain">Pickle executes code on load.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-21" data-topic="§14.5 Supply chain">
+<p class="q">How should customer-uploaded fine-tunes be handled?</p>
+<ol class="opts"><li>Loaded directly in production</li><li data-correct>As untrusted input: converted to a code-free format in a sandbox, scanned and served with appropriate isolation</li><li>Rejected always</li><li>Merged into the base model</li></ol>
+<div class="explain">Their source is outside the trust boundary.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-22" data-topic="§14.6 Data">
+<p class="q">Where does sensitive customer data most commonly leak in practice?</p>
+<ol class="opts"><li>GPU registers</li><li data-correct>Logs that record prompt content</li><li>DNS</li><li>Model weights</li></ol>
+<div class="explain">Log metadata by default; content only when needed, redacted, short-lived.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-23" data-topic="§14.6 Data">
+<p class="q">"Zero data retention" options typically mean:</p>
+<ol class="opts"><li>No encryption</li><li data-correct>Prompts and outputs are not stored beyond the request, except where monitoring or law requires</li><li>No logs of any kind</li><li>No caching within a request</li></ol>
+<div class="explain">Minimisation reduces exposure.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-24" data-topic="§14.6 Data">
+<p class="q">Break-glass access procedures provide:</p>
+<ol class="opts"><li>Permanent admin rights</li><li data-correct>Justified, approved, audited and minimal human access to customer data when unavoidable</li><li>Faster debugging without controls</li><li>Disabled encryption</li></ol>
+<div class="explain">Engineers rarely need to read prompts.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-25" data-topic="§14.7 Injection">
+<p class="q">Indirect prompt injection places malicious instructions in:</p>
+<ol class="opts"><li>The model weights</li><li data-correct>Content the model processes, such as web pages, documents or tool outputs</li><li>The TLS handshake</li><li>The GPU driver</li></ol>
+<div class="explain">Greshake et al. (2023) demonstrated it on LLM-integrated apps.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-26" data-topic="§14.7 Injection">
+<p class="q">The infrastructure principle for containing prompt injection is:</p>
+<ol class="opts"><li>Filter all inputs perfectly</li><li data-correct>Assume it sometimes succeeds and limit what model outputs can cause</li><li>Disable tools entirely</li><li>Use larger models</li></ol>
+<div class="explain">Least privilege, confirmation, sandboxes, egress limits, audit.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-27" data-topic="§14.7 Injection">
+<p class="q">Why restrict network egress from tool-execution environments?</p>
+<ol class="opts"><li>To save bandwidth</li><li data-correct>Fetching attacker-controlled URLs is a common exfiltration route for injected instructions</li><li>Tools do not need networks</li><li>For latency</li></ol>
+<div class="explain">Allow-lists bound what injected instructions can reach.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-28" data-topic="§14.8 Abuse">
+<p class="q">"Denial of wallet" refers to:</p>
+<ol class="opts"><li>Crashing the service</li><li data-correct>Running up a customer's bill through a leaked key or abused application</li><li>Stealing GPUs</li><li>Cache poisoning</li></ol>
+<div class="explain">Spend limits, alerts and key hygiene mitigate it.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-29" data-topic="§14.8 Abuse">
+<p class="q">In Drill 14.2, why do a few million-token prompts degrade other tenants?</p>
+<ol class="opts"><li>They are slow to tokenise</li><li data-correct>Their KV caches occupy most of the replica's KV capacity, collapsing other tenants' batch sizes</li><li>They use more power</li><li>They break TLS</li></ol>
+<div class="explain">Cap resident long-context requests per tenant, or route them to a dedicated pool.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-30" data-topic="§14.8 Abuse">
+<p class="q">Which limits defend against expensive-request attacks? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Maximum context and output length per tier</li><li data-correct>Per-tenant concurrency and resident-KV caps</li><li data-correct>Token-based rate limits</li><li>Requests-per-minute limits alone</li></ol>
+<div class="explain">Request counts do not reflect cost.</div>
+</div>
+
+<div class="mcq" data-id="ci14-mcq-31" data-topic="§14.2 Isolation">
+<p class="q">Why are GPUs shared across trust boundaries at the process level riskier than MIG partitions?</p>
+<ol class="opts"><li>Processes are slower</li><li data-correct>Memory may not be scrubbed between processes and shared hardware creates side channels; MIG partitions memory and caches in hardware</li><li>MIG is encrypted</li><li>Processes cannot use CUDA</li></ol>
+<div class="explain">See also LeftoverLocals.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci14-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Give a threat model for a multi-tenant LLM API.</summary>
+<div class="answer">
+<p>Assets: customer prompts, files, outputs, conversations, fine-tune data and derivatives (KV caches, logs, embeddings); model weights; system prompts and configuration; GPU compute; availability and integrity. Adversaries: external attackers, malicious tenants (inside the sharing boundary), insiders, supply-chain attackers, sophisticated actors targeting weights. Surfaces: API/gateway (credentials, abuse), shared engine state (batches, caches—side channels), model inputs (prompt injection), streams (length leaks), storage (weights, logs, threads), control plane and deployment pipeline, supply chain (models, images, dependencies), insiders. Prioritise by impact and likelihood; design controls per surface.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-02">
+<summary><span class="lvl warm">Warm-up</span> How can a shared prefix cache leak information between users?</summary>
+<div class="answer">
+<p>If cache keys depend only on token content, a request whose prefix matches a cached block gets a much faster TTFT. An attacker submits guessed prefixes and measures TTFT: a hit reveals that some other request recently contained that prefix; extending guesses block by block can reconstruct structured secrets or confirm that a document was submitted. Repeated probes defeat network noise. Fix: scope cache keys by tenant (or per-tenant salt), share only explicitly public prefixes, consider per-user scoping within sensitive tenants; noise injection is a weak supplement.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-03">
+<summary><span class="lvl warm">Warm-up</span> What is confidential computing and when would you use it for LLM serving?</summary>
+<div class="answer">
+<p>Hardware TEEs (AMD SEV-SNP or Intel TDX for CPU VMs; NVIDIA H100/Blackwell confidential-computing mode for GPUs) run code in encrypted, integrity-protected memory inaccessible to the host OS, hypervisor and operators, encrypt CPU–GPU transfers, and provide remote attestation of the exact software running. Use it when the threat model includes the provider or its staff: regulated customer data (health, finance, government), customers requiring proof that prompts are processed only by approved code, and protecting proprietary weights in use with key release tied to attestation. Costs: some throughput (encrypted transfers), operational complexity, less sharing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-04">
+<summary><span class="lvl core">Core</span> Design tenant isolation for an LLM platform serving both startups and banks.</summary>
+<div class="answer">
+<p>Default tier: shared engines with continuous batching (logical isolation) but tenant-scoped prefix caches, tenant-scoped adapters and data stores, per-tenant rate limits and KV bulkheads, encrypted internal traffic, metadata-only logs. Sensitive tier: dedicated replicas or MIG partitions (hardware isolation of memory and caches), separate cells, customer-managed keys, zero-retention options, residency pinning. Highest tier (banks/government): dedicated nodes or clusters, confidential computing with attestation and key release policies, private networking into the customer's VPC, audit access, break-glass controls. Price tiers to reflect lost sharing. Verify with penetration tests and side-channel audits.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-05">
+<summary><span class="lvl core">Core</span> How would you protect a frontier model's weights in a serving fleet?</summary>
+<div class="answer">
+<p>Access: only serving workloads can decrypt; no human read access by default, two-person approval for exceptions, short-lived credentials, full audit. Encryption: at rest with HSM/KMS-held keys, in transit between storage, caches and nodes; decrypt into GPU memory directly where possible. Exposure: minimise copies and locations; treat node caches as protected; no general internet egress from serving nodes, capped and monitored egress (exfiltration of hundreds of GB becomes slow and visible). Confidential computing: CPU TEE + GPU CC mode with attestation-gated key release. Supply chain and control plane hardened (signed images, pinned dependencies). Insider controls: separation of duties. API: rate limits and monitoring against extraction. Map to a target security level (e.g. RAND SL3–SL4+).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-06">
+<summary><span class="lvl core">Core</span> A customer wants to upload a fine-tuned model for you to serve. What do you do?</summary>
+<div class="answer">
+<p>Treat it as untrusted. Accept only code-free formats (safetensors) or convert pickles inside an isolated sandbox with no network or secrets; reject custom remote code (or review and vendor it); validate architecture and config against supported ones; scan for anomalies; compute digests, record provenance, store in the tenant's scope (encrypted, residency-aware). Serve with isolation proportional to risk: if it's a LoRA on a supported base, load into a multi-LoRA engine with tenant-scoped caches; full models on dedicated replicas or MIG slices; monitor behaviour. Never let the artefact touch shared infrastructure before it has been converted and verified.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-07">
+<summary><span class="lvl core">Core</span> How do you defend an LLM API against expensive-request denial of service?</summary>
+<div class="answer">
+<p>Limits by expensive dimension: max context and output per tier, token-based rate limits (input and output separately), per-tenant concurrency and resident-KV caps; admission control that estimates request cost and protects others (bulkheads by tenant or size class; dedicated long-context pools); prioritised shedding under load; pricing that reflects capacity use; anomaly detection on usage patterns; verification and spend limits for free/trial tiers; fast key revocation. Ensure one tenant using its tier as documented cannot starve others (e.g. a few million-token prompts filling a replica's KV memory).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-08">
+<summary><span class="lvl core">Core</span> Explain the token-length side channel in streaming and how to mitigate it.</summary>
+<div class="answer">
+<p>Streaming sends tokens in separate encrypted records; encryption hides content but not length; token lengths vary, so the record-size sequence leaks the token-length sequence. A passive observer of traffic (e.g. on the same network) can feed these lengths to a model trained to reconstruct likely text, recovering a substantial fraction of responses, as shown in 2024. Mitigate by padding events to fixed or random sizes, coalescing multiple tokens per event (also reduces overhead), and avoiding per-token flushes at the transport layer. Similar reasoning applies to any observable (timing, sizes) correlated with secret content.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Formalise tenant isolation as noninterference and identify the channels in a continuous-batching engine.</summary>
+<div class="answer">
+<p>Noninterference: for any two histories differing only in tenant A's inputs, tenant B's observations (outputs, timings, errors, resource availability) have the same distribution. Channels in a continuous-batching engine: (1) prefix-cache hits (timing depends on A's prior prompts)—close with tenant-scoped keys; (2) batch composition (A's long prompt delays B's tokens; B can infer A's activity level)—a low-bandwidth load channel; mitigate with per-tenant bulkheads or dedicated capacity when required; (3) KV memory pressure and preemption (A's long contexts cause B's preemption)—quotas; (4) numerical nondeterminism (B's outputs vary slightly with batch composition)—batch-invariant kernels if needed; (5) error messages and rate-limit behaviour shared across tenants—scope per tenant; (6) GPU memory reuse—scrubbing. Full noninterference requires dedicated resources; practical designs bound channel capacity and close high-bandwidth ones.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> What is the efficiency cost of tenant-scoped prefix caches, and how would you minimise it?</summary>
+<div class="answer">
+<p>Lost hits are only cross-tenant reuse: common public prefixes (provider system prompts, popular tool descriptions, widely shared documents). Most reuse is within a tenant (its system prompts, conversation histories, repeated documents), so scoping typically costs a small fraction of hits. Minimise: explicitly mark provider-owned public prefixes as shareable (keyed without tenant), allow tenants to opt in to sharing among their own users or organisation, route each tenant's traffic with affinity so its cache is concentrated, and measure hit rates before and after. Charge appropriately for cached input since it remains cheap.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> How should an agent platform contain prompt injection?</summary>
+<div class="answer">
+<p>Accept that injection sometimes succeeds. Least-privilege tools scoped to the user (read-only by default, per-resource permissions, no ambient credentials); explicit user confirmation for side-effecting or irreversible actions (payments, emails, deletions, production changes); code execution only in sandboxes (microVMs or gVisor) with no secrets and restricted egress via allow-lists; separate and label trust levels in context (system, user, retrieved, tool output); input/output classifiers to detect injection attempts and data exfiltration patterns; rate limits on tool actions; complete audit logs; secrets never placed in the model context; and red-teaming with injected documents in CI.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-12">
+<summary><span class="lvl design">Design</span> Design the security architecture for a confidential LLM service for hospitals.</summary>
+<div class="answer">
+<p>Deployment in the hospitals' required jurisdiction; dedicated cluster or cells; confidential VMs with GPU CC mode; remote attestation verified by a hospital-controlled verifier; customer-managed keys released only to attested images; end-to-end TLS into the TEE; no persistent storage of prompts by default (zero retention), or encrypted storage with customer keys and short retention; metadata-only telemetry exported; tenant-scoped (or disabled) prefix caching; no operator access without break-glass with hospital approval; signed and pinned images, provenance; audit logs exported to the customer; penetration testing and side-channel review; incident response agreements; compliance mapping (HIPAA or local equivalents) by legal.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-13">
+<summary><span class="lvl design">Design</span> How would you secure the supply chain for a serving fleet that uses open-source engines and open-weight models?</summary>
+<div class="answer">
+<p>Ingest models through a controlled pipeline: download from vetted sources, convert to safetensors in a sandbox, verify against published hashes, scan, sign internally, record provenance, store immutably in the registry. Disable remote code execution; vendor any needed architecture code after review. Engines: build from pinned source or verified releases, reproducible builds where possible, private package mirrors with pinned versions and hash checking, vulnerability scanning, minimal base images, image signing and admission policies that only allow signed images. Kernels/drivers from vendor-signed packages. Verify digests and signatures at every load. Monitor advisories and patch quickly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-14">
+<summary><span class="lvl core">Core</span> What should and should not be logged by an LLM service?</summary>
+<div class="answer">
+<p>By default log metadata: request ID, tenant, model and engine version, token counts by type, latencies, routing decisions, errors, finish reasons, sampling parameters and seeds (for reproducibility). Avoid prompt and output content by default; when content is needed (debugging, abuse monitoring), sample minimally, redact PII and secrets, restrict access, encrypt, apply short retention, respect residency and customer zero-retention settings. Never log API keys or credentials. Keep audit logs of administrative and data-access actions separately and immutably.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> Why do egress controls matter for protecting weights, and what are their limits?</summary>
+<div class="answer">
+<p>Weights are large (70 GB to over a terabyte); exfiltrating them requires sustained transfer. Removing general internet egress from serving environments and capping and monitoring permitted egress (allow-listed destinations, rate limits, anomaly detection) stretches theft to hours or days of conspicuous traffic (700 GB at 1 Gb/s ≈ 1.6 h; at 100 Mb/s ≈ 16 h). Limits: an attacker may exfiltrate slowly over legitimate channels, compress or steal partial weights (e.g. distilled students via API), or compromise components with high legitimate bandwidth (storage replication, backups); insiders may use physical media. So combine egress control with access control, encryption with attested key release, monitoring of storage access, and separation of duties.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci14-qa-16">
+<summary><span class="lvl warm">Warm-up</span> Why is pickle dangerous, and what replaces it?</summary>
+<div class="answer">
+<p>Unpickling executes a program that can call arbitrary Python callables, so loading an untrusted checkpoint can run attacker code with the loader's privileges; malicious checkpoints have appeared on public hubs. Safetensors replaces it for weights: an 8-byte header length, a JSON table of tensor metadata and offsets, and raw bytes—no code. In production, refuse pickle, convert untrusted pickles only inside isolated sandboxes, and verify digests of all artefacts at load.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-earlybird">L. Song et al. The Early Bird Catches the Leak: Unveiling Timing Side Channels in LLM Serving Systems. 2024. <a href="https://arxiv.org/abs/2409.20002">arXiv:2409.20002</a>.</li>
+<li id="r-audit">C. Gu et al. Auditing Prompt Caching in Language Model APIs. 2025. <a href="https://arxiv.org/abs/2502.07776">arXiv:2502.07776</a>.</li>
+<li id="r-keylog">R. Weiss, D. Ayzenshteyn, G. Amit, Y. Mirsky. What Was Your Prompt? A Remote Keylogging Attack on AI Assistants. <em>USENIX Security</em>, 2024. <a href="https://arxiv.org/abs/2403.09751">arXiv:2403.09751</a>.</li>
+<li id="r-leftover">T. Sorensen, H. Khlaaf. LeftoverLocals: Listening to LLM Responses Through Leaked GPU Local Memory. Trail of Bits, January 2024 (CVE-2023-4969).</li>
+<li id="r-rand">S. Nevo et al. <em>Securing AI Model Weights: Preventing Theft and Misuse of Frontier Models</em>. RAND Corporation, RR-A2849-1, 2024.</li>
+<li id="r-injection">K. Greshake et al. Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection. 2023. <a href="https://arxiv.org/abs/2302.12173">arXiv:2302.12173</a>.</li>
+<li>J. A. Goguen, J. Meseguer. Security Policies and Security Models (noninterference). <em>IEEE Symposium on Security and Privacy</em>, 1982.</li>
+<li>NVIDIA. Confidential Computing on NVIDIA H100 GPUs for Secure and Trustworthy AI. Whitepaper, 2023.</li>
+<li id="r-ccbench">J. Zhu, H. Yin, P. Deng, S. Zhou. Confidential Computing on NVIDIA Hopper GPUs: A Performance Benchmark Study. 2024. <a href="https://arxiv.org/abs/2409.03992">arXiv:2409.03992</a>.</li>
+<li>F. Tramèr et al. Stealing Machine Learning Models via Prediction APIs. <em>USENIX Security</em>, 2016. <a href="https://arxiv.org/abs/1609.02943">arXiv:1609.02943</a>.</li>
+<li>OpenSSF. Model Signing specification (v1.0), 2025; Sigstore project documentation.</li>
+<li>SLSA. Supply-chain Levels for Software Artifacts, specification v1.0, 2023.</li>
+<li>OWASP. Top 10 for Large Language Model Applications, 2025.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

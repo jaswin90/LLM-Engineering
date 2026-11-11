@@ -58,7 +58,7 @@
     { id: 'ci11', n: 11, part: 'IV', title: 'The Front Door: Gateways, Streaming and Rate Limits', sub: 'HTTP/2, SSE, gRPC, WebSockets, distributed rate limiting, admission control', file: 'cloud/ci11.html', ready: true },
     { id: 'ci12', n: 12, part: 'IV', title: 'Multi-Region Serving and Disaster Recovery', sub: 'Global load balancing, data residency, failover, capacity across regions', file: 'cloud/ci12.html', ready: true },
     { id: 'ci13', n: 13, part: 'IV', title: 'Reliability Engineering for AI Services', sub: 'SLOs and error budgets, GPU failure modes, MTBF at scale, safe rollouts, incidents', file: 'cloud/ci13.html', ready: true },
-    { id: 'ci14', n: 14, part: 'IV', title: 'Security, Isolation and Multi-Tenancy', sub: 'Threat models, confidential computing, cache side channels, weight protection, supply chain', file: 'cloud/ci14.html', ready: false },
+    { id: 'ci14', n: 14, part: 'IV', title: 'Security, Isolation and Multi-Tenancy', sub: 'Threat models, confidential computing, cache side channels, weight protection, supply chain', file: 'cloud/ci14.html', ready: true },
     { id: 'ci15', n: 15, part: 'V', title: 'Serving Multimodal Models', sub: 'Vision encoders, image tokens, encoder caching, speech and real-time audio, video', file: 'cloud/ci15.html', ready: false },
     { id: 'ci16', n: 16, part: 'V', title: 'Embeddings, Retrieval and Vector Search at Scale', sub: 'Embedding serving, HNSW, IVF-PQ, sharded indexes, RAG latency budgets', file: 'cloud/ci16.html', ready: false },
     { id: 'ci17', n: 17, part: 'V', title: 'Agents and Compound AI Systems', sub: 'Tool calls, MCP, code sandboxes, session state, program-aware scheduling', file: 'cloud/ci17.html', ready: false },
