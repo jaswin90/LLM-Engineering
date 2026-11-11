@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 3 · Accelerators as Cloud Products — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 3 of Cloud AI Infrastructure: what a cloud instance is (virtual machines, passthrough, bare metal), the GPU instance catalogue across AWS, Google Cloud, Azure and neoclouds, fitting a model to the smallest device, latency floors, sharing a GPU with time-slicing, MPS and MIG, TPUs, Trainium and AMD Instinct as products, and a procedure for choosing hardware by cost per token.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci03" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part I · The Physical Cloud — Chapter 3</div>
+<h1 id="top">Accelerators as Cloud Products</h1>
+<p class="lede">Most teams never touch a GPU. They rent an instance: a bundle of accelerators, host CPUs, memory, local disk and network bandwidth, sold by the hour or by the year under a name such as <code>p5.48xlarge</code> or <code>a3-highgpu-8g</code>. This chapter explains what is inside those bundles and how they are virtualised, how one GPU can be safely divided among several workloads, how Google's TPUs, Amazon's Trainium and AMD's Instinct GPUs compare as products, and how to choose the cheapest hardware that meets a model's memory, latency and throughput requirements.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Volume I described accelerators as an architect sees them: streaming multiprocessors, tensor cores, HBM and NVLink (Vol. I Chapter 5). Chapter 2 of this volume described them as a facilities engineer sees them: kilowatts and litres of coolant. Neither is how most engineers meet them. An inference team at a typical company opens a cloud console, sees a list of instance types with prices, and must choose. The choice decides the cost of every token the team serves for the next one to three years, and it is constrained by things the architecture diagrams do not show: how many GPUs come in one instance, whether the instance is a virtual machine or bare metal, what network bandwidth it has, whether the type exists in the region the team needs, and whether the cloud will actually sell it.</p>
+<p>Interviewers probe this layer because it is where the theory of Volume I meets a budget. "Would you serve Llama 3 8B on L4s or H100s?" has a quantitative answer, and it depends on traffic. "Can we give each of our forty customers an isolated GPU for their fine-tuned 8B model?" has an answer involving MIG. "Should we move our 70B model from H100s to MI300X or TPUs?" has an answer involving memory per device, bandwidth per dollar and software maturity. By the end of this chapter you should be able to give all three.</p>
+<p>We start with what an instance is, and why GPUs in a virtual machine run nearly as fast as on bare metal (§3.1). We survey the instance catalogue and its common anatomy (§3.2). We then derive the two quantities that decide whether a device can serve a model—whether it fits, and what latency floor its bandwidth imposes—and compare devices by cost per token (§3.3). We examine three ways of sharing one GPU among workloads and the isolation each provides (§3.4), survey the non-NVIDIA accelerators as products (§3.5), and assemble everything into a procedure for choosing hardware (§3.6). We end with the practical question of availability (§3.7).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain virtual machines, hypervisors, PCIe passthrough and bare-metal instances, and why accelerator performance in a VM is close to bare metal.</li>
+<li>Read an instance specification (GPUs, HBM, vCPUs, host memory, local NVMe, network bandwidth) and identify what matters for inference.</li>
+<li>Compute whether a model fits on a device, the maximum batch it allows, the TPOT floor set by bandwidth, and the resulting cost per token.</li>
+<li>Compare time-slicing, MPS and MIG for sharing a GPU, quantify their interference and isolation, and say when each is appropriate.</li>
+<li>Describe TPUs, Trainium/Inferentia and AMD Instinct GPUs as cloud products, including their software stacks and scale-up domains.</li>
+<li>Apply a step-by-step procedure for choosing hardware for a model, traffic level and latency target.</li>
+</ol>
+<p class="small muted">Uses: GPU architecture (Vol. I Chapter 5), the decode latency model (Vol. I §3.7), KV-cache sizes (Vol. I §3.4, Chapter 8), quantisation (Vol. I Chapter 14), parallelism (Vol. I Chapter 18) and Chapters 1–2 of this volume.</p>
+</div>
+
+<h2 id="s3-1">3.1 What you rent: instances, virtual machines and bare metal</h2>
+<p>A cloud <strong>instance</strong> is a computer that a customer can boot and control, carved out of the provider's physical servers. For most of the cloud's history an instance was a <strong>virtual machine</strong> (VM): a software-defined computer presented by a <strong>hypervisor</strong>, a thin layer of software that runs directly on the physical server and multiplexes its CPUs, memory, disks and network among several guest operating systems. Each guest believes it owns a computer; the hypervisor ensures that it cannot see or disturb the others. Virtualisation was what made the cloud possible: one physical server could be sold to many customers, resized, migrated and reclaimed without touching hardware.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — virtualisation as faithful simulation</div>
+<p>Think of a computer's instruction set as an abstract machine: a state space (registers, memory, device state) and a transition function for each instruction. A hypervisor provides a <em>simulation</em> of that machine for each guest: a map from the guest's state to a subset of the real machine's state such that executing a guest instruction and then mapping gives the same result as mapping and then executing the corresponding real operations. In 1974 Popek and Goldberg showed that efficient virtualisation is possible when every instruction that could reveal or change the real machine's control state is "privileged"—it traps to the hypervisor when a guest executes it—so that all other instructions can run directly on the hardware at full speed. Modern CPUs added hardware support (Intel VT-x, AMD-V) that makes this condition hold, so a guest's ordinary computation runs natively and only privileged operations pay the cost of a trap.</p>
+</div>
+
+<p>Accelerators fit this picture through <strong>PCIe passthrough</strong>. A GPU is a device on the server's PCI Express bus. Rather than emulating a GPU in software, which would be hopelessly slow, the hypervisor assigns the whole physical GPU to one guest, and the server's I/O memory-management unit (IOMMU) translates the device's memory accesses so that it can read and write only that guest's memory. The guest loads the ordinary NVIDIA driver and talks to the GPU directly. Kernels run on the GPU exactly as they would on bare metal, and the data path between the GPU and its HBM does not involve the hypervisor at all. That is why a GPU in a well-designed VM delivers within a few percent of its bare-metal performance for compute-bound and memory-bound kernels alike. The costs of virtualisation appear elsewhere: in the host CPU cycles the hypervisor consumes, in the latency of interrupts and some I/O, and in the network path.</p>
+<p>Network and storage I/O used to be the expensive part, because every packet passed through the hypervisor's software switch. Providers removed that cost by moving I/O into dedicated hardware. AWS's <strong>Nitro</strong> system, introduced from 2017, offloads networking, storage and security functions to separate cards, so that the main server's CPUs run almost nothing but the customer's guest; network interfaces present themselves to the guest through <strong>SR-IOV</strong> (single-root I/O virtualisation), a PCIe feature that lets one physical NIC appear as many virtual NICs, each assignable to a guest. Other clouds built comparable offload hardware. With these, a GPU instance's host overhead is small, and the provider can also offer <strong>bare-metal instances</strong>: the customer gets the whole physical server with no hypervisor, while the provider's offload cards still enforce network isolation and manage the machine.</p>
+<p>Whether a team wants a VM or bare metal depends on details that matter for AI. Bare metal gives full control of the GPU driver and firmware, of NVLink and the fabric manager that configures NVSwitch, of performance counters and of MIG configuration (§3.4); it removes the last few percent of overhead; and it lets the customer run its own virtualisation or Kubernetes stack. VMs give faster provisioning, live maintenance and integration with the provider's managed services. Most neoclouds sell bare metal; hyperscalers sell both, and their largest GPU instances are usually "whole-server" VMs that occupy an entire eight-GPU machine, because no other customer could use a fraction of it anyway. That brings us to what those whole-server instances contain.</p>
+
+<figure class="diagram" id="fig-3-1">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Virtual machine with GPU passthrough versus bare metal">
+<rect x="15" y="15" width="335" height="230" rx="10" class="bx"/>
+<text x="182" y="36" text-anchor="middle" class="t-sm t-b">VM with passthrough</text>
+<rect x="35" y="50" width="295" height="56" rx="6" class="bx4"/><text x="182" y="72" text-anchor="middle" class="t-xs t-b">guest OS + NVIDIA driver + engine</text><text x="182" y="88" text-anchor="middle" class="t-xs">(customer)</text>
+<rect x="35" y="114" width="295" height="34" rx="6" class="bx2"/><text x="182" y="136" text-anchor="middle" class="t-xs">hypervisor (CPU, memory, interrupts)</text>
+<rect x="35" y="156" width="140" height="34" rx="6" class="bx3"/><text x="105" y="178" text-anchor="middle" class="t-xs">IOMMU → GPUs</text>
+<rect x="190" y="156" width="140" height="34" rx="6" class="bx3"/><text x="260" y="174" text-anchor="middle" class="t-xs">offload card: NICs</text><text x="260" y="186" text-anchor="middle" class="t-xs">via SR-IOV, storage</text>
+<text x="182" y="216" text-anchor="middle" class="t-xs">GPU kernels and HBM traffic bypass the hypervisor</text>
+<text x="182" y="232" text-anchor="middle" class="t-xs">overhead ≈ a few % (host CPU, interrupts)</text>
+<rect x="370" y="15" width="335" height="230" rx="10" class="bx"/>
+<text x="537" y="36" text-anchor="middle" class="t-sm t-b">Bare metal</text>
+<rect x="390" y="50" width="295" height="98" rx="6" class="bx4"/><text x="537" y="88" text-anchor="middle" class="t-xs t-b">customer OS + driver + firmware choices</text><text x="537" y="104" text-anchor="middle" class="t-xs">+ fabric manager, MIG, own Kubernetes</text>
+<rect x="390" y="156" width="140" height="34" rx="6" class="bx3"/><text x="460" y="178" text-anchor="middle" class="t-xs">GPUs, NVSwitch</text>
+<rect x="545" y="156" width="140" height="34" rx="6" class="bx3"/><text x="615" y="174" text-anchor="middle" class="t-xs">provider offload card</text><text x="615" y="186" text-anchor="middle" class="t-xs">still isolates network</text>
+<text x="537" y="216" text-anchor="middle" class="t-xs">full control, no hypervisor; slower provisioning,</text>
+<text x="537" y="232" text-anchor="middle" class="t-xs">customer handles more of the stack</text>
+</svg>
+<figcaption><b>Figure 3.1 — Two ways to rent a GPU server.</b> In a VM, the hypervisor manages CPUs and memory while the GPUs are passed through and the NICs are virtualised in hardware, so the accelerator data path is native. Bare metal removes the hypervisor and hands the customer the whole stack.</figcaption>
+</figure>
+
+<h2 id="s3-2">3.2 The instance catalogue</h2>
+<p>Every major cloud offers a family of accelerator instances, renewed with each GPU generation, and their names are part of the vocabulary of infrastructure interviews. Table 3.1 lists representative types; names change and new ones appear every year, so the point is the pattern, not the exact catalogue.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 3.1 — Representative accelerator instances (approximate; check current documentation)</caption>
+<thead><tr><th>Provider</th><th>Instance family</th><th>Accelerators</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>AWS</td><td>p4d / p4de</td><td>8 × A100 (40 / 80 GB)</td><td>400 Gb/s EFA per instance</td></tr>
+<tr><td>AWS</td><td>p5 / p5e / p5en</td><td>8 × H100 / H200</td><td>3,200 Gb/s EFA per instance (400 Gb/s per GPU)</td></tr>
+<tr><td>AWS</td><td>p6-b200; P6e-GB200 UltraServers</td><td>8 × B200; GB200 NVL72 rack-scale</td><td>rack-scale systems sold as one unit</td></tr>
+<tr><td>AWS</td><td>g5 / g6 / g6e</td><td>A10G / L4 / L40S (1–8)</td><td>inference-class GPUs, PCIe, no NVLink</td></tr>
+<tr><td>AWS</td><td>trn1 / trn2; inf2</td><td>Trainium, Trainium2; Inferentia2</td><td>Neuron SDK; Trn2 UltraServers of 64 chips</td></tr>
+<tr><td>Google Cloud</td><td>A2, A3 (High, Mega), A3 Ultra</td><td>A100; H100; H200</td><td>A3 Mega doubles network bandwidth of A3</td></tr>
+<tr><td>Google Cloud</td><td>A4, A4X</td><td>B200; GB200 NVL72</td><td></td></tr>
+<tr><td>Google Cloud</td><td>G2; TPU v5e, v5p, v6e (Trillium), v7 (Ironwood)</td><td>L4; TPUs</td><td>TPUs sold as slices of pods</td></tr>
+<tr><td>Azure</td><td>ND A100 v4, ND H100 v5, ND H200 v5, ND GB200 v6</td><td>A100; H100; H200; GB200</td><td>InfiniBand back-end networking</td></tr>
+<tr><td>Azure</td><td>ND MI300X v5</td><td>8 × AMD MI300X</td><td>192 GB HBM per GPU</td></tr>
+<tr><td>OCI, neoclouds</td><td>bare-metal HGX and NVL72 systems</td><td>H100, H200, B200, GB200, MI300X</td><td>often InfiniBand or RoCE; Kubernetes or Slurm on top</td></tr>
+</tbody></table></div>
+
+<p>Despite the variety, the large instances share one anatomy, shown in Figure 3.2 for an eight-GPU H100 instance. The <strong>GPUs</strong> sit on a baseboard and are joined by NVSwitch chips, so any GPU can talk to any other at 450 GB/s per direction (Vol. I §17.4). Each GPU has its own <strong>back-end NIC</strong>, 400 Gb/s for H100 generations and 800 Gb/s for Blackwell, connected to the cluster fabric (Chapter 4); on AWS this is the Elastic Fabric Adapter (EFA), elsewhere InfiniBand or RoCE. Two <strong>host CPUs</strong>, with 192 or so virtual CPUs (vCPUs, hardware threads) and 2 TB of DRAM between them, run the operating system, the inference engine's scheduler and tokenizer, and data loading. Several <strong>local NVMe drives</strong>, typically 8 × 3.84 TB, provide fast scratch space and a cache for model weights (Chapter 5). A separate <strong>front-end NIC</strong> connects to the provider's ordinary network for API traffic, storage and management.</p>
+
+<figure class="diagram" id="fig-3-2">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="Anatomy of an eight-GPU accelerator instance">
+<rect x="15" y="15" width="690" height="250" rx="12" class="bx"/>
+<text x="30" y="36" class="t-sm t-b">One eight-GPU instance (e.g. an H100 or H200 HGX server)</text>
+<g>
+<rect x="40" y="55" width="70" height="44" rx="5" class="bx2"/><text x="75" y="81" text-anchor="middle" class="t-xs">GPU 0</text>
+<rect x="120" y="55" width="70" height="44" rx="5" class="bx2"/><text x="155" y="81" text-anchor="middle" class="t-xs">GPU 1</text>
+<rect x="200" y="55" width="70" height="44" rx="5" class="bx2"/><text x="235" y="81" text-anchor="middle" class="t-xs">GPU 2</text>
+<rect x="280" y="55" width="70" height="44" rx="5" class="bx2"/><text x="315" y="81" text-anchor="middle" class="t-xs">GPU 3</text>
+<rect x="360" y="55" width="70" height="44" rx="5" class="bx2"/><text x="395" y="81" text-anchor="middle" class="t-xs">GPU 4</text>
+<rect x="440" y="55" width="70" height="44" rx="5" class="bx2"/><text x="475" y="81" text-anchor="middle" class="t-xs">GPU 5</text>
+<rect x="520" y="55" width="70" height="44" rx="5" class="bx2"/><text x="555" y="81" text-anchor="middle" class="t-xs">GPU 6</text>
+<rect x="600" y="55" width="70" height="44" rx="5" class="bx2"/><text x="635" y="81" text-anchor="middle" class="t-xs">GPU 7</text>
+</g>
+<rect x="40" y="110" width="630" height="26" rx="5" class="bx4"/><text x="355" y="128" text-anchor="middle" class="t-xs">NVSwitch fabric: any-to-any 450 GB/s per GPU per direction (scale-up)</text>
+<g>
+<rect x="40" y="146" width="70" height="30" rx="5" class="bx3"/><text x="75" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+<rect x="120" y="146" width="70" height="30" rx="5" class="bx3"/><text x="155" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+<rect x="200" y="146" width="70" height="30" rx="5" class="bx3"/><text x="235" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+<rect x="280" y="146" width="70" height="30" rx="5" class="bx3"/><text x="315" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+<rect x="360" y="146" width="70" height="30" rx="5" class="bx3"/><text x="395" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+<rect x="440" y="146" width="70" height="30" rx="5" class="bx3"/><text x="475" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+<rect x="520" y="146" width="70" height="30" rx="5" class="bx3"/><text x="555" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+<rect x="600" y="146" width="70" height="30" rx="5" class="bx3"/><text x="635" y="165" text-anchor="middle" class="t-xs">NIC 400G</text>
+</g>
+<text x="355" y="192" text-anchor="middle" class="t-xs">→ back-end fabric (scale-out): 8 × 400 Gb/s = 3.2 Tb/s per instance</text>
+<rect x="40" y="204" width="200" height="48" rx="6" class="bx5"/><text x="140" y="224" text-anchor="middle" class="t-xs t-b">2 CPUs, ≈ 192 vCPUs</text><text x="140" y="240" text-anchor="middle" class="t-xs">≈ 2 TB DRAM; PCIe Gen5 to GPUs</text>
+<rect x="255" y="204" width="200" height="48" rx="6" class="bx5"/><text x="355" y="224" text-anchor="middle" class="t-xs t-b">local NVMe ≈ 8 × 3.84 TB</text><text x="355" y="240" text-anchor="middle" class="t-xs">scratch, weight cache</text>
+<rect x="470" y="204" width="200" height="48" rx="6" class="bx5"/><text x="570" y="224" text-anchor="middle" class="t-xs t-b">front-end NIC(s)</text><text x="570" y="240" text-anchor="middle" class="t-xs">API, storage, management</text>
+</svg>
+<figcaption><b>Figure 3.2 — Anatomy of a large accelerator instance.</b> Eight GPUs share an NVSwitch scale-up fabric; each has its own back-end NIC to the cluster network; host CPUs, DRAM, local NVMe and a separate front-end network complete the machine. Rack-scale systems such as GB200 NVL72 extend the NVSwitch fabric across 72 GPUs.</figcaption>
+</figure>
+
+<p>Two features of Figure 3.2 shape how instances are used. First, the instance is <em>indivisible along the NVLink domain</em>. A model that needs tensor parallelism over eight GPUs must sit inside one instance (or one NVL72 rack), because NVLink does not cross instance boundaries; a model that needs only one GPU can be packed eight to an instance as eight independent replicas. Clouds therefore sell the large GPUs mostly as whole eight-GPU instances, and fractional sizes (one, two or four GPUs) exist mainly for the inference-class parts. Second, the <em>host is not negligible</em>. Volume I showed that an engine's CPU work—scheduling, tokenisation, detokenisation, sampling bookkeeping—can become the bottleneck when steps are short (Vol. I §12.2). Eight engines on one instance share 192 vCPUs, and a mis-sized host or a noisy process can slow all of them. Instance shapes that skimp on vCPUs per GPU are a false economy for small, fast models.</p>
+<p>Below the flagship eight-GPU instances sits a tier of <strong>inference-class</strong> GPUs: NVIDIA's L4 (24 GB of GDDR6 memory, 300 GB/s, 72 W), L40S (48 GB, 864 GB/s, 350 W) and older A10G, sold one to eight per instance on PCIe without NVLink. They are much cheaper per hour than H100s and were marketed for inference. Whether they are actually cheaper per token is the question of the next section.</p>
+
+<h2 id="s3-3">3.3 Fitting a model: memory, latency floors and cost per token</h2>
+<p>Choosing a device for a model starts with two questions that follow directly from Volume I's decode model. Does the model, with enough KV cache for a useful batch, fit in the device's memory? And can the device read that memory fast enough to meet the latency target? Only then does price enter.</p>
+<p><strong>Fit.</strong> A replica of \(n_g\) devices, each with memory \(M_{\text{HBM}}\) of which a fraction \(f_{\text{use}}\) is usable (the rest goes to the CUDA context, fragmentation and safety margins), must hold the weights \(W_{\text{bytes}}=N b_w\), a reserve \(M_{\text{act}}\) for activations, CUDA graphs and workspace, and the KV cache of \(B\) sequences of mean context \(\bar t\), each needing \(\bar t\,s_{kv}\) bytes. The largest batch that fits is</p>
+\[
+B_{\max}=\left\lfloor\frac{n_g f_{\text{use}}M_{\text{HBM}}-N b_w-M_{\text{act}}}{\bar t\,s_{kv}}\right\rfloor .
+\]
+<p><strong>Latency floor.</strong> In memory-bound decode, each step reads the weights and the batch's KV cache, so with effective bandwidth \(\beta_{\text{eff}}=n_g\cdot\text{MBU}\cdot\beta\) the step time is \(t_{\text{step}}\approx(Nb_w+B\bar ts_{kv})/\beta_{\text{eff}}\) (Vol. I §3.7). Even at \(B=1\) the step cannot be shorter than \(Nb_w/\beta_{\text{eff}}\): this is the device's <strong>TPOT floor</strong> for the model. For a target TPOT \(t^{*}\), the batch the bandwidth allows is \(B(t^{*})=(t^{*}\beta_{\text{eff}}-Nb_w)/(\bar ts_{kv})\), and the batch actually used is the smaller of \(B(t^*)\) and \(B_{\max}\). The decode throughput is then \(\Phi=B/t_{\text{step}}\), and the cost per million output tokens at price \(c_{\text{gpu}}\) per device-hour is \(n_gc_{\text{gpu}}\times10^6/(3600\,\Phi)\) at full utilisation (Vol. I §27.7).</p>
+
+<div class="box example">
+<div class="box-title">Worked example — Llama 3 8B on four devices</div>
+<p><strong>Setup.</strong> Llama 3 8B in FP8: \(Nb_w\approx8.03\) GB; FP8 KV cache, half of the BF16 \(s_{kv}=128\) KiB, so 64 KiB per token; mean context 2,048 tokens, so 0.134 GB per sequence; \(f_{\text{use}}=0.9\), \(M_{\text{act}}=2\) GB, MBU 0.8. Illustrative prices per device-hour: L4 $0.80, L40S $1.80, H100 $2.50, H200 $3.50.</p>
+<p><strong>L4</strong> (24 GB, 300 GB/s). KV space \(21.6-8.03-2\approx11.6\) GB, so \(B_{\max}=86\). \(\beta_{\text{eff}}=240\) GB/s, so the TPOT floor is \(8.03/240\approx33\) ms: the L4 <em>cannot</em> meet a 25 ms TPOT target for this model at any batch. At 50 ms it allows \(B\approx29\), about 590 tokens/s, or about $0.38 per million tokens.</p>
+<p><strong>L40S</strong> (48 GB, 864 GB/s). \(B_{\max}=247\), floor 11.6 ms. At 50 ms, \(B\approx198\): about 3,960 tokens/s, $0.13 per million.</p>
+<p><strong>H100</strong> (80 GB, 3.35 TB/s). \(B_{\max}=462\), floor 3.0 ms. At 50 ms the memory limit binds: \(B=462\), step 26 ms, about 17,700 tokens/s, $0.039 per million.</p>
+<p><strong>H200</strong> (141 GB, 4.8 TB/s). \(B_{\max}=872\), step 32.5 ms, about 26,800 tokens/s, $0.036 per million.</p>
+<p><strong>Check compute.</strong> At the H200's batch of 872, the step's \(2NB\approx1.4\times10^{13}\) FLOPs take about 12 ms at 60% of 1,979 TFLOP/s, below the 32.5 ms memory time, so the memory-bound model holds.</p>
+<p><strong>Lesson.</strong> Per token, at full load, the large GPUs are about ten times cheaper than the L4, because cost per token is price divided by bandwidth-limited throughput, and bandwidth per dollar is far higher on HBM parts. These are roofline upper bounds—real engines reach perhaps half to two-thirds of them once prefill and scheduling are included (Vol. I §27.9 measured 9,000 tokens/s on an H100 at batch 128)—but the ratios survive.</p>
+</div>
+
+<p>Figure 3.3 generalises the example by plotting each device's roofline decode throughput against the TPOT target. Each curve rises steeply just above its floor, as the bandwidth left over after reading the weights admits more sequences, and then flattens when memory capacity caps the batch. The L4 has no throughput at all below 33 ms; the H100 and H200 have most of their throughput available even at 10–15 ms.</p>
+
+<figure class="chart" id="fig-3-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Roofline decode throughput of Llama 3 8B (FP8 weights and KV, 2,048-token contexts) against TPOT target","height":340,
+ "x":{"label":"TPOT target (ms)","min":0,"max":125,"ticks":[0,20,40,60,80,100,120]},
+ "y":{"label":"Output tokens per second per device (log)","log":true,"min":200,"max":40000,"ticks":[300,1000,3000,10000,30000]},
+ "series":[
+  {"name":"L4 (24 GB, 0.3 TB/s)","color":"s2","points":[[40,293],[50,592],[80,1043],[120,1055]]},
+  {"name":"L40S (48 GB, 0.86 TB/s)","color":"s4","points":[[15,1165],[20,2160],[30,3160],[50,3958],[60,4151],[120,4151]]},
+  {"name":"H100 (80 GB, 3.35 TB/s)","color":"s1","points":[[10,14000],[15,16000],[20,17000],[26,17700],[120,17700]]},
+  {"name":"H200 (141 GB, 4.8 TB/s)","color":"s3","points":[[10,22660],[15,24660],[20,25660],[30,26660],[33,26830],[120,26830]]}
+ ],
+ "vlines":[{"x":25,"text":"25 ms"}]}
+</script>
+<figcaption><b>Figure 3.3 — Bandwidth sets the latency floor; capacity sets the plateau.</b> Throughput is \(B/t_{\text{step}}\) with \(B=\min(B(t^*),B_{\max})\), MBU 0.8. A curve starts at the device's TPOT floor (weights divided by effective bandwidth) and flattens when HBM capacity caps the batch. These are upper bounds; measured throughput is lower by a roughly constant factor.</figcaption>
+</figure>
+
+<p>Should anyone, then, serve an 8B model on an L4? Yes, when traffic is small. The cost-per-token comparison assumed every device was fully used. A service that receives only a few hundred output tokens per second still needs at least one replica running, and its cost is the price of that replica whatever its utilisation. The relevant comparison is the cost per token as a function of demand, which Figure 3.4 shows.</p>
+
+<figure class="chart" id="fig-3-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Cost per million output tokens against demand, Llama 3 8B at a 50 ms TPOT target","height":340,
+ "x":{"label":"Demand (output tokens per second, log)","log":true,"min":100,"max":30000,"ticks":[100,300,1000,3000,10000,30000]},
+ "y":{"label":"Dollars per million output tokens (log)","log":true,"min":0.03,"max":10,"ticks":[0.05,0.1,0.2,0.5,1,2,5]},
+ "series":[
+  {"name":"L4 replicas","color":"s2","points":[[100,2.22],[300,0.741],[1000,0.444],[3000,0.444],[10000,0.378],[30000,0.378]]},
+  {"name":"H100 MIG 2g.20gb slices","color":"s5","points":[[100,2.31],[300,0.769],[1000,0.231],[3000,0.154],[10000,0.115],[30000,0.0999]]},
+  {"name":"L40S replicas","color":"s4","points":[[100,5.0],[300,1.667],[1000,0.5],[3000,0.167],[10000,0.15],[30000,0.133]]},
+  {"name":"Whole H100 replicas","color":"s1","points":[[100,6.94],[300,2.31],[1000,0.694],[3000,0.231],[10000,0.0694],[30000,0.0463]]}
+ ]}
+</script>
+<figcaption><b>Figure 3.4 — Small devices win at low demand; large ones win at scale.</b> Cost is \(c\lceil\lambda/\Phi\rceil/(3600\lambda)\) per token, where at least one replica must run. Below about 1,000 tokens/s a whole H100 is mostly idle and an L4 or a MIG slice is cheaper; above about 5,000 tokens/s the whole H100 is cheapest. Prices are illustrative.</figcaption>
+</figure>
+
+<p>Figure 3.4 contains the practical rule. At low demand the curves fall as \(1/\lambda\), because the fixed cost of one replica is spread over more tokens, and the cheapest option is the device with the lowest price per hour. At high demand the curves flatten at the device's full-utilisation cost, and the cheapest option is the one with the most throughput per dollar. The crossover for an 8B model is a few thousand tokens per second. Many real deployments—an internal tool, a fine-tuned model for one customer, a staging environment—live on the left of the chart, and for them a smaller device is the right choice. The violet curve shows a third option: a slice of an H100 obtained by partitioning it, which combines the low price of a small device with the bandwidth per dollar of a large one. Partitioning is the subject of the next section.</p>
+
+<details class="drill">
+<summary>Drill 3.1 — Does Llama 3 70B fit on one H200?</summary>
+<p>Llama 3 70B in FP8 has \(Nb_w\approx70.6\) GB; its FP8 KV cache is \(2\times80\times8\times128\times1=160\) KiB per token. With \(f_{\text{use}}=0.9\) and \(M_{\text{act}}=6\) GB, what batch of 4,096-token sequences fits on one H200 (141 GB), and what is the TPOT floor and the step time at that batch?</p>
+<p><em>Solution.</em> Usable memory \(0.9\times141\approx126.9\) GB; KV space \(126.9-70.6-6\approx50.3\) GB. Each sequence needs \(4096\times160\) KiB \(\approx0.67\) GB, so \(B_{\max}=74\). The TPOT floor is \(70.6/(0.8\times4800)\approx18.4\) ms. At \(B=74\) the step reads \(70.6+49.6\approx120\) GB, about 31 ms. A single H200 can therefore serve this model at a 40 ms TPOT with a batch of about 74, roughly 2,400 tokens/s—but with little headroom for longer contexts. Two H200s with TP2 double the bandwidth and quadruple the KV space (since the weights are now split), which is why 70B models are usually served on two or more devices even when one would technically suffice.</p>
+</details>
+
+<h2 id="s3-4">3.4 Sharing one GPU: time-slicing, MPS and MIG</h2>
+<p>Many workloads cannot fill an H100. A small embedding model, a 1B classifier, a lightly used fine-tune, a developer's notebook: each would use a few percent of the GPU. Giving each its own GPU wastes most of the hardware; putting several on one GPU raises two questions. How is the GPU's capacity divided among them, and how well is each protected from the others—from slowing them down, from crashing them, and from reading their data? NVIDIA GPUs offer three mechanisms, which make different trade-offs. Figure 3.5 compares them.</p>
+
+<figure class="diagram" id="fig-3-5">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Three ways to share a GPU: time-slicing, MPS and MIG">
+<rect x="10" y="15" width="225" height="245" rx="10" class="bx"/>
+<text x="122" y="36" text-anchor="middle" class="t-sm t-b">Time-slicing</text>
+<rect x="30" y="50" width="185" height="26" rx="4" class="bx2"/><text x="122" y="67" text-anchor="middle" class="t-xs">A owns whole GPU</text>
+<rect x="30" y="80" width="185" height="26" rx="4" class="bx3"/><text x="122" y="97" text-anchor="middle" class="t-xs">B owns whole GPU</text>
+<rect x="30" y="110" width="185" height="26" rx="4" class="bx4"/><text x="122" y="127" text-anchor="middle" class="t-xs">C owns whole GPU</text>
+<text x="122" y="152" text-anchor="middle" class="t-xs">turns of a few ms, context switches</text>
+<text x="30" y="182" class="t-xs">compute: shared in time</text>
+<text x="30" y="198" class="t-xs">memory capacity: not partitioned</text>
+<text x="30" y="214" class="t-xs">fault isolation: separate contexts</text>
+<text x="30" y="230" class="t-xs">performance isolation: none</text>
+<text x="30" y="246" class="t-xs">any GPU, no setup</text>
+<rect x="248" y="15" width="225" height="245" rx="10" class="bx"/>
+<text x="360" y="36" text-anchor="middle" class="t-sm t-b">MPS</text>
+<rect x="268" y="50" width="60" height="86" rx="4" class="bx2"/><text x="298" y="97" text-anchor="middle" class="t-xs">A</text>
+<rect x="331" y="50" width="60" height="86" rx="4" class="bx3"/><text x="361" y="97" text-anchor="middle" class="t-xs">B</text>
+<rect x="394" y="50" width="60" height="86" rx="4" class="bx4"/><text x="424" y="97" text-anchor="middle" class="t-xs">C</text>
+<text x="360" y="152" text-anchor="middle" class="t-xs">kernels run concurrently on shared SMs</text>
+<text x="268" y="182" class="t-xs">compute: concurrent, optional % caps</text>
+<text x="268" y="198" class="t-xs">memory capacity: optional limits</text>
+<text x="268" y="214" class="t-xs">fault isolation: weak (shared server)</text>
+<text x="268" y="230" class="t-xs">performance isolation: partial</text>
+<text x="268" y="246" class="t-xs">best utilisation for cooperative jobs</text>
+<rect x="486" y="15" width="225" height="245" rx="10" class="bx"/>
+<text x="598" y="36" text-anchor="middle" class="t-sm t-b">MIG (A100, H100, B200)</text>
+<rect x="506" y="50" width="88" height="40" rx="4" class="bx2"/><text x="550" y="74" text-anchor="middle" class="t-xs">3g.40gb</text>
+<rect x="598" y="50" width="94" height="40" rx="4" class="bx3"/><text x="645" y="74" text-anchor="middle" class="t-xs">2g.20gb</text>
+<rect x="506" y="94" width="58" height="42" rx="4" class="bx4"/><text x="535" y="119" text-anchor="middle" class="t-xs">1g.10gb</text>
+<rect x="568" y="94" width="58" height="42" rx="4" class="bx5"/><text x="597" y="119" text-anchor="middle" class="t-xs">1g.10gb</text>
+<text x="661" y="113" text-anchor="middle" class="t-xs">3+2+1+1</text><text x="661" y="127" text-anchor="middle" class="t-xs">= 7 slices</text>
+<text x="598" y="152" text-anchor="middle" class="t-xs">hardware partitions of SMs, L2, memory</text>
+<text x="506" y="182" class="t-xs">compute: dedicated SM slices</text>
+<text x="506" y="198" class="t-xs">memory + bandwidth: dedicated</text>
+<text x="506" y="214" class="t-xs">fault isolation: strong</text>
+<text x="506" y="230" class="t-xs">performance isolation: strong</text>
+<text x="506" y="246" class="t-xs">fixed profiles, up to 7 per GPU</text>
+</svg>
+<figcaption><b>Figure 3.5 — Three ways to share a GPU.</b> Time-slicing takes turns on the whole GPU; MPS runs several processes' kernels at once on shared hardware; MIG divides the GPU into hardware-isolated instances with their own compute, cache, memory capacity and memory bandwidth.</figcaption>
+</figure>
+
+<p><strong>Time-slicing</strong> is the default when several processes use one GPU. Each process has its own GPU context; the GPU runs one context at a time and switches between them, giving each a turn of some milliseconds. Memory capacity is not partitioned—all processes allocate from the same HBM, and one can starve the others—and there is no performance isolation: if two processes are busy, each runs at roughly half speed, plus the cost of context switches. Time-slicing is useful for development and for workloads that are mostly idle. For latency-sensitive serving it is dangerous, because each tenant's step time depends on what the others are doing.</p>
+<p>The <strong>Multi-Process Service</strong> (MPS) lets kernels from several processes run <em>concurrently</em> on the GPU's SMs, through a shared server process that funnels their work into one hardware context. Concurrency lets small kernels from different processes fill SMs that each process alone would leave idle, so MPS achieves higher utilisation than time-slicing for workloads with small kernels. Since the Volta generation, MPS clients have separate address spaces and can be given caps on the fraction of SMs they may use and on memory. Isolation is still weaker than separate GPUs: the processes share memory bandwidth and caches, and a fatal fault in one client can affect others served by the same MPS server. MPS suits cooperative workloads under one owner, such as several small models of the same team.</p>
+<p><strong>Multi-Instance GPU</strong> (MIG), introduced with the A100 in 2020 and continued in H100 and Blackwell, divides the GPU in hardware. An H100's compute is organised into seven slices of SMs and its memory system into eight slices of L2 cache, memory controllers and HBM capacity. A MIG <em>instance</em> combines some compute slices and some memory slices into what looks to software like a separate, smaller GPU, with profiles named by compute slices and memory: on an 80 GB H100, <code>1g.10gb</code> (one-seventh of the SMs, 10 GB), <code>2g.20gb</code>, <code>3g.40gb</code>, <code>4g.40gb</code> and <code>7g.80gb</code> (the whole GPU). Because each instance has its own share of SMs, L2 and memory channels, one instance's load cannot slow another's kernels or memory accesses, and faults are contained. The price is rigidity: only certain combinations of profiles fit on one GPU, reconfiguration requires the affected instances to be idle, and the slicing granularity is coarse.</p>
+<p>For LLM decode, MIG has a particularly clean interpretation. Since decode is memory-bound, an instance with a quarter of the memory slices delivers about a quarter of the GPU's bandwidth—about 0.84 TB/s for a <code>2g.20gb</code> instance of an H100, comparable to an L40S, with 20 GB of capacity. In Figure 3.4, three such instances per H100 at a third of its price each give the violet curve: as cheap as an L4 at low demand and far cheaper at moderate demand. MIG turns one large GPU into several small ones with nearly the large GPU's bandwidth per dollar, and with isolation strong enough to serve different customers' models side by side.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — interference under time-slicing</div>
+<p>Model a time-sliced GPU shared by \(k\) tenants as a processor-sharing server. If tenant \(i\) is active (has work queued) a fraction \(\upsilon_i\) of the time, independently, then when tenant 1 is active the expected number of other active tenants is \(\sum_{i\ne1}\upsilon_i\), and its work progresses at rate roughly \(1/(1+\sum_{i\ne1}\upsilon_i)\) of the full GPU, minus context-switch overhead. A tenant whose own requests need a 30 ms decode step on a dedicated GPU sees an expected step of \(30(1+\sum_{i\neq1}\upsilon_i)\) ms—but the distribution matters more than the mean: when all \(k\) tenants are busy at once, its step is \(k\) times longer, and the tail latency of each tenant is set by the joint busy periods of all of them. With MIG, each tenant's step is fixed by its slice regardless of the others: a dedicated slice of \(1/k\) of the bandwidth gives a step \(k\) times the dedicated-GPU step <em>always</em>. Time-slicing is better on average for bursty tenants and worse in the tail; MIG gives predictable, worse-on-average latency. This is the general trade-off between statistical multiplexing and hard partitioning.</p>
+</div>
+
+<p>Cloud providers expose these mechanisms in different ways. Kubernetes can advertise MIG instances or time-sliced "replicas" of a GPU as schedulable resources (Chapter 6). Some providers sell fractional-GPU instances backed by MIG or by NVIDIA's <strong>vGPU</strong> software, which virtualises a GPU across several VMs with time-slicing or MIG underneath. For multi-tenant inference platforms, the usual pattern is MIG when tenants are different customers and must be isolated, MPS or simply running several models in one engine process when one team owns all the models, and time-slicing only for development. Sharing helps when models are small. When models are large, the question becomes which large accelerator to use, and NVIDIA is not the only supplier.</p>
+
+<h2 id="s3-5">3.5 Beyond NVIDIA: TPUs, Trainium and AMD Instinct</h2>
+<p>Three families of non-NVIDIA accelerators are available at scale as cloud products, and each has served frontier models in production. They differ from NVIDIA's GPUs less in raw specifications than in the scale-up domain they offer, the software stack they require, and where they can be rented. Table 3.2 summarises representative parts.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 3.2 — Representative accelerators as cloud products (approximate dense throughputs, per chip)</caption>
+<thead><tr><th>Accelerator</th><th class="num">Memory</th><th class="num">Bandwidth</th><th class="num">16-bit TFLOP/s</th><th>Scale-up domain</th><th>Software</th></tr></thead>
+<tbody>
+<tr><td>NVIDIA H100 SXM</td><td class="num">80 GB</td><td class="num">3.35 TB/s</td><td class="num">989</td><td>8 (NVLink)</td><td>CUDA</td></tr>
+<tr><td>NVIDIA H200</td><td class="num">141 GB</td><td class="num">4.8 TB/s</td><td class="num">989</td><td>8 (NVLink)</td><td>CUDA</td></tr>
+<tr><td>NVIDIA B200</td><td class="num">≈ 180–192 GB</td><td class="num">8 TB/s</td><td class="num">≈ 2,250</td><td>8; 72 in GB200 NVL72</td><td>CUDA</td></tr>
+<tr><td>AMD MI300X</td><td class="num">192 GB</td><td class="num">5.3 TB/s</td><td class="num">≈ 1,300</td><td>8 (Infinity Fabric)</td><td>ROCm</td></tr>
+<tr><td>AMD MI355X</td><td class="num">288 GB</td><td class="num">8 TB/s</td><td class="num">≈ 2,500</td><td>8</td><td>ROCm</td></tr>
+<tr><td>Google TPU v5e</td><td class="num">16 GB</td><td class="num">0.82 TB/s</td><td class="num">197</td><td>256 (ICI torus)</td><td>JAX / XLA, PyTorch-XLA</td></tr>
+<tr><td>Google TPU v6e (Trillium)</td><td class="num">32 GB</td><td class="num">1.6 TB/s</td><td class="num">918</td><td>256</td><td>JAX / XLA, vLLM-TPU</td></tr>
+<tr><td>Google TPU v7 (Ironwood)</td><td class="num">192 GB</td><td class="num">7.4 TB/s</td><td class="num">≈ 2,300</td><td>up to 9,216</td><td>JAX / XLA</td></tr>
+<tr><td>AWS Trainium2</td><td class="num">96 GB</td><td class="num">2.9 TB/s</td><td class="num">≈ 670</td><td>16 per instance; 64 per UltraServer</td><td>Neuron SDK</td></tr>
+</tbody></table></div>
+
+<p><strong>Google's TPUs</strong> are the most mature alternative. They were designed from the start as systolic matrix engines (Vol. I §5.8) joined by a dedicated inter-chip interconnect (ICI) in a two- or three-dimensional torus, so a TPU "pod" is a scale-up domain of hundreds to thousands of chips without external switches. They are sold as <em>slices</em> of pods: a v5e slice of 8 chips for a small model, a slice of 256 for a large one. Inference-oriented generations (v5e, v6e) traded per-chip memory for cost; the 2025 Ironwood generation, explicitly aimed at inference, raised per-chip memory to 192 GB and bandwidth to about 7.4 TB/s. The software stack is XLA, the compiler behind JAX and PyTorch-XLA, and serving engines such as JetStream and a TPU backend for vLLM. TPUs serve Google's own Gemini models and are used by external labs; their advantages are cost, availability within Google Cloud and very large scale-up domains, and their main obstacle is that code written for CUDA kernels does not run on them.</p>
+<p><strong>AWS's Trainium and Inferentia</strong> are Amazon's own accelerators. Inferentia2 (2022) targeted inference; Trainium2 (2024), despite its name, is used for both training and inference, with 96 GB of HBM per chip, 16 chips per instance joined by a proprietary NeuronLink, and "UltraServers" of 64 chips. They are programmed through the Neuron SDK, which compiles PyTorch and JAX models and offers a vLLM integration. Their pitch is price–performance within AWS, and their largest public deployment is Anthropic's use of Trainium2 at very large scale. As with TPUs, adoption depends on whether a model's kernels and engine features have been ported.</p>
+<p><strong>AMD's Instinct GPUs</strong> are the most direct alternative to NVIDIA, because they are GPUs with a similar programming model, programmed through the ROCm stack and the HIP language, which mirrors CUDA closely. The MI300X (2023) stood out for memory: 192 GB of HBM3 at 5.3 TB/s per GPU, more than twice an H100's capacity, so a model that needs two H100s may fit on one MI300X, and a 70B model in FP8 fits with room for a large KV cache. The MI325X raised memory to 256 GB, and the MI355X (2025) to 288 GB with FP4 support. vLLM and SGLang run on ROCm, and several large inference deployments have used MI300X. The historical gap has been software maturity: kernels such as FlashAttention variants, FP8 paths and collective libraries arrived later and initially reached a lower fraction of peak than on NVIDIA hardware, though that gap narrowed through 2024–2025.</p>
+<p>From the infrastructure engineer's point of view, a non-NVIDIA accelerator should be evaluated with the same quantities as any other—memory, bandwidth, scale-up size, price per hour, achieved MBU and MFU on the actual engine and model, availability in the needed regions—plus two extra costs: the engineering effort to port and maintain the serving stack, and the risk of depending on a less widely used toolchain. The next section turns this into a procedure.</p>
+
+<h2 id="s3-6">3.6 Choosing hardware: a procedure</h2>
+<p>We can now assemble the pieces into a procedure that answers "which hardware should we serve this model on?" for any model, latency target and traffic level. The procedure is deliberately mechanical, because in an interview—and in practice—the value lies in doing each step explicitly and stating its assumptions.</p>
+<ol>
+<li><strong>State the requirements.</strong> Model (parameters, architecture, KV size per token), precision the quality budget allows (BF16, FP8, FP4; Vol. I Chapter 14), latency targets (TTFT and TPOT at a percentile), traffic (mean and peak prefill and decode tokens per second, context distribution), and constraints (regions, residency, isolation, budget, delivery date).</li>
+<li><strong>Find feasible replica shapes.</strong> For each candidate device, find the smallest number of devices \(n_g\) (respecting the parallelism the model allows—tensor-parallel degrees must divide the head counts, and must lie within one scale-up domain) such that \(B_{\max}\) is large enough for a useful batch at the typical context. Discard shapes whose TPOT floor \(Nb_w/(n_g\,\text{MBU}\,\beta)\), plus communication time, exceeds the target.</li>
+<li><strong>Estimate throughput at the target.</strong> For each feasible shape, compute \(\Phi\) at the TPOT target with \(B=\min(B(t^*),B_{\max})\) and check that compute does not bind; account for prefill sharing the device. Better still, measure it with the real engine (Chapter 28 of Volume I describes how).</li>
+<li><strong>Compute cost at the expected utilisation.</strong> Cost per million tokens \(=n_gc_{\text{gpu}}\times10^6/(3600\,\Phi\,u)\), and at low traffic, the cost of the minimum replica count (Figure 3.4).</li>
+<li><strong>Apply the qualitative filters.</strong> Availability and quota in the needed regions, purchase terms (Chapter 9), software maturity and the cost of porting, power and cooling if self-hosted (Chapter 2), and operational familiarity.</li>
+<li><strong>Decide, and plan to revisit.</strong> Choose, keep a second option qualified, and re-run the procedure with each new hardware generation or price change.</li>
+</ol>
+
+<p>Figure 3.6 draws the same procedure as a decision flow, and it is worth reading from the bottom up as well as from the top down. Read top-down, it filters: each box in the left column removes hardware that cannot meet a hard requirement—memory, latency, isolation, availability—before any price is consulted. Read bottom-up, it explains why real decisions rarely land on the option with the best headline cost per token: that option often fails a filter that the spreadsheet did not encode, such as a regional quota or the absence of liquid-cooled capacity. Interviewers reward candidates who apply the filters explicitly and say which one bound. Note also the loop on the right of the figure: the decision is revisited whenever prices, generations or traffic change, which in 2023–2026 meant roughly every six months.</p>
+
+<figure class="diagram" id="fig-3-6">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-label="Decision flow for choosing hardware for a model">
+<defs><marker id="a36" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="20" y="15" width="250" height="44" rx="8" class="bx4"/><text x="145" y="34" text-anchor="middle" class="t-xs t-b">requirements: model, precision,</text><text x="145" y="49" text-anchor="middle" class="t-xs">TTFT/TPOT, traffic, regions, isolation</text>
+<rect x="20" y="80" width="250" height="44" rx="8" class="bx"/><text x="145" y="99" text-anchor="middle" class="t-xs t-b">for each device: smallest n_g with</text><text x="145" y="114" text-anchor="middle" class="t-xs">useful B_max (TP divides heads)</text>
+<rect x="20" y="145" width="250" height="44" rx="8" class="bx"/><text x="145" y="164" text-anchor="middle" class="t-xs t-b">latency: floor + communication</text><text x="145" y="179" text-anchor="middle" class="t-xs">below TPOT target?</text>
+<rect x="20" y="210" width="250" height="44" rx="8" class="bx"/><text x="145" y="229" text-anchor="middle" class="t-xs t-b">throughput Φ at target (measure),</text><text x="145" y="244" text-anchor="middle" class="t-xs">cost per token at expected u</text>
+<rect x="20" y="275" width="250" height="44" rx="8" class="bx3"/><text x="145" y="294" text-anchor="middle" class="t-xs t-b">filters: availability, quota, terms,</text><text x="145" y="309" text-anchor="middle" class="t-xs">software maturity, cooling, team</text>
+<line x1="145" y1="59" x2="145" y2="78" class="ln" marker-end="url(#a36)"/>
+<line x1="145" y1="124" x2="145" y2="143" class="ln" marker-end="url(#a36)"/>
+<line x1="145" y1="189" x2="145" y2="208" class="ln" marker-end="url(#a36)"/>
+<line x1="145" y1="254" x2="145" y2="273" class="ln" marker-end="url(#a36)"/>
+<rect x="330" y="80" width="170" height="44" rx="8" class="bx2"/><text x="415" y="99" text-anchor="middle" class="t-xs">does not fit: more devices,</text><text x="415" y="114" text-anchor="middle" class="t-xs">lower precision, or discard</text>
+<rect x="330" y="145" width="170" height="44" rx="8" class="bx2"/><text x="415" y="164" text-anchor="middle" class="t-xs">too slow: more bandwidth</text><text x="415" y="179" text-anchor="middle" class="t-xs">(larger n_g, newer part)</text>
+<rect x="330" y="210" width="170" height="44" rx="8" class="bx2"/><text x="415" y="229" text-anchor="middle" class="t-xs">low traffic: smallest replica</text><text x="415" y="244" text-anchor="middle" class="t-xs">(MIG slice, small GPU)</text>
+<line x1="270" y1="102" x2="328" y2="102" class="ln" marker-end="url(#a36)"/>
+<line x1="270" y1="167" x2="328" y2="167" class="ln" marker-end="url(#a36)"/>
+<line x1="270" y1="232" x2="328" y2="232" class="ln" marker-end="url(#a36)"/>
+<rect x="540" y="230" width="165" height="90" rx="8" class="bx5"/><text x="622" y="256" text-anchor="middle" class="t-xs t-b">decide; keep a second</text><text x="622" y="272" text-anchor="middle" class="t-xs">option qualified; route</text><text x="622" y="288" text-anchor="middle" class="t-xs">traffic by cost and</text><text x="622" y="304" text-anchor="middle" class="t-xs">availability</text>
+<line x1="270" y1="297" x2="538" y2="297" class="ln" marker-end="url(#a36)"/>
+<path d="M622,230 C622,60 400,30 272,36" class="ln ln-acc" fill="none" marker-end="url(#a36)"/>
+<text x="560" y="70" class="t-xs t-acc">revisit with each new</text>
+<text x="560" y="84" class="t-xs t-acc">generation, price or</text>
+<text x="560" y="98" class="t-xs t-acc">traffic change</text>
+</svg>
+<figcaption><b>Figure 3.6 — Choosing hardware as a sequence of filters.</b> Hard requirements (fit, latency) remove options before cost is compared; practical filters (availability, maturity) often decide among the survivors. The loop back reflects how often the answer changes.</figcaption>
+</figure>
+
+<div class="box example">
+<div class="box-title">Worked example — Llama 3 70B: H100, H200, B200 or MI300X?</div>
+<p><strong>Requirements.</strong> Llama 3 70B in FP8 (70.6 GB of weights, 160 KiB of FP8 KV per token); 4,096-token contexts; a working batch of 128 sequences (86 GB of KV); 6 GB per device of activations and workspace; 40 ms TPOT. Illustrative prices per device-hour: H100 $2.50, H200 $3.50, B200 $5.00, MI300X $3.00.</p>
+<p><strong>Feasible shapes.</strong> The replica needs about \(70.6+86=157\) GB plus workspace. H100 (80 GB): three devices would hold it, but tensor parallelism must divide the 8 KV heads, so TP4 (320 GB) is the smallest shape. H200 (141 GB): TP2 (282 GB). B200 (180 GB usable class): TP1 holds 162 GB at 90%—too tight with workspace—so TP2; in FP4 weights (35 GB) a single B200 suffices. MI300X (192 GB): TP1 holds 173 GB at 90%, marginal, so TP2 for comfort.</p>
+<p><strong>Bandwidth per dollar.</strong> Decode throughput is roughly proportional to aggregate bandwidth (all shapes have room for the batch). H100 TP4: 13.4 TB/s for $10/h. H200 TP2: 9.6 TB/s for $7/h. B200 TP2: 16 TB/s for $10/h. MI300X TP2: 10.6 TB/s for $6/h. Per dollar: 1.34, 1.37, 1.60 and 1.77 TB/s per $/h respectively. B200 in FP4 on one device reads half the bytes, so it is equivalent to 16 TB/s of FP8 bandwidth for $5/h, 3.2 per $/h—if FP4 meets the quality bar.</p>
+<p><strong>Latency floors.</strong> At MBU 0.8 the weight-read floors are about 6.6 ms (H100 TP4), 9.2 ms (H200 TP2), 5.5 ms (B200 TP2) and 8.3 ms (MI300X TP2), all comfortably under 40 ms, though TP all-reduces add a few milliseconds per step (Vol. I §18.2).</p>
+<p><strong>Qualitative filters.</strong> MI300X leads on paper, but its delivered MBU on the team's engine must be measured, not assumed; if it reaches only 0.6 against 0.8 on NVIDIA, its advantage disappears. B200 needs liquid-cooled capacity that may be scarce. H200 is a drop-in upgrade for an H100 stack.</p>
+<p><strong>Decision.</strong> Benchmark B200 (FP8 and FP4) and MI300X on the real workload; meanwhile move from H100 TP4 to H200 TP2, which keeps the software unchanged and halves the devices per replica. The general lesson: more memory per device lowers the parallel degree, which lowers communication overhead and raises bandwidth per dollar.</p>
+</div>
+
+<p>The worked example illustrates a subtle point. Memory capacity per device matters beyond "does it fit". A larger device lets a replica use fewer devices, and a smaller tensor-parallel degree means fewer all-reduces per step, less communication overhead, and replicas that are smaller failure domains and easier to schedule (Chapter 7). This is why the H200 and MI300X, whose compute is no faster than an H100's, sold well for inference: they let 70B-class models run on two devices instead of four. Conversely, for very large mixture-of-experts models such as DeepSeek-V3, the decisive property is the size of the scale-up domain: expert parallelism over 72 GPUs in one NVLink domain (Vol. I §19.6) or over a TPU pod is far cheaper in communication than the same parallelism over a scale-out network, so rack-scale systems are the natural home of the largest models.</p>
+
+<details class="drill">
+<summary>Drill 3.2 — Isolated replicas for forty customers</summary>
+<p>Forty enterprise customers each have a fine-tuned Llama 3 8B (merged weights, FP8) and demand an isolated replica that no other customer shares. Each customer's peak load is about 1,500 output tokens/s at a 50 ms TPOT. Compare dedicating one H100 per customer with using H100 MIG <code>2g.20gb</code> instances (three per H100, each about 2,480 tokens/s at 50 ms from the model of §3.3).</p>
+<p><em>Solution.</em> Dedicated H100s: 40 GPUs, each about 8% utilised at peak. MIG: each customer fits in one <code>2g.20gb</code> instance (20 GB holds 8 GB of weights plus about 8 GB of KV), whose roughly 2,480 tokens/s covers the 1,500 tokens/s peak at about 60% utilisation; three instances per H100 gives 14 GPUs. Hardware isolation of SMs, cache, memory capacity and bandwidth meets the "not shared" requirement in a way that time-slicing or MPS would not. Cost falls by about 65%. If customers' loads are bursty and their peaks do not coincide, a shared multi-LoRA deployment (Vol. I §27.4) would be cheaper still, but it would not satisfy the isolation requirement.</p>
+</details>
+
+<h2 id="s3-7">3.7 Availability: the hardware you can actually get</h2>
+<p>The procedure of §3.6 ranks hardware by cost per token, but the ranking is useless if the winning hardware cannot be obtained. In practice, availability is often the deciding factor, for four reasons that an infrastructure engineer must understand.</p>
+<p>First, <strong>not every type exists in every region</strong>. New GPU generations are installed first in a few large regions and reach others over a year or more; TPUs exist only in Google Cloud regions, and the newest generations only in some of them. A team bound to a European region for data residency (Chapter 12) may find that the hardware of its choice is simply not offered there. Second, <strong>capacity is rationed through quotas</strong>. Clouds limit how many accelerators of each type an account may launch in each region, and raising the quota for scarce types requires a request, a business case and often a commitment to reserved capacity. On-demand access to eight-GPU H100 instances was, for much of 2023–2024, more a theoretical than a practical option. Third, <strong>purchase terms change the price by large factors</strong>: on-demand, reserved for one or three years, capacity blocks booked for days or weeks, and spot capacity that can be reclaimed at short notice all coexist, and the cheapest hardware on a per-hour basis may be available only on terms that do not fit the workload (Chapter 9). Fourth, <strong>portability is a hedge</strong>. A serving stack that runs well on two or three hardware families can take whatever capacity is available at the best price, while a stack tied to one family must accept that family's price and supply.</p>
+<p>For these reasons, large serving organisations treat hardware as a portfolio. They keep their engines portable across NVIDIA generations and, increasingly, across vendors (vLLM and SGLang support NVIDIA, AMD and TPU backends; Trainium has a Neuron integration). They qualify each model on several hardware types, so that traffic can move when capacity or prices change. And they place each workload on the hardware where it is cheapest: latency-critical traffic on the newest NVLink domains, steady high-volume traffic on whatever offers the best bandwidth per dollar, small models on MIG slices or inference-class GPUs, and batch work on spot or older capacity. This portfolio is connected by networks, inside each cluster and between them, and those networks are the subject of the next chapter.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We have treated each instance as a self-contained machine: eight GPUs, an NVSwitch, and eight NICs whose bandwidth we quoted without asking where the cables go. But replicas larger than one instance (disaggregated prefill and decode, wide expert parallelism, multi-node tensor or pipeline parallelism), the loading of weights, and the movement of KV caches between machines all depend on the network that joins thousands of these instances. How is that network built, what does its topology cost, why do flows collide in it, and what does inference need from it? Chapter 4 answers these questions.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>An instance is a VM or a bare-metal server. GPUs are passed through to VMs via the IOMMU, so kernels and HBM traffic run natively; offload cards (Nitro) and SR-IOV remove most network and storage virtualisation cost.</li>
+<li>Large instances are whole eight-GPU servers with NVSwitch, one 400–800 Gb/s back-end NIC per GPU, about 192 vCPUs and 2 TB of DRAM, local NVMe, and a front-end NIC; rack-scale systems (GB200 NVL72, Trn2 UltraServers) are sold as units.</li>
+<li>Fit: \(B_{\max}=\lfloor(n_gf_{\text{use}}M_{\text{HBM}}-Nb_w-M_{\text{act}})/(\bar ts_{kv})\rfloor\). Latency floor: \(Nb_w/\beta_{\text{eff}}\). Throughput: \(B/t_{\text{step}}\) at \(B=\min(B(t^*),B_{\max})\).</li>
+<li>For Llama 3 8B, an L4 cannot meet a 25 ms TPOT (33 ms floor); at full load H100/H200 are about ten times cheaper per token than L4, but at low demand the cheapest replica wins (crossover at a few thousand tokens/s).</li>
+<li>Time-slicing shares the whole GPU in turns (no isolation); MPS runs kernels concurrently (partial isolation, good utilisation); MIG partitions SMs, L2, memory capacity and bandwidth into up to seven isolated instances.</li>
+<li>A MIG slice delivers roughly its share of HBM bandwidth, so it combines a small device's price with a large device's bandwidth per dollar—ideal for isolated small-model replicas.</li>
+<li>TPUs (XLA, large torus pods, Ironwood for inference), Trainium2 (Neuron, UltraServers) and AMD Instinct (ROCm, 192–288 GB per GPU) are production alternatives; evaluate them by measured MBU, scale-up size, price and porting cost.</li>
+<li>More memory per device lowers the parallel degree, reducing communication and raising bandwidth per dollar; for giant MoE models the scale-up domain size is decisive.</li>
+<li>Availability—regional presence, quotas, purchase terms—often decides; portable serving stacks and multi-hardware portfolios are the hedge.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci03-mcq-01" data-topic="§3.1 Instances">
+<p class="q">Why does a GPU passed through to a VM run its kernels at nearly bare-metal speed?</p>
+<ol class="opts"><li>The hypervisor emulates the GPU efficiently</li><li data-correct>The guest drives the physical GPU directly; the IOMMU only translates its memory accesses</li><li>VMs have more HBM</li><li>Kernels run on the host CPU</li></ol>
+<div class="explain">The GPU–HBM data path never involves the hypervisor.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-02" data-topic="§3.1 Instances">
+<p class="q">What does SR-IOV provide?</p>
+<ol class="opts"><li>GPU partitioning</li><li data-correct>One physical PCIe device (e.g. a NIC) appearing as many virtual devices assignable to guests</li><li>Encrypted memory</li><li>Faster HBM</li></ol>
+<div class="explain">It removes the hypervisor's software switch from the packet path.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-03" data-topic="§3.1 Instances">
+<p class="q">Which are reasons to prefer bare-metal GPU instances? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Control of drivers, firmware and the NVSwitch fabric manager</li><li data-correct>Ability to configure MIG and run one's own virtualisation or Kubernetes</li><li>Faster provisioning than VMs</li><li data-correct>Removing the last few percent of host overhead</li></ol>
+<div class="explain">VMs usually provision faster and support live maintenance.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-04" data-topic="§3.1 Instances">
+<p class="q">The Popek–Goldberg condition for efficient virtualisation concerns:</p>
+<ol class="opts"><li>GPU memory size</li><li data-correct>Every sensitive instruction being privileged, so that it traps to the hypervisor</li><li>Network bandwidth</li><li>Disk encryption</li></ol>
+<div class="explain">Then all other instructions can run natively.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-05" data-topic="§3.2 Catalogue">
+<p class="q">Why are flagship GPUs usually sold as whole eight-GPU instances?</p>
+<ol class="opts"><li>Licensing</li><li data-correct>The NVLink domain is the server, and models that need TP must sit within it; fractions would rarely be usable by others</li><li>Single GPUs cannot be passed through</li><li>Power supplies cannot be split</li></ol>
+<div class="explain">Inference-class PCIe GPUs are sold in fractions instead.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-06" data-topic="§3.2 Catalogue">
+<p class="q">An eight-GPU H100 instance with one 400 Gb/s back-end NIC per GPU has an aggregate back-end bandwidth of:</p>
+<ol class="opts"><li>400 Gb/s</li><li data-correct>3.2 Tb/s</li><li>450 GB/s</li><li>3.35 TB/s</li></ol>
+<div class="explain">8 × 400 Gb/s = 3,200 Gb/s = 400 GB/s.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-07" data-topic="§3.2 Catalogue">
+<p class="q">Why can skimping on host vCPUs hurt a small, fast model?</p>
+<ol class="opts"><li>GPUs need vCPUs for HBM</li><li data-correct>Engine CPU work (scheduling, tokenisation, detokenisation) can bottleneck short steps</li><li>vCPUs set NVLink speed</li><li>It cannot; vCPUs are irrelevant</li></ol>
+<div class="explain">See Vol. I §12.2 on CPU overhead in engines.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-08" data-topic="§3.3 Fit">
+<p class="q">For a memory-bound model, the TPOT floor of a device is approximately:</p>
+<ol class="opts"><li>FLOPs per token / peak FLOP/s</li><li data-correct>Weight bytes / effective bandwidth</li><li>KV bytes per token / bandwidth</li><li>Network latency</li></ol>
+<div class="explain">Even at batch 1, each step must read the weights.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-09" data-topic="§3.3 Fit">
+<p class="q">Why can an L4 not meet a 25 ms TPOT for Llama 3 8B in FP8?</p>
+<ol class="opts"><li>It lacks FP8</li><li data-correct>Reading 8 GB of weights at about 240 GB/s effective takes about 33 ms</li><li>It has no tensor cores</li><li>Its KV cache is too small for batch 1</li></ol>
+<div class="explain">Bandwidth, not capacity, sets this floor.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-10" data-topic="§3.3 Fit">
+<p class="q">In Figure 3.3, why does each throughput curve flatten at large TPOT targets?</p>
+<ol class="opts"><li>Compute becomes the bottleneck</li><li data-correct>HBM capacity caps the batch at \(B_{\max}\)</li><li>The network saturates</li><li>Prefill takes over</li></ol>
+<div class="explain">Beyond that point more latency budget cannot be converted into more batch.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-11" data-topic="§3.3 Fit">
+<p class="q">At full utilisation, why is an H100 much cheaper per 8B token than an L4 despite a higher hourly price?</p>
+<ol class="opts"><li>H100s are subsidised</li><li data-correct>Bandwidth and capacity per dollar are far higher, so throughput rises more than price</li><li>L4s cannot run FP8</li><li>H100s use less power</li></ol>
+<div class="explain">Cost per token is price divided by bandwidth-limited throughput.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-12" data-topic="§3.3 Fit">
+<p class="q">At very low demand (a few hundred tokens/s), the cheapest option is usually:</p>
+<ol class="opts"><li>The device with the most bandwidth</li><li data-correct>The device (or slice) with the lowest price per hour that meets the latency target</li><li>A whole eight-GPU instance</li><li>Always the H200</li></ol>
+<div class="explain">One replica must run regardless, so its hourly price dominates.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-13" data-topic="§3.3 Fit">
+<p class="q">\(B_{\max}\) increases when: (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Weights are quantised from BF16 to FP8</li><li data-correct>The KV cache is quantised or uses GQA/MLA</li><li>The mean context grows</li><li data-correct>More devices are used per replica</li></ol>
+<div class="explain">Longer contexts consume more KV per sequence and lower \(B_{\max}\).</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-14" data-topic="§3.4 Sharing">
+<p class="q">Which GPU-sharing mechanism provides hardware isolation of memory bandwidth?</p>
+<ol class="opts"><li>Time-slicing</li><li>MPS</li><li data-correct>MIG</li><li>CUDA streams</li></ol>
+<div class="explain">MIG instances have dedicated L2 slices and memory controllers.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-15" data-topic="§3.4 Sharing">
+<p class="q">Under time-slicing, the main risk for latency-sensitive serving is:</p>
+<ol class="opts"><li>Memory leaks</li><li data-correct>Each tenant's step time depends on how many others are busy, inflating tail latency</li><li>Lower precision</li><li>Lost requests</li></ol>
+<div class="explain">When all \(k\) tenants are busy, steps take about \(k\) times longer.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-16" data-topic="§3.4 Sharing">
+<p class="q">MPS improves utilisation over time-slicing because:</p>
+<ol class="opts"><li>It increases HBM size</li><li data-correct>Kernels from several processes can run concurrently and fill idle SMs</li><li>It disables context switching for one tenant</li><li>It compresses weights</li></ol>
+<div class="explain">Its isolation is weaker than MIG's.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-17" data-topic="§3.4 Sharing">
+<p class="q">How many MIG instances can an H100 provide at most?</p>
+<ol class="opts"><li>2</li><li>4</li><li data-correct>7</li><li>16</li></ol>
+<div class="explain">Seven 1g compute slices.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-18" data-topic="§3.4 Sharing">
+<p class="q">A <code>2g.20gb</code> MIG instance on an 80 GB H100 gets roughly what share of HBM bandwidth?</p>
+<ol class="opts"><li>1/7</li><li data-correct>About 1/4 (two of eight memory slices)</li><li>1/2</li><li>All of it</li></ol>
+<div class="explain">About 0.84 TB/s, comparable to an L40S.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-19" data-topic="§3.4 Sharing">
+<p class="q">Which is a limitation of MIG?</p>
+<ol class="opts"><li>No fault isolation</li><li data-correct>Fixed profiles and coarse granularity; reconfiguration requires idle instances</li><li>It works only on consumer GPUs</li><li>It shares memory capacity</li></ol>
+<div class="explain">Only certain profile combinations fit on one GPU.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-20" data-topic="§3.4 Sharing">
+<p class="q">Different customers each need an isolated small model on shared hardware. The best fit is:</p>
+<ol class="opts"><li>Time-slicing</li><li>MPS</li><li data-correct>MIG</li><li>One process serving all models</li></ol>
+<div class="explain">MIG's hardware partitioning provides performance and fault isolation.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-21" data-topic="§3.5 Alternatives">
+<p class="q">TPU pods differ from NVIDIA clusters mainly in that:</p>
+<ol class="opts"><li>TPUs have no HBM</li><li data-correct>Chips are joined by a dedicated inter-chip interconnect in a torus, giving scale-up domains of hundreds to thousands of chips</li><li>TPUs run CUDA</li><li>TPUs are only for training</li></ol>
+<div class="explain">TPUs are sold as slices of these pods.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-22" data-topic="§3.5 Alternatives">
+<p class="q">The most distinctive strength of AMD's MI300X for inference was:</p>
+<ol class="opts"><li>The fastest tensor cores</li><li data-correct>192 GB of HBM per GPU at 5.3 TB/s</li><li>CUDA compatibility</li><li>Liquid-cooling-free operation</li></ol>
+<div class="explain">Large models fit on fewer devices.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-23" data-topic="§3.5 Alternatives">
+<p class="q">Which software stacks correspond to TPU, Trainium and AMD Instinct respectively?</p>
+<ol class="opts"><li>CUDA, CUDA, CUDA</li><li data-correct>XLA (JAX/PyTorch-XLA), Neuron SDK, ROCm/HIP</li><li>ROCm, XLA, Neuron</li><li>OpenCL for all</li></ol>
+<div class="explain">Porting effort is part of the cost of non-NVIDIA hardware.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-24" data-topic="§3.5 Alternatives">
+<p class="q">When evaluating MI300X against H100, which number must be measured rather than taken from the datasheet?</p>
+<ol class="opts"><li>HBM capacity</li><li data-correct>Achieved MBU/MFU on the actual engine and model</li><li>Number of GPUs per instance</li><li>Price per hour</li></ol>
+<div class="explain">Kernel maturity determines delivered bandwidth and compute.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-25" data-topic="§3.6 Procedure">
+<p class="q">Why must Llama 3 70B use TP4 rather than TP3 on H100s?</p>
+<ol class="opts"><li>Three GPUs cannot share NVLink</li><li data-correct>The tensor-parallel degree must divide the 8 KV heads (and 64 query heads)</li><li>FP8 requires four GPUs</li><li>Instances have four GPUs</li></ol>
+<div class="explain">Head-wise sharding needs a divisor of the head counts.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-26" data-topic="§3.6 Procedure">
+<p class="q">Why does more memory per device improve bandwidth per dollar beyond "the model fits"?</p>
+<ol class="opts"><li>Larger HBM is faster</li><li data-correct>Fewer devices per replica means less TP communication and smaller, easier-to-schedule replicas</li><li>It reduces FLOPs</li><li>It removes KV cache</li></ol>
+<div class="explain">E.g. H200 TP2 instead of H100 TP4 for a 70B model.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-27" data-topic="§3.6 Procedure">
+<p class="q">For DeepSeek-V3-class MoE models, which hardware property is most decisive?</p>
+<ol class="opts"><li>Per-GPU FP64 throughput</li><li data-correct>The size of the scale-up domain for expert-parallel all-to-all</li><li>Local NVMe size</li><li>vCPU count</li></ol>
+<div class="explain">EP over a 72-GPU NVLink domain or a TPU pod is far cheaper than over the scale-out network.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-28" data-topic="§3.7 Availability">
+<p class="q">Which factors limit access to the "best" hardware in practice? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Regional availability</li><li data-correct>Account quotas</li><li data-correct>Purchase terms (reserved, blocks, spot)</li><li>The model's vocabulary size</li></ol>
+<div class="explain">Portability across hardware is the hedge.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-29" data-topic="§3.4 Sharing">
+<p class="q">Forty isolated 8B replicas at about 1,500 tokens/s each: roughly how many H100s are needed with three <code>2g.20gb</code> MIG instances per GPU?</p>
+<ol class="opts"><li>4</li><li data-correct>14</li><li>40</li><li>120</li></ol>
+<div class="explain">\(\lceil40/3\rceil=14\).</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-30" data-topic="§3.3 Fit">
+<p class="q">Llama 3 70B (FP8) on one H200 with 4,096-token sequences: the KV cache of one sequence is about:</p>
+<ol class="opts"><li>67 MB</li><li data-correct>0.67 GB</li><li>6.7 GB</li><li>67 GB</li></ol>
+<div class="explain">\(4096\times160\) KiB \(\approx0.67\) GB.</div>
+</div>
+
+<div class="mcq" data-id="ci03-mcq-31" data-topic="§3.5 Alternatives">
+<p class="q">Which Google TPU generation was positioned explicitly for inference with 192 GB of HBM per chip?</p>
+<ol class="opts"><li>v4</li><li>v5p</li><li>v6e Trillium</li><li data-correct>v7 Ironwood</li></ol>
+<div class="explain">Ironwood (2025) raised per-chip memory and bandwidth for serving.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci03-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is inside a typical eight-GPU cloud instance, and which parts matter for inference?</summary>
+<div class="answer">
+<p>Eight GPUs on an NVSwitch baseboard (scale-up, 450 GB/s per GPU per direction on H100), one back-end NIC per GPU (400–800 Gb/s; EFA, InfiniBand or RoCE) for scale-out, two CPUs with around 192 vCPUs and about 2 TB DRAM, several local NVMe drives, and a front-end NIC for API, storage and management. For inference: HBM capacity and bandwidth (decode), NVLink (TP within the instance), back-end NICs (disaggregation, multi-node EP, KV transfer), vCPUs (engine CPU work for small fast models), local NVMe (weight cache and cold starts), and the front-end network (request traffic, weight downloads).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Compare time-slicing, MPS and MIG.</summary>
+<div class="answer">
+<p>Time-slicing: processes take turns on the whole GPU; no partitioning of memory capacity, no performance isolation, works anywhere; fine for dev or idle workloads. MPS: a server process funnels kernels from several clients into one context so they run concurrently on shared SMs; optional SM-percentage and memory limits; better utilisation for small kernels; weaker fault isolation (shared server) and shared bandwidth and caches. MIG: hardware partitions (up to seven on A100/H100) with dedicated SM slices, L2, memory controllers and capacity; strong performance and fault isolation; fixed profiles, coarse granularity, reconfiguration needs idle instances. Use MIG for multi-tenant isolation, MPS for cooperative workloads under one owner, time-slicing for development.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Why do GPUs run at nearly native speed inside VMs?</summary>
+<div class="answer">
+<p>With PCIe passthrough, the hypervisor assigns the physical GPU to one guest and programs the IOMMU so the device can only access that guest's memory. The guest runs the normal driver and submits work directly; kernels and HBM traffic never touch the hypervisor. CPU virtualisation is hardware-assisted, so ordinary instructions run natively. Network and storage use SR-IOV and offload cards (e.g. AWS Nitro), removing software switching. Residual overheads are a few percent in host CPU, interrupts and some I/O paths.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-04">
+<summary><span class="lvl core">Core</span> Should we serve Llama 3 8B on L4s or H100s? Answer quantitatively.</summary>
+<div class="answer">
+<p>It depends on latency and traffic. In FP8 the weights are about 8 GB; an L4 at roughly 240 GB/s effective has a TPOT floor of about 33 ms, so it cannot meet a 25 ms target at all; at 50 ms it supports about 29 concurrent sequences of 2k context, about 600 tokens/s. An H100 at about 2.7 TB/s effective has a 3 ms floor and, memory-capped at about 460 sequences, about 17,700 tokens/s roofline. At illustrative prices ($0.80 vs $2.50 per hour) the H100 is about ten times cheaper per token at full load. But one replica must run: below about 1,000 tokens/s the L4's lower hourly price wins, and the crossover is a few thousand tokens/s. A MIG slice of an H100 often beats both at moderate demand. So: low-traffic, latency-tolerant deployments on L4 or MIG slices; anything high-volume or under 30 ms TPOT on H100/H200.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-05">
+<summary><span class="lvl core">Core</span> Derive the maximum batch a replica can hold and the TPOT floor, and apply it to Llama 3 70B on one H200.</summary>
+<div class="answer">
+<p>\(B_{\max}=\lfloor(n_gf_{\text{use}}M_{\text{HBM}}-Nb_w-M_{\text{act}})/(\bar ts_{kv})\rfloor\); floor \(=Nb_w/(n_g\,\text{MBU}\,\beta)\). H200: \(0.9\times141=126.9\) GB usable; minus 70.6 GB FP8 weights and about 6 GB workspace leaves 50.3 GB; FP8 KV is 160 KiB/token, so a 4,096-token sequence is 0.67 GB and \(B_{\max}\approx74\). Floor \(70.6/(0.8\times4.8\text{ TB/s})\approx18\) ms; step at \(B=74\) about 31 ms. Feasible at 40 ms TPOT but little headroom for longer contexts or burst; TP2 doubles bandwidth and quadruples KV space (weights split), so production would likely use two H200s.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-06">
+<summary><span class="lvl core">Core</span> Forty customers each want an isolated replica of their fine-tuned 8B model. How do you serve them cost-effectively?</summary>
+<div class="answer">
+<p>Isolation rules out sharing an engine process or time-slicing, and makes multi-LoRA batching inappropriate if "isolated" means no shared process. MIG gives hardware isolation: an H100 <code>2g.20gb</code> instance has 20 GB (8 GB FP8 weights plus about 8 GB KV) and about a quarter of the bandwidth, roughly 2,500 tokens/s at a 50 ms TPOT; three fit per H100. If each customer's peak is about 1,500 tokens/s, 40 instances need 14 H100s instead of 40 dedicated ones. Add per-customer network isolation, separate storage of weights, and monitoring per instance. If customers accept logical isolation, multi-LoRA on shared replicas would be cheaper still; if some customers need more, give them larger profiles (3g.40gb) or whole GPUs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-07">
+<summary><span class="lvl core">Core</span> How would you compare H100, H200, B200 and MI300X for serving a 70B model?</summary>
+<div class="answer">
+<p>Fix requirements (precision, context, batch, TPOT). Find each device's minimum replica shape: H100 needs TP4 (TP must divide 8 KV heads), H200 TP2, B200 TP2 in FP8 or TP1 in FP4, MI300X TP1–TP2. Compare aggregate bandwidth per dollar since decode is memory-bound (e.g. 13.4 TB/s for $10/h vs 9.6 for $7 vs 16 for $10 vs 10.6 for $6 at illustrative prices), check latency floors plus TP communication, and check compute at the batch. Then measure achieved MBU on the real engine—non-NVIDIA kernels may reach less of peak—and apply filters: availability, cooling requirements (B200 liquid), software maturity, porting effort. Note that larger per-device memory lowers the parallel degree, reducing communication and failure domain size.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-08">
+<summary><span class="lvl core">Core</span> What are TPUs' strengths and weaknesses as an inference platform compared with NVIDIA GPUs?</summary>
+<div class="answer">
+<p>Strengths: large scale-up domains via ICI tori (pods of hundreds to thousands of chips; good for large models and expert parallelism), competitive price-performance in Google Cloud, inference-focused generations (v5e, v6e, Ironwood with 192 GB HBM and about 7.4 TB/s), mature compiler (XLA) and production use for Gemini. Weaknesses: available only on Google Cloud; requires XLA-compatible code (JAX, PyTorch-XLA), so custom CUDA kernels and some engine features must be reimplemented; smaller ecosystem of serving engines (JetStream, vLLM-TPU); dynamic shapes and some control flow are harder under compilation; older inference generations had small per-chip memory (16–32 GB).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Analyse latency interference between tenants under time-slicing versus MIG.</summary>
+<div class="answer">
+<p>Time-slicing is processor sharing: with \(k\) tenants each active a fraction \(\upsilon_i\) of the time independently, tenant 1's work progresses at roughly \(1/(1+\text{number of other active tenants})\) of the GPU, so its expected step is inflated by \(1+\sum_{i\ne1}\upsilon_i\), and in the worst case (all busy) by \(k\), plus context-switch overhead. Tail latency is driven by joint busy periods, which are hard to predict and depend on neighbours' traffic. MIG gives each tenant a fixed slice—its step time is always about \(1/\text{share}\) of the dedicated step, independent of neighbours. So time-slicing has better mean latency for bursty, rarely-coincident tenants (statistical multiplexing) but unbounded, neighbour-dependent tails; MIG has worse mean but predictable latency. For SLO-bound multi-tenant serving, predictability usually wins; for internal bursty dev workloads, time-slicing or MPS wins.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Why did the H200 and MI300X sell well for inference even though their compute is similar to the H100's?</summary>
+<div class="answer">
+<p>Decode is memory-bound: throughput tracks bandwidth and batch, which is limited by KV capacity. H200 (141 GB, 4.8 TB/s) and MI300X (192 GB, 5.3 TB/s) raise both. More capacity lets a model run on fewer devices (70B on two instead of four), which reduces tensor-parallel communication (fewer, smaller all-reduces relative to compute), shrinks failure domains and scheduling units, and frees KV space for larger batches, raising throughput per device. Bandwidth per dollar and per watt also improved. Compute matters for prefill, where the gain was smaller, but for decode-dominated serving the memory system determines cost per token.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> When does a MIG slice beat a dedicated small GPU, and when does it not?</summary>
+<div class="answer">
+<p>A MIG slice gets roughly its share of HBM bandwidth and capacity at roughly its share of the large GPU's price, so its bandwidth per dollar equals the large GPU's (much higher than an L4's GDDR6), while its absolute price is low. For memory-bound small models at low to moderate demand, it beats a dedicated small GPU on cost per token and offers isolation. It does not win when the slice's capacity is too small for the model plus useful KV (e.g. 10 GB slices for an 8B FP8 model), when the workload needs more compute than its SM share (prefill-heavy), when instance reconfiguration is frequent (MIG changes need idle instances), when the cloud does not offer MIG-backed fractional instances (you need whole GPUs and bare metal or Kubernetes MIG support), or when demand is high enough to fill whole GPUs, where whole-GPU replicas avoid slice overheads.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> What are the risks of moving a production serving stack from NVIDIA to another accelerator family, and how would you de-risk it?</summary>
+<div class="answer">
+<p>Risks: kernel coverage and performance (attention variants, FP8/FP4 GEMMs, MoE kernels, sampling) reaching lower MBU/MFU; feature gaps in the engine (prefix caching, speculative decoding, structured output, LoRA); numerical differences changing outputs; collective libraries and multi-node support; tooling for profiling and debugging; driver and firmware maturity; availability and support; and team expertise. De-risk: benchmark the exact model, engine version and workload (prompt and output length distributions, concurrency) with SLO-based goodput, not peak throughput; run quality evaluations for output parity; shadow traffic before cut-over; keep the serving layer portable (vLLM/SGLang backends, abstracted kernels); migrate a fraction of traffic with fast rollback; negotiate capacity and support terms.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-13">
+<summary><span class="lvl design">Design</span> Design the hardware portfolio for a provider serving 8B, 70B and 671B-MoE models with bursty and steady traffic.</summary>
+<div class="answer">
+<p>Segment by model and traffic class. 671B MoE: rack-scale NVLink systems (GB200/GB300 NVL72) or TPU pods for wide EP within one scale-up domain, disaggregated prefill/decode; reserved capacity, since supply is scarce. 70B: H200 TP2 or B200 (FP8/FP4) for steady traffic on reserved capacity; H100 TP4 as overflow; MI300X if benchmarks justify. 8B: whole H100/H200 replicas for high-volume tiers; MIG slices for many low-traffic fine-tunes or isolated customers; L4/L40S for latency-tolerant edge regions. Batch and evaluation: spot or older-generation capacity. Keep the engine portable across at least two families; qualify each model on two hardware types; route traffic by cost and availability; revisit every generation. Tie the portfolio to power (tokens per joule in constrained sites) and to regions (residency).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-14">
+<summary><span class="lvl design">Design</span> You can get H100s on-demand in region A or reserved H200s in region B 1,500 km away. How do you decide?</summary>
+<div class="answer">
+<p>Compute cost per token for each: price per GPU-hour (on-demand H100 is typically several times reserved H200), replica shape (70B on H100 TP4 vs H200 TP2) and throughput, expected utilisation (on-demand can scale with demand; reserved is paid whether used or not). Latency: 1,500 km adds roughly 15–25 ms RTT—negligible for chat, significant for voice or many-round-trip agents. Data residency: is region B allowed for the users' data? Capacity risk: on-demand availability in A may vanish at peaks; reserved capacity in B is guaranteed. Reliability: using both regions adds geographic redundancy. A common answer: reserve H200s in B for the predictable base load, serve latency-tolerant traffic there, keep a smaller on-demand footprint in A for latency-sensitive and residency-bound traffic and for bursts.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-15">
+<summary><span class="lvl core">Core</span> Why is cost per token at full utilisation a misleading basis for choosing hardware for a new product?</summary>
+<div class="answer">
+<p>New products usually have low and uncertain demand. Each model, region and isolation domain needs at least one replica (often two for availability), whose cost is fixed regardless of traffic, so at low demand cost per token is set by the minimum replica's hourly price, not by its throughput per dollar (Figure 3.4). Large devices that are cheapest at scale can be ten times more expensive per token when mostly idle. Also, peak-to-mean ratios, latency headroom and spare capacity reduce average utilisation. Choose hardware for the expected demand curve, start small (MIG slices, smaller GPUs, or a shared multi-model or multi-LoRA deployment, or an API) and migrate to large devices as volume grows.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci03-qa-16">
+<summary><span class="lvl core">Core</span> What do quotas and capacity reservations mean for an inference team, and how do you plan around them?</summary>
+<div class="answer">
+<p>Clouds limit how many accelerators of each type an account can run per region; scarce types need approvals and often commitments. Capacity for a launch or growth must therefore be requested weeks or months ahead, justified with forecasts, and often reserved; on-demand may not be available at peaks. Plan by forecasting demand per model and region, reserving the base, holding approved quota (and ideally reserved headroom) for bursts and failover, qualifying alternative instance types and regions, keeping engines portable, and monitoring quota utilisation as a capacity signal. Treat "can we get the GPUs?" as a first-class risk in launch plans.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li>G. J. Popek, R. P. Goldberg. Formal Requirements for Virtualizable Third Generation Architectures. <em>Communications of the ACM</em> 17(7), 1974.</li>
+<li>P. Barham et al. Xen and the Art of Virtualization. <em>SOSP</em>, 2003.</li>
+<li>Amazon Web Services. The Security Design of the AWS Nitro System. Whitepaper, 2022.</li>
+<li>NVIDIA. <em>Multi-Instance GPU User Guide</em> and <em>Multi-Process Service</em> documentation, 2020–2025.</li>
+<li>NVIDIA. NVIDIA H100 Tensor Core GPU Architecture. Whitepaper, 2022; NVIDIA Blackwell Architecture Technical Brief, 2024.</li>
+<li>N. P. Jouppi et al. TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning with Hardware Support for Embeddings. <em>ISCA</em>, 2023. <a href="https://arxiv.org/abs/2304.01433">arXiv:2304.01433</a>.</li>
+<li>AMD. AMD Instinct MI300X Accelerator data sheet and CDNA 3 Architecture whitepaper, 2023.</li>
+<li>Amazon Web Services. AWS Trainium2 and Neuron SDK documentation, 2024–2025.</li>
+<li>W. Kwon et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+<li>B. Li et al. Characterizing Multi-Instance GPU for Machine Learning Workloads. <em>IPDPS Workshops</em>, 2022. <a href="https://arxiv.org/abs/2209.11336">arXiv:2209.11336</a>.</li>
+<li>R. Pope et al. Efficiently Scaling Transformer Inference. <em>MLSys</em>, 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

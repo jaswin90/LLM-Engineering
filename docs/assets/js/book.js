@@ -47,7 +47,7 @@
   const CLOUD_CHAPTERS = [
     { id: 'ci01', n: 1, part: 'I', title: 'Why Serving Became a Cloud Problem', sub: 'The stack from silicon to region, capacity as the scarce resource, and the map of this volume', file: 'cloud/ci01.html', ready: true },
     { id: 'ci02', n: 2, part: 'I', title: 'The AI Datacenter: Power, Cooling and Space', sub: 'Watts per token, PUE, liquid cooling, rack density and the grid', file: 'cloud/ci02.html', ready: true },
-    { id: 'ci03', n: 3, part: 'I', title: 'Accelerators as Cloud Products', sub: 'Instance families, GPU sharing (MIG, MPS), TPUs and Trainium, price–performance', file: 'cloud/ci03.html', ready: false },
+    { id: 'ci03', n: 3, part: 'I', title: 'Accelerators as Cloud Products', sub: 'Instance families, GPU sharing (MIG, MPS), TPUs and Trainium, price–performance', file: 'cloud/ci03.html', ready: true },
     { id: 'ci04', n: 4, part: 'I', title: 'Datacenter Networks for AI', sub: 'Front-end and back-end fabrics, fat trees, rail-optimised designs, RDMA, congestion', file: 'cloud/ci04.html', ready: false },
     { id: 'ci05', n: 5, part: 'I', title: 'Storage, Weights and Cold Starts', sub: 'Object storage, safetensors, weight streaming, caching tiers, peer-to-peer distribution', file: 'cloud/ci05.html', ready: false },
     { id: 'ci06', n: 6, part: 'II', title: 'Containers and Kubernetes for Accelerators', sub: 'Processes, cgroups, pods, device plugins, DRA, the GPU operator', file: 'cloud/ci06.html', ready: false },

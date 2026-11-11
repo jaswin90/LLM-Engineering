@@ -235,3 +235,7 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(z_\epsilon\) | upper \(\epsilon\)-quantile of the standard normal distribution |
 | \(\dot m\), \(c_p\), \(\vartheta\) | coolant mass flow (kg/s), specific heat (J/(kg·K)), temperature (\(\Delta\vartheta\): temperature rise) (Ch. 2) |
 | \(\ell\), \(n_{\text{rt}}\) | network path length; number of sequential round trips (Ch. 2, 12, 17) |
+| \(f_{\text{use}}\), \(M_{\text{act}}\) | usable fraction of device memory; memory reserved for activations, graphs and workspace (Ch. 3) |
+| \(B_{\max}\), \(\bar t\), \(t^{*}\) | largest batch that fits; mean context length of resident sequences; TPOT target (Ch. 3) |
+| \(\beta_{\text{eff}}\) | effective bandwidth of a replica, \(n_g\cdot\text{MBU}\cdot\beta\) (Ch. 3) |
+| \(\upsilon_i\) | fraction of time tenant \(i\) is active on a shared device (Ch. 3) |
