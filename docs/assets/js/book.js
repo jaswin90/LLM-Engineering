@@ -54,7 +54,7 @@
     { id: 'ci07', n: 7, part: 'II', title: 'Scheduling a GPU Cluster', sub: 'Bin packing, gang and topology-aware scheduling, quotas, preemption, fragmentation', file: 'cloud/ci07.html', ready: true },
     { id: 'ci08', n: 8, part: 'II', title: 'Serving Platforms and Control Planes', sub: 'KServe, Ray Serve, Triton, Dynamo, llm-d, managed endpoints and serverless GPUs', file: 'cloud/ci08.html', ready: true },
     { id: 'ci09', n: 9, part: 'III', title: 'Capacity, Procurement and Autoscaling', sub: 'Reserved, on-demand and spot capacity, forecasting, capacity mix as an optimisation', file: 'cloud/ci09.html', ready: true },
-    { id: 'ci10', n: 10, part: 'III', title: 'The Economics of Inference', sub: 'TCO, build versus buy, pricing tokens, FinOps and cost attribution', file: 'cloud/ci10.html', ready: false },
+    { id: 'ci10', n: 10, part: 'III', title: 'The Economics of Inference', sub: 'TCO, build versus buy, pricing tokens, FinOps and cost attribution', file: 'cloud/ci10.html', ready: true },
     { id: 'ci11', n: 11, part: 'IV', title: 'The Front Door: Gateways, Streaming and Rate Limits', sub: 'HTTP/2, SSE, gRPC, WebSockets, distributed rate limiting, admission control', file: 'cloud/ci11.html', ready: false },
     { id: 'ci12', n: 12, part: 'IV', title: 'Multi-Region Serving and Disaster Recovery', sub: 'Global load balancing, data residency, failover, capacity across regions', file: 'cloud/ci12.html', ready: false },
     { id: 'ci13', n: 13, part: 'IV', title: 'Reliability Engineering for AI Services', sub: 'SLOs and error budgets, GPU failure modes, MTBF at scale, safe rollouts, incidents', file: 'cloud/ci13.html', ready: false },

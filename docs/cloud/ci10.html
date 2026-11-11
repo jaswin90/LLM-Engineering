@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 10 · The Economics of Inference — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 10 of Cloud AI Infrastructure: the total cost of owning a GPU from capital, depreciation, power, space and operations; why rental prices fall; from GPU-hours to the cost of input, cached and output tokens; why APIs price output above input and discount cached and batch tokens; pricing and margins; the break-even between APIs and self-hosting; and FinOps cost attribution.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci10" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part III · Elasticity and Economics — Chapter 10</div>
+<h1 id="top">The Economics of Inference</h1>
+<p class="lede">Every number in this volume eventually becomes a dollar figure: the cost of a GPU-hour, of a million output tokens, of a request, of a customer. This chapter derives those figures from first principles—capital, depreciation, power, space and people—and then turns them into prices: why output tokens cost several times input tokens, why cached input and batch requests are discounted, when self-hosting beats an API, and how an organisation attributes the cost of a shared fleet to the teams and customers who use it.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Vol. I §27.7 gave a compact formula for the cost of a token: the price of the GPUs a replica uses, divided by the tokens it produces per hour at its utilisation. Chapters 1 and 9 of this volume used it with prices such as $2.50 per committed GPU-hour and $6.90 on demand. Those prices were inputs. A serving organisation that owns its hardware, negotiates contracts or sets prices for customers needs to know where they come from and what they leave out. And a token is not one product: input tokens, cached input tokens, output tokens, batch tokens and long-context tokens have different costs and are sold at different prices, for reasons that follow from the mechanics of Volume I.</p>
+<p>Economics questions appear in infrastructure interviews more than candidates expect, often disguised: "is $0.10 per million tokens for a 70B model plausible?" (Vol. I §30.6), "why is output four times the price of input?", "should we build our own cluster?", "how would you bill internal teams for GPU use?". They also appear in every architecture decision, because a design that saves a third of the GPUs saves a third of the largest line in the budget. This chapter equips the reader to answer them.</p>
+<p>We begin with why economics is part of the engineering (§10.1), derive the total cost of owning a GPU (§10.2), explain why rented GPU-hours keep getting cheaper (§10.3), and decompose the cost of tokens by kind (§10.4). We discuss pricing and margins (§10.5), derive the break-even between APIs and self-hosting (§10.6), treat cost attribution and FinOps (§10.7), and close with a ranking of the levers that move cost per token (§10.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Compute the all-in cost of owning a GPU-hour from capital cost, depreciation life, cost of capital, power, space, operations and availability.</li>
+<li>Explain why the market price of GPU-hours falls over a generation and what that implies for depreciation and contract terms.</li>
+<li>Derive separate costs for prefill (input), cached input, decode (output), batch and long-context tokens, and explain providers' price ratios.</li>
+<li>Reason about pricing, margins and price elasticity for token products.</li>
+<li>Compute the break-even volume at which self-hosting beats an API, including fixed team costs.</li>
+<li>Design cost attribution (showback and chargeback) for a shared GPU fleet and identify metrics that mislead.</li>
+</ol>
+<p class="small muted">Uses: Chapters 1, 2, 9 of this volume; Vol. I §3.7–3.9 (prefill and decode cost), Chapter 10 (prefix caching), §27.7 (cost per token).</p>
+</div>
+
+<h2 id="s10-1">10.1 Why economics is part of the engineering</h2>
+<p>For most of computing's history, the cost of serving a request was so small that engineers could ignore it: a web page costs a fraction of a cent of CPU time. LLM serving reversed that. A long request to a frontier model can cost several cents of accelerator time, and reasoning requests much more; an API's gross margin depends on the efficiency of its engines and the utilisation of its fleet; and a product feature—longer context, a reasoning mode, a free tier—can change a company's cost structure overnight. Decisions that look like engineering choices are financial ones: a 20% throughput gain on a fleet costing $200 million a year is worth $40 million a year.</p>
+<p>The economics also flow the other way: price determines demand. When the price of a capability falls, usage rises, often by more than the price fell—an instance of what economists call the Jevons paradox, named after the observation that more efficient steam engines increased total coal consumption. Token prices for a given level of model quality fell by roughly an order of magnitude per year in 2023–2025, and total token volume rose even faster (Chapter 1). An infrastructure team that lowers cost per token is therefore not only saving money; it is enabling new uses, which then demand more capacity. To reason about any of this we need the cost of the basic unit, the GPU-hour.</p>
+
+<h2 id="s10-2">10.2 The total cost of owning a GPU</h2>
+<p>When an organisation owns its accelerators—buying servers and placing them in its own or a colocation datacenter—the cost of a GPU-hour is not a price but an allocation of several costs over time. Figure 10.1 shows the components for an eight-GPU H100 server.</p>
+
+<figure class="diagram" id="fig-10-1">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Components of the cost of an owned GPU-hour">
+<text x="20" y="24" class="t-sm t-b">Owned H100, ≈ $2.05 per sold GPU-hour (5-year life, 10% cost of capital, 90% sold)</text>
+<rect x="20" y="40" width="400" height="56" class="bx2"/><text x="220" y="64" text-anchor="middle" class="t-xs t-b">capital recovery: server + network share</text><text x="220" y="80" text-anchor="middle" class="t-xs">≈ $1.33 / h (65%)</text>
+<rect x="420" y="40" width="115" height="56" class="bx4"/><text x="477" y="64" text-anchor="middle" class="t-xs t-b">space</text><text x="477" y="80" text-anchor="middle" class="t-xs">≈ $0.38 (19%)</text>
+<rect x="535" y="40" width="50" height="56" class="bx3"/><text x="560" y="64" text-anchor="middle" class="t-xs t-b">power</text><text x="560" y="80" text-anchor="middle" class="t-xs">$0.16</text>
+<rect x="585" y="40" width="55" height="56" class="bx5"/><text x="612" y="64" text-anchor="middle" class="t-xs t-b">ops</text><text x="612" y="80" text-anchor="middle" class="t-xs">$0.17</text>
+<text x="20" y="130" class="t-xs">Capital: server ≈ $280k for 8 GPUs + ≈ 15% for network and storage → ≈ $40k per GPU, recovered with interest over the life.</text>
+<text x="20" y="148" class="t-xs">Space: colocation for high-density racks priced per kW of IT load per month (≈ $150–250); covers building, cooling, power infrastructure.</text>
+<text x="20" y="166" class="t-xs">Power: 1.4 kW all-in × PUE 1.3 × $0.08/kWh. Ops: staff, spares, repairs, software, monitoring.</text>
+<text x="20" y="184" class="t-xs">All divided by the fraction of hours the GPU is healthy and sold (here 90%).</text>
+<text x="20" y="214" class="t-xs t-b">Rented on a multi-year contract, the same GPU-hour typically costs ≈ $2–3; on demand, several times more.</text>
+</svg>
+<figcaption><b>Figure 10.1 — What an owned GPU-hour costs.</b> Capital dominates. Electricity, which dominates many people's intuition, is less than a tenth. Values are illustrative 2025 figures and vary widely by purchase price, financing and facility.</figcaption>
+</figure>
+
+<p>The largest component is <strong>capital</strong>. An eight-GPU H100 server cost on the order of $250,000–300,000 in 2024–2025, and its share of the back-end network, storage and other infrastructure adds perhaps 15–20%, so about $40,000 per GPU. That money is spent up front, and to turn it into an hourly cost we spread it over the hardware's useful life with interest at the organisation's cost of capital \(r_{\text{cap}}\). The standard tool is the <strong>capital recovery factor</strong>: the constant annual payment that repays a capital sum \(K\) over \(n_{\text{yr}}\) years at rate \(r_{\text{cap}}\) is</p>
+\[
+A=K\cdot\frac{r_{\text{cap}}(1+r_{\text{cap}})^{n_{\text{yr}}}}{(1+r_{\text{cap}})^{n_{\text{yr}}}-1}.
+\]
+<p>For \(K=\$40{,}000\), \(n_{\text{yr}}=5\) and \(r_{\text{cap}}=10\%\), the factor is 0.264, so \(A\approx\$10{,}550\) per year or about $1.20 per hour. Next is <strong>space</strong>: the building, its power infrastructure and cooling, usually priced by colocation providers per kilowatt of IT load per month; at around $180 per kW-month for high-density space, a GPU's 1.4 kW costs about $0.35 per hour. <strong>Power</strong> follows from Chapter 2: 1.4 kW at PUE 1.3 and $0.08 per kWh is about $0.15 per hour. <strong>Operations</strong>—the staff who run the fleet, spare parts and repairs, software licences and monitoring—add perhaps $0.15 per hour. Finally, the GPU is not sold every hour: it is down for repairs, held as spare, or idle between contracts, so the total is divided by the fraction of hours it is <em>sold</em>, here 90%. The result is about $2.05 per sold GPU-hour, consistent with the range of $1.60–2.10 that published total-cost-of-ownership analyses gave for H100s in 2025 depending on purchase price, financing and facility; Chapter 1 used the low end of this range.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — the capital recovery factor</div>
+<p>The capital recovery factor answers: what constant payment \(A\) per period, for \(n\) periods at interest rate \(r\), has present value equal to \(K\)? The present value of the payments is \(\sum_{k=1}^{n}A(1+r)^{-k}=A\,\frac{1-(1+r)^{-n}}{r}\), and setting it equal to \(K\) gives \(A=K\,r/(1-(1+r)^{-n})\), which is the formula above. As \(r\to0\) it tends to straight-line depreciation \(K/n\); as \(n\to\infty\) it tends to \(rK\), the interest on perpetual capital. For GPUs the useful life \(n\) is the uncertain parameter: it is not when the hardware stops working, but when its output stops being worth its operating cost, which depends on how fast newer generations lower the market price of tokens.</p>
+</div>
+
+<p>The useful life is the most consequential and most debated input. Accounting conventions in 2024–2025 typically depreciated servers over five or six years, and some analysts argued that AI accelerators should be depreciated faster, because each new generation delivers several times the tokens per dollar and so lowers the value of older hardware. Figure 10.2 shows how much the assumption matters. At $40,000 per GPU, a three-year life gives $2.75 per sold GPU-hour and a six-year life $1.88; at $60,000 per GPU (a Blackwell-class price), the corresponding figures are $3.77 and $2.46.</p>
+
+<figure class="chart" id="fig-10-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"All-in cost per sold GPU-hour of owned hardware, against depreciation life (10% cost of capital, 90% sold)","height":320,
+ "x":{"label":"Useful life (years)","min":2.8,"max":6.2,"ticks":[3,4,5,6]},
+ "y":{"label":"Dollars per sold GPU-hour","min":1.5,"max":4,"ticks":[1.5,2,2.5,3,3.5,4]},
+ "series":[
+  {"name":"Capex $40k per GPU (H100-class)","color":"s1","points":[[3,2.75],[4,2.31],[5,2.05],[6,1.88]]},
+  {"name":"Capex $60k per GPU (Blackwell-class)","color":"s2","points":[[3,3.77],[4,3.11],[5,2.72],[6,2.46]]}
+ ]}
+</script>
+<figcaption><b>Figure 10.2 — Depreciation life moves the cost of a GPU-hour by up to 50%.</b> Capital recovery at 10% plus space ($0.35/h), power ($0.15/h) and operations ($0.15/h), divided by a 90% sold fraction. Whether a GPU's economic life is three years or six depends on how fast newer generations lower the market value of its output.</figcaption>
+</figure>
+
+<p>Figure 10.2 shows why owning is a bet on technology. If H100s remain productive for six years—serving smaller models, batch work, or customers who value price over speed—their cost is under $1.90 an hour. If Blackwell and Rubin make them uncompetitive in three, the cost of the hours actually sold is nearly $2.75. The same logic sets the terms of rental contracts: a neocloud that signs a three-year contract at $2.50 for H100s has hedged its depreciation risk onto the customer, and the customer has bet that the price of H100-hours will not fall below $2.50 during the contract. Whether that bet is good depends on how fast prices fall.</p>
+
+<h2 id="s10-3">10.3 Why the price of GPU-hours falls</h2>
+<p>The market price of renting a given GPU falls over its life, for three reinforcing reasons. Supply grows as manufacturers catch up with demand: the acute H100 shortage of 2023 eased through 2024–2025 as packaging and HBM capacity expanded, and rental prices for H100s fell from levels near $8 per GPU-hour on short-term contracts in 2023 to around $2 by 2025 on neoclouds, with hyperscaler on-demand prices cut sharply in mid-2025. Newer generations arrive with more tokens per dollar: when a B200 delivers two to three times an H100's decode throughput (§1.6) at well under three times the price, the value of an H100-hour must fall to keep it competitive. And software improvements raise throughput on <em>all</em> hardware but favour new hardware, whose features (FP4, larger NVLink domains) the new software exploits.</p>
+<p>For a serving organisation, price deflation has three consequences. First, long commitments should be made at prices that anticipate it, or should include rights to upgrade to newer hardware. Second, older hardware should migrate to workloads whose value per token is lowest—batch, smaller models, internal tools—rather than be retired abruptly, since its marginal cost is mostly sunk. Third, the right figure of merit when comparing generations is cost per token at the target latency, not cost per hour: a newer GPU at twice the hourly price that delivers three times the tokens is the cheaper one. With the cost of the hour understood, we can turn to the cost of the token.</p>
+
+<h2 id="s10-4">10.4 From GPU-hours to tokens: input, cached, output, batch and long context</h2>
+<p>Vol. I §27.7 gave the cost per million tokens of a replica as \(n_gc_{\text{gpu}}\times10^6/(3600\,\Phi\,u)\). That formula treats all tokens alike, but a replica produces two very different products. <em>Prefill</em> processes input tokens at a rate \(\Phi_P\) that is compute-bound and large—tens of thousands of tokens per second per GPU for an 8B model, thousands for a 70B one. <em>Decode</em> produces output tokens at a rate \(\Phi_D\) that is memory-bound and much smaller per unit of GPU time. If a replica's GPU time is divided between them, the cost of each kind of token is the price of the GPU-seconds it consumes.</p>
+<p>A simple allocation: a replica running at utilisation \(u\) spends a fraction \(f_P\) of its busy time on prefill and \(1-f_P\) on decode. Then the cost per input token is \(c_{\text{in}}=n_gc_{\text{gpu}}/(3600\,u\,\Phi_P^{\text{ded}})\) and the cost per output token is \(c_{\text{out}}=n_gc_{\text{gpu}}/(3600\,u\,\Phi_D^{\text{ded}})\), where \(\Phi_P^{\text{ded}}\) and \(\Phi_D^{\text{ded}}\) are the rates the replica would achieve if it did only prefill or only decode. Their ratio,</p>
+\[
+\frac{c_{\text{out}}}{c_{\text{in}}}=\frac{\Phi_P^{\text{ded}}}{\Phi_D^{\text{ded}}},
+\]
+<p>is the ratio of the dedicated prefill rate to the dedicated decode rate at the operating point. For decode at moderate batch, a step reads the weights once for \(B\) tokens; for prefill, a step reads them once for thousands of tokens and is limited by compute. Volume I's models put the ratio between about 3 and 10 for typical models and batch sizes, rising for long contexts (decode reads more KV per token) and falling for very large decode batches.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the cost of Atlas's 70B tokens</div>
+<p><strong>Inputs.</strong> A TP8 replica of Llama 3 70B on H100s at $2.50 per GPU-hour, $20 per replica-hour. Dedicated prefill rate about 40,000 tokens/s (FP8, about 40% MFU across eight GPUs); dedicated decode rate at the 40 ms TPOT target about 8,000 tokens/s; time-averaged utilisation 55% (Chapter 1).</p>
+<p><strong>Input tokens.</strong> \(c_{\text{in}}=20/(3600\times0.55\times40{,}000)\approx\$0.25\) per million.</p>
+<p><strong>Output tokens.</strong> \(c_{\text{out}}=20/(3600\times0.55\times8{,}000)\approx\$1.26\) per million.</p>
+<p><strong>Cached input tokens.</strong> A prefix-cache hit skips the prefill computation; what remains is the cost of holding the KV cache in HBM or host memory and reading it (Vol. I Chapter 10), plus routing to keep hits high. If storage and retrieval cost about 10–20% of computation, cached input costs about $0.03–0.05 per million.</p>
+<p><strong>Ratio.</strong> Output costs about five times input, and cached input about a tenth of input. A provider's list prices typically sit above these costs with similar ratios.</p>
+</div>
+
+<p>The worked example explains the structure of the price lists that LLM API providers converged on. <strong>Output tokens are priced several times higher than input tokens</strong>—ratios of 3–5 to 1 were standard across major providers in 2024–2026—because decode is memory-bound and consumes several times more GPU time per token. <strong>Cached input is discounted heavily</strong>, often to 10–50% of the normal input price, because a cache hit skips the expensive computation; some providers also charge a premium for <em>writing</em> to the cache, because holding a cache entry consumes memory that could otherwise hold running sequences. <strong>Batch APIs</strong>, which accept requests for completion within hours rather than seconds, are commonly priced at about half of the interactive price, because batch work fills the troughs of §7.7 and runs at high utilisation and large batch sizes, so its true marginal cost is lower. <strong>Long-context requests</strong> above some threshold (often 128,000 or 200,000 tokens) are priced higher per token, because their KV caches crowd out other sequences, shrinking the decode batch and raising the GPU time per output token, and their prefill attention cost grows faster than linearly. <strong>Priority or provisioned tiers</strong> are priced higher because guaranteeing capacity means holding headroom.</p>
+<p>Figure 10.3 summarises these relationships. The diagram's point is that every term of a token price list corresponds to a mechanism of Volume I, so a candidate who understands the mechanisms can reconstruct the price list and can tell whether a quoted price is plausible.</p>
+
+<figure class="diagram" id="fig-10-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Why different tokens cost different amounts">
+<rect x="20" y="20" width="160" height="50" rx="8" class="bx2"/><text x="100" y="42" text-anchor="middle" class="t-xs t-b">output token</text><text x="100" y="58" text-anchor="middle" class="t-xs">≈ 3–5 × input</text>
+<text x="200" y="42" class="t-xs">memory-bound decode: each step reads weights + KV for only B tokens (Vol. I §3.7)</text>
+<rect x="20" y="80" width="160" height="50" rx="8" class="bx4"/><text x="100" y="102" text-anchor="middle" class="t-xs t-b">input token</text><text x="100" y="118" text-anchor="middle" class="t-xs">1 × (reference)</text>
+<text x="200" y="102" class="t-xs">compute-bound prefill: thousands of tokens share each weight read (Vol. I §3.8)</text>
+<rect x="20" y="140" width="160" height="50" rx="8" class="bx3"/><text x="100" y="162" text-anchor="middle" class="t-xs t-b">cached input</text><text x="100" y="178" text-anchor="middle" class="t-xs">≈ 0.1–0.5 × input</text>
+<text x="200" y="162" class="t-xs">prefix-cache hit skips compute; pays for KV storage and retrieval (Vol. I Ch. 10)</text>
+<rect x="20" y="200" width="160" height="50" rx="8" class="bx5"/><text x="100" y="222" text-anchor="middle" class="t-xs t-b">batch / long context</text><text x="100" y="238" text-anchor="middle" class="t-xs">≈ 0.5× / ≈ 1.5–2×</text>
+<text x="200" y="222" class="t-xs">batch fills troughs at large batch sizes; long contexts shrink the decode batch</text>
+<text x="200" y="238" class="t-xs">and add super-linear attention cost (Vol. I §21.1)</text>
+</svg>
+<figcaption><b>Figure 10.3 — The anatomy of a token price list.</b> Each price ratio reflects a cost ratio of the underlying computation. Ratios shown are typical of major providers' published prices in 2024–2026; specific prices change often.</figcaption>
+</figure>
+
+<details class="drill">
+<summary>Drill 10.1 — Is this price plausible?</summary>
+<p>A provider offers a Llama 3 70B-class model at $0.20 per million input tokens and $0.60 per million output tokens. Using the worked example's costs at 55% utilisation ($0.25 and $1.26), is this price profitable? What would make it so?</p>
+<p><em>Solution.</em> At Atlas's operating point the price is below cost for both kinds of token. It can be profitable if the provider's cost per token is two to three times lower, which is achievable by a combination of levers: higher utilisation (75% instead of 55% cuts cost by 27%), cheaper GPU-hours (owned at $1.90 or older hardware), FP4 or more aggressive quantisation, speculative decoding (Vol. I Chapter 20) raising decode throughput by 2×, high prefix-cache hit rates making most input tokens cheap, and newer hardware with more bandwidth per dollar. Alternatively, the price may be a loss-leader. A quoted price far below the cost implied by the roofline is a signal to ask which levers the provider uses—or whether it is subsidising.</p>
+</details>
+
+<h2 id="s10-5">10.5 Pricing, margins and elasticity</h2>
+<p>Cost sets a floor for price, but price is set by markets. Three features of the LLM market shape pricing. The first is <em>competition among open-weight providers</em>: when many providers serve the same open model, the price converges towards the most efficient provider's cost plus a modest margin, which is why open-model prices fell rapidly in 2024–2025. The second is <em>differentiation of proprietary models</em>: a frontier model with unique capability can be priced well above its cost, and its provider earns a large gross margin that funds training. The third is <em>elasticity</em>: lower prices unlock new uses—agents, background processing, long-document analysis—that consume far more tokens, so revenue may rise when prices fall.</p>
+<p>Gross margin—revenue minus the cost of serving, divided by revenue—is the infrastructure team's scorecard. If a product sells output tokens at \(p_{\text{out}}\) and input at \(p_{\text{in}}\), and a typical request has \(n_{\text{in}}\) input tokens (of which a fraction \(r_{\text{hit}}\) are cached) and \(n_{\text{out}}\) output tokens, the margin on a request is \(1-\text{cost}/\text{revenue}\) with</p>
+\[
+\text{cost}=n_{\text{in}}\bigl((1-r_{\text{hit}})c_{\text{in}}+r_{\text{hit}}c_{\text{hit}}\bigr)+n_{\text{out}}c_{\text{out}},\qquad
+\text{revenue}=n_{\text{in}}\bigl((1-r_{\text{hit}})p_{\text{in}}+r_{\text{hit}}p_{\text{hit}}\bigr)+n_{\text{out}}p_{\text{out}} .
+\]
+<p>This decomposition shows which engineering changes matter to the business. A rise in cache-hit rate lowers cost faster than revenue if \(p_{\text{hit}}/p_{\text{in}}>c_{\text{hit}}/c_{\text{in}}\), so the provider gains margin. A reasoning mode that multiplies \(n_{\text{out}}\) raises both, but if its hidden "thinking" tokens are billed as output at the same price, margin is preserved; if they are free, margin collapses. A free tier contributes cost with no revenue and must be justified by conversion. Infrastructure engineers who can compute these effects are valuable partners to product and finance teams.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — Atlas's gross margin on a 70B request</div>
+<p><strong>Request.</strong> 2,000 input tokens (1,200 cached, 800 uncached) and 400 output tokens.</p>
+<p><strong>Revenue</strong> at Atlas's list prices ($0.60 input, $0.15 cached, $2.40 output per million): \(800\times0.60+1200\times0.15+400\times2.40=480+180+960\) micro-dollars, about $0.00162.</p>
+<p><strong>Serving cost</strong> from §10.4 ($0.25, $0.04, $1.26 per million): \(200+48+504\approx752\) micro-dollars, about $0.00075, or 46% of revenue.</p>
+<p><strong>Other costs of revenue.</strong> Spare and failover capacity, the control plane, guardrail classifiers on every request (Chapter 18), evaluation and shadow traffic, and the on-call staff who run the fleet: together perhaps another 14% of revenue.</p>
+<p><strong>Gross margin.</strong> About 40%. Two sensitivities stand out: output tokens are 59% of revenue and 67% of serving cost, so speculative decoding or a shift to shorter answers moves margin most; and if the cache-hit rate fell from 60% to 30%, serving cost would rise by about 17%—but so would revenue, by about 17%, because the lost hits are billed at the uncached rate. The provider's margin barely moves; the customer pays for the lost cache hits. Prefix caching is as much a lever on the customer's bill as on the provider's cost, which is why providers document how to structure prompts for cache reuse.</p>
+</div>
+
+<p>Figure 10.4 draws the same example as a waterfall from a dollar of revenue. Reading it from left to right shows where engineering effort pays: the largest bar is serving compute, which Volume I's techniques shrink; the next are spare capacity and overheads, which the reliability and platform work of this volume shrink; what is left is the margin that funds the business.</p>
+
+<figure class="diagram" id="fig-10-4">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Where a dollar of LLM API revenue goes">
+<line x1="40" y1="210" x2="700" y2="210" class="ln"/>
+<rect x="60" y="40" width="90" height="170" class="bx4"/><text x="105" y="30" text-anchor="middle" class="t-xs t-b">revenue $1.00</text>
+<rect x="190" y="40" width="90" height="78" class="bx2"/><text x="235" y="30" text-anchor="middle" class="t-xs t-b">serving $0.46</text>
+<text x="235" y="134" text-anchor="middle" class="t-xs">decode 0.31</text><text x="235" y="148" text-anchor="middle" class="t-xs">prefill 0.12</text><text x="235" y="162" text-anchor="middle" class="t-xs">cached 0.03</text>
+<rect x="320" y="118" width="90" height="12" class="bx"/><text x="365" y="108" text-anchor="middle" class="t-xs t-b">spares $0.07</text>
+<rect x="450" y="130" width="90" height="12" class="bx5"/><text x="495" y="120" text-anchor="middle" class="t-xs t-b">overheads $0.07</text>
+<text x="495" y="160" text-anchor="middle" class="t-xs">control plane, guards,</text><text x="495" y="174" text-anchor="middle" class="t-xs">evals, on-call</text>
+<rect x="580" y="142" width="90" height="68" class="bx3"/><text x="625" y="132" text-anchor="middle" class="t-xs t-b">margin ≈ $0.40</text>
+<line x1="150" y1="40" x2="190" y2="40" class="ln" stroke-dasharray="3 3"/><line x1="280" y1="118" x2="320" y2="118" class="ln" stroke-dasharray="3 3"/><line x1="410" y1="130" x2="450" y2="130" class="ln" stroke-dasharray="3 3"/><line x1="540" y1="142" x2="580" y2="142" class="ln" stroke-dasharray="3 3"/>
+<text x="370" y="235" text-anchor="middle" class="t-xs">Each bar removes a cost from the revenue on its left; heights are to scale.</text>
+</svg>
+<figcaption><b>Figure 10.4 — Where a dollar of revenue goes.</b> For Atlas's 70B tier at its list prices, serving compute is the largest cost, dominated by output tokens; spare capacity and overheads take a further 14%; about 40% remains as gross margin. Figures follow the worked example and are illustrative.</figcaption>
+</figure>
+
+<h2 id="s10-6">10.6 Build, rent or call an API: the break-even</h2>
+<p>An organisation that consumes tokens can call an API at a price \(p_{\text{api}}\) per million tokens, or self-host an open model on rented or owned GPUs at a variable cost \(c_{\text{var}}\) per million tokens plus a fixed cost \(F\) per year for the team and tooling needed to operate it. Self-hosting wins when annual volume \(V\) (in millions of tokens) exceeds the break-even</p>
+\[
+V^{*}=\frac{F}{p_{\text{api}}-c_{\text{var}}},
+\]
+<p>provided that \(c_{\text{var}}<p_{\text{api}}\) at the achievable utilisation. Figure 10.5 plots annual cost against volume for an illustrative case: an API at a blended $0.90 per million tokens for a 70B-class model, against self-hosting at a blended $0.35 per million tokens (input-heavy traffic, good utilisation) plus a fixed $2.4 million a year for a team of about six engineers and tooling.</p>
+
+<figure class="chart" id="fig-10-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Annual cost of an API versus self-hosting a 70B-class model (illustrative)","height":330,
+ "x":{"label":"Annual volume (trillions of tokens, log)","log":true,"min":0.5,"max":16,"ticks":[0.5,1,2,4,8,16]},
+ "y":{"label":"Millions of dollars per year (log)","log":true,"min":0.4,"max":16,"ticks":[0.5,1,2,4,8,16]},
+ "series":[
+  {"name":"API at $0.90 per million tokens","color":"s2","points":[[0.5,0.45],[1,0.9],[2,1.8],[4,3.6],[8,7.2],[16,14.4]]},
+  {"name":"Self-host: $2.4M/yr fixed + $0.35 per million","color":"s1","points":[[0.5,2.575],[1,2.75],[2,3.1],[4,3.8],[8,5.2],[16,8.0]]}
+ ],
+ "vlines":[{"x":4.36,"text":"break-even ≈ 4.4T/yr"}]}
+</script>
+<figcaption><b>Figure 10.5 — Self-hosting pays only at large, steady volume.</b> Break-even \(V^*=F/(p_{\text{api}}-c_{\text{var}})\approx4.4\) trillion tokens per year, about 12 billion per day. Below it, the fixed cost of a team dominates; above it, savings grow linearly.</figcaption>
+</figure>
+
+<p>Figure 10.5 is a good antidote to two common errors. One is to compare an API price with the self-hosted <em>variable</em> cost alone and conclude that self-hosting is obviously cheaper, forgetting the team. The other is to assume that the variable cost achievable in-house equals that of a specialised provider: \(c_{\text{var}}\) depends on utilisation (a small organisation's traffic has deep troughs and little else to fill them), on engine expertise, and on the price of GPU-hours the organisation can obtain, all of which favour large providers. In practice, break-even volumes of billions to tens of billions of tokens per day are typical for open models, which is why self-hosting is common among large technology companies and AI-native firms and less so elsewhere. Non-cost factors—data governance, latency, customisation, independence from a provider—can justify self-hosting below break-even, and should be stated as such.</p>
+
+<details class="drill">
+<summary>Drill 10.2 — Does Atlas's customer self-host?</summary>
+<p>A customer sends Atlas 3 billion tokens a day (80% input, 40% of input cached) to the 70B tier. Atlas charges $0.60 per million input, $0.15 per million cached input and $2.40 per million output. The customer estimates self-hosting at $0.25 input, $0.05 cached and $1.30 output per million at its own utilisation, plus $2 million a year in fixed costs. Should it self-host?</p>
+<p><em>Solution.</em> Daily volumes: 2.4 billion input (1.44 uncached, 0.96 cached), 0.6 billion output. Atlas: \(1440\times0.60+960\times0.15+600\times2.40=864+144+1440=\$2{,}448\) per day, about $894,000 per year. Self-host variable: \(1440\times0.25+960\times0.05+600\times1.30=360+48+780=\$1{,}188\) per day, about $434,000 per year, plus $2 million fixed: $2.43 million. Atlas is cheaper by about $1.5 million a year. The customer would need roughly four to five times its volume to break even, unless data-governance requirements force self-hosting.</p>
+</details>
+
+<h2 id="s10-7">10.7 FinOps: attributing the cost of a shared fleet</h2>
+<p>A large organisation's GPU fleet is shared by many teams, products and customers, and it needs to know what each of them costs, for three reasons: to set prices (for external customers), to make teams accountable for their spending (internal chargeback or showback), and to find waste. The practice of managing cloud costs in this way is called <strong>FinOps</strong>, and GPU fleets make it both more important and harder. Harder, because the natural unit of cost—a GPU-hour—is shared among many requests in a batch, so attributing it to individual requests requires a model.</p>
+<p>The standard approach attributes cost in two layers. <em>Direct consumption</em>: each request's share of the GPU time of the steps it participated in. A decode step serving \(B\) sequences costs \(n_gc_{\text{gpu}}t_{\text{step}}\), and a reasonable allocation divides it in proportion to each sequence's bytes read (its share of KV-cache traffic plus an equal share of the weight read), which charges long-context sequences more, as their cost warrants; prefill chunks are charged to the requests whose tokens they contain. Engines can record these shares cheaply per step; simpler systems approximate them by token counts weighted by the per-token costs of §10.4. <em>Shared overhead</em>: idle time, spare capacity, headroom, failed or draining replicas, control-plane and observability costs. These are real costs of offering the service, and they are allocated either proportionally to direct consumption (everyone pays for the headroom in proportion to use) or to the parties that cause them (a team that insists on a dedicated, rarely used pool pays for its idle capacity).</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — cost allocation as a cooperative game</div>
+<p>Allocating the cost of a shared resource is a classic problem of cooperative game theory. Let \(\mathcal C(S)\) be the cost of serving only the set \(S\) of tenants. Because of batching and multiplexing, \(\mathcal C\) is usually <em>subadditive</em>—\(\mathcal C(S\cup S')\le\mathcal C(S)+\mathcal C(S')\)—which is why sharing pays. A fair allocation \(x_i\) should be <em>efficient</em> (\(\sum_ix_i=\mathcal C(\text{all})\)) and, ideally, in the <em>core</em>: no group \(S\) pays more than it would alone, \(\sum_{i\in S}x_i\le\mathcal C(S)\), so no group wants to leave. The Shapley value, which charges each tenant its marginal cost averaged over all orders of joining, is the canonical fair allocation, but it is expensive to compute and hard to explain. Practical FinOps uses proportional allocation by measured consumption, which is simple, roughly fair when tenants are similar, and can be checked against the core condition for large tenants: a tenant who would pay less on dedicated capacity than under the shared allocation has a legitimate complaint.</p>
+</div>
+
+<p>Figure 10.6 shows the flow from raw measurements to unit economics. The measurements that matter are not the ones that are easiest to collect. Driver-reported GPU utilisation is nearly useless for cost purposes (§8.5): a replica can report 100% while doing a few percent of its possible work. Better metrics are tokens served per GPU-hour by model and tier, the fraction of GPU-hours that are allocated but idle, the fraction spent on headroom and spares, cost per million input and output tokens, and cost per request by tenant. These are what reveal waste: a team whose dedicated pool serves 900 tokens per GPU-hour where the shared pool serves 20,000, a model whose cost per request doubled after a prompt change, a region whose headroom policy holds 40% of its GPUs idle.</p>
+
+<figure class="diagram" id="fig-10-6">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Cost attribution pipeline for a shared GPU fleet">
+<defs><marker id="a105" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="30" width="150" height="80" rx="8" class="bx"/><text x="90" y="52" text-anchor="middle" class="t-xs t-b">measure</text><text x="90" y="68" text-anchor="middle" class="t-xs">per step: GPU time,</text><text x="90" y="82" text-anchor="middle" class="t-xs">sequences, KV bytes</text><text x="90" y="96" text-anchor="middle" class="t-xs">per request: tokens</text>
+<rect x="190" y="30" width="160" height="80" rx="8" class="bx4"/><text x="270" y="52" text-anchor="middle" class="t-xs t-b">direct cost</text><text x="270" y="68" text-anchor="middle" class="t-xs">step cost split by bytes</text><text x="270" y="82" text-anchor="middle" class="t-xs">read; prefill by tokens</text><text x="270" y="96" text-anchor="middle" class="t-xs">→ per request</text>
+<rect x="375" y="30" width="160" height="80" rx="8" class="bx2"/><text x="455" y="52" text-anchor="middle" class="t-xs t-b">shared overhead</text><text x="455" y="68" text-anchor="middle" class="t-xs">idle, headroom, spares,</text><text x="455" y="82" text-anchor="middle" class="t-xs">control plane → spread</text><text x="455" y="96" text-anchor="middle" class="t-xs">or charged to causers</text>
+<rect x="560" y="30" width="145" height="80" rx="8" class="bx3"/><text x="632" y="52" text-anchor="middle" class="t-xs t-b">unit economics</text><text x="632" y="68" text-anchor="middle" class="t-xs">$ per M tokens, per</text><text x="632" y="82" text-anchor="middle" class="t-xs">request, per tenant,</text><text x="632" y="96" text-anchor="middle" class="t-xs">margin by product</text>
+<line x1="165" y1="70" x2="188" y2="70" class="ln" marker-end="url(#a105)"/><line x1="350" y1="70" x2="373" y2="70" class="ln" marker-end="url(#a105)"/><line x1="535" y1="70" x2="558" y2="70" class="ln" marker-end="url(#a105)"/>
+<rect x="15" y="140" width="690" height="90" rx="8" class="bx5"/>
+<text x="360" y="162" text-anchor="middle" class="t-xs t-b">Metrics that reveal waste (and one that misleads)</text>
+<text x="30" y="184" class="t-xs">✓ tokens per GPU-hour by pool · ✓ allocated-but-idle GPU fraction · ✓ headroom and spare fraction · ✓ cost per request by tenant</text>
+<text x="30" y="202" class="t-xs">✓ cost per M input / cached / output tokens · ✓ cache-hit rate · ✓ joules per token (Chapter 2)</text>
+<text x="30" y="220" class="t-xs">✗ driver "GPU utilisation": fraction of time any kernel runs, near 100% even when a replica does a few percent of its work</text>
+</svg>
+<figcaption><b>Figure 10.6 — From measurements to unit economics.</b> Direct costs follow the work each request causes; shared overheads are spread or charged to the policies that cause them; the result is a set of unit costs that product, finance and engineering can act on.</figcaption>
+</figure>
+
+<p>Two organisational choices determine whether FinOps changes behaviour. <em>Showback</em> reports each team's cost without charging it; <em>chargeback</em> moves the cost into the team's budget. Chargeback changes behaviour more but invites gaming and disputes over allocation rules, so the rules must be simple, published and stable. And the unit costs must reach the people who make the decisions that drive them: the product manager who adds a reasoning mode, the engineer who changes a prompt template, the team that asks for a dedicated pool. A cost-per-request dashboard in every model launch review does more for efficiency than any amount of after-the-fact accounting.</p>
+
+<h2 id="s10-8">10.8 The levers, ranked</h2>
+<p>We can now rank the levers that move the cost of a token, using the formula \(n_gc_{\text{gpu}}/(3600\,\Phi\,u)\) and the decomposition of §10.4. Table 10.1 gives typical magnitudes. The ranking is not universal—which lever dominates depends on where a fleet starts—but its shape is: the largest factors come from utilisation and purchasing, which are infrastructure decisions, as much as from the engine optimisations of Volume I.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 10.1 — Levers on cost per token and typical magnitudes</caption>
+<thead><tr><th>Lever</th><th>Term it moves</th><th>Typical effect</th><th>Where covered</th></tr></thead>
+<tbody>
+<tr><td>Purchase terms (on-demand → committed/owned)</td><td>\(c_{\text{gpu}}\)</td><td>2–4×</td><td>Ch. 9, §10.2</td></tr>
+<tr><td>Utilisation (fixed peak fleet → shared, elastic)</td><td>\(u\)</td><td>1.5–2.5×</td><td>Ch. 7, 9</td></tr>
+<tr><td>Batching and memory management</td><td>\(\Phi\)</td><td>10–30× vs naive</td><td>Vol. I Ch. 10–11</td></tr>
+<tr><td>Quantisation (BF16 → FP8 → FP4)</td><td>\(\Phi\), \(n_g\)</td><td>1.5–3×</td><td>Vol. I Ch. 14</td></tr>
+<tr><td>Hardware generation</td><td>\(\Phi/c_{\text{gpu}}\)</td><td>1.5–3× per generation</td><td>Ch. 3</td></tr>
+<tr><td>Prefix caching and cache-aware routing</td><td>input cost</td><td>up to 5–10× on input</td><td>Vol. I Ch. 10, Ch. 8</td></tr>
+<tr><td>Speculative decoding</td><td>\(\Phi_D\)</td><td>1.5–3× on output</td><td>Vol. I Ch. 20</td></tr>
+<tr><td>Model choice and routing to smaller models</td><td>model cost</td><td>3–30×</td><td>Vol. I §27.6</td></tr>
+<tr><td>Batch tiers for deferrable work</td><td>\(u\), batch size</td><td>≈ 2×</td><td>Ch. 19</td></tr>
+</tbody></table></div>
+
+<p>Table 10.1 also explains the shape of a mature inference organisation. Engine teams own \(\Phi\); platform and capacity teams own \(u\) and \(c_{\text{gpu}}\); product and routing teams own the model mix; and finance owns the prices. Each lever multiplies the others, so a fleet that improves several by modest factors achieves an order of magnitude. The remaining chapters of this volume take up the parts of the system that face outward—towards users, regions, failures and attackers—starting with the front door through which every request arrives.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Part III has priced the fleet: what capacity to buy and on what terms, what a GPU-hour and a token cost, how to set prices and how to attribute costs. All of it assumed that requests somehow arrive at the right replica, from users anywhere in the world, authenticated, rate-limited and streamed back. The path a request takes from a user's device to an engine and back is itself a system: DNS, TLS, load balancers, an API gateway, protocols for streaming tokens over long-lived connections, and rate limits that must be enforced consistently across many gateway instances. How is that front door built, and what is special about it for LLMs? Chapter 11 opens Part IV with these questions.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Economics is engineering for LLMs: requests cost cents, margins depend on efficiency, and falling prices raise demand (Jevons).</li>
+<li>Owned GPU-hour ≈ (capital recovery \(K\,r_{\text{cap}}(1+r_{\text{cap}})^{n}/((1+r_{\text{cap}})^{n}-1)\) + space + power + ops) / sold fraction: about $2 for an H100 over five years; capital dominates, power is under 10%. Useful life (3 vs 6 years) moves it by up to 50%.</li>
+<li>GPU-hour prices fall over a generation (supply, newer hardware, software); commit with deflation in mind; move old hardware to low-value work; compare generations by cost per token.</li>
+<li>Output tokens cost \(\Phi_P^{\text{ded}}/\Phi_D^{\text{ded}}\approx3\)–10 times input tokens; cached input ≈ 0.1–0.5×; batch ≈ 0.5×; long context and priority more. Price lists mirror these mechanisms.</li>
+<li>Gross margin per request depends on token mix, cache-hit rate and how reasoning tokens are billed; free tiers are cost without revenue.</li>
+<li>Self-host beats an API above \(V^*=F/(p_{\text{api}}-c_{\text{var}})\): typically billions to tens of billions of tokens per day, once team cost and achievable utilisation are included.</li>
+<li>FinOps: attribute step costs by bytes read and tokens, spread or assign overheads, publish unit costs (per M tokens, per request, per tenant); driver GPU utilisation misleads; cost allocation is a cooperative game (core, Shapley).</li>
+<li>Largest levers: purchase terms, utilisation, batching, quantisation, hardware generation, caching, speculation, model routing, batch tiers—multiplicative.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci10-mcq-01" data-topic="§10.1 Economics">
+<p class="q">The Jevons paradox, applied to tokens, predicts that falling prices:</p>
+<ol class="opts"><li>Reduce total usage</li><li data-correct>Can increase total token consumption by enabling new uses</li><li>Have no effect on demand</li><li>Eliminate margins</li></ol>
+<div class="explain">More efficient use of a resource can increase its total use.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-02" data-topic="§10.2 TCO">
+<p class="q">Which component dominates the cost of an owned H100 GPU-hour?</p>
+<ol class="opts"><li>Electricity</li><li data-correct>Capital recovery of the hardware</li><li>Software licences</li><li>Network egress</li></ol>
+<div class="explain">About two-thirds; power is under 10%.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-03" data-topic="§10.2 TCO">
+<p class="q">The capital recovery factor for 10% interest over 5 years is about:</p>
+<ol class="opts"><li>0.10</li><li>0.20</li><li data-correct>0.264</li><li>0.50</li></ol>
+<div class="explain">\(0.1\times1.1^5/(1.1^5-1)\approx0.264\).</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-04" data-topic="§10.2 TCO">
+<p class="q">As the interest rate tends to zero, the capital recovery payment tends to:</p>
+<ol class="opts"><li>Zero</li><li data-correct>Straight-line depreciation \(K/n\)</li><li>\(rK\)</li><li>\(K\)</li></ol>
+<div class="explain">As \(n\to\infty\) it tends to \(rK\).</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-05" data-topic="§10.2 TCO">
+<p class="q">Why is all-in cost divided by the "sold fraction"?</p>
+<ol class="opts"><li>Tax rules</li><li data-correct>Costs accrue every hour, but only the hours the GPU is healthy and in use produce revenue or work</li><li>To include power</li><li>To convert currencies</li></ol>
+<div class="explain">Repairs, spares and idle time spread costs over fewer useful hours.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-06" data-topic="§10.2 TCO">
+<p class="q">From Figure 10.2, moving the useful life from 6 to 3 years at $40k per GPU raises cost per sold hour from about $1.88 to about:</p>
+<ol class="opts"><li>$2.05</li><li>$2.31</li><li data-correct>$2.75</li><li>$3.77</li></ol>
+<div class="explain">Depreciation life is the most consequential assumption.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-07" data-topic="§10.2 TCO">
+<p class="q">A GPU's economic useful life ends when:</p>
+<ol class="opts"><li>It physically fails</li><li data-correct>Its output is no longer worth its operating cost, given the market price set by newer hardware</li><li>Its warranty expires</li><li>Its driver is deprecated</li></ol>
+<div class="explain">Hence the depreciation debate for AI accelerators.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-08" data-topic="§10.3 Prices fall">
+<p class="q">Which forces lower the rental price of a given GPU over its life? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Supply catching up with demand</li><li data-correct>Newer generations delivering more tokens per dollar</li><li data-correct>Software that exploits new hardware's features</li><li>Rising electricity prices</li></ol>
+<div class="explain">Electricity is a small share and would push prices up, not down.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-09" data-topic="§10.3 Prices fall">
+<p class="q">The right figure of merit for comparing GPU generations is:</p>
+<ol class="opts"><li>Price per hour</li><li>Peak FLOP/s</li><li data-correct>Cost per token at the target latency</li><li>HBM capacity</li></ol>
+<div class="explain">A GPU at twice the price with three times the tokens is cheaper.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-10" data-topic="§10.4 Token costs">
+<p class="q">The ratio of output-token cost to input-token cost equals approximately:</p>
+<ol class="opts"><li>1</li><li data-correct>The dedicated prefill rate divided by the dedicated decode rate</li><li>The number of layers</li><li>The vocabulary size</li></ol>
+<div class="explain">Typically 3–10 for common models.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-11" data-topic="§10.4 Token costs">
+<p class="q">In the worked example, Atlas's 70B output tokens cost about:</p>
+<ol class="opts"><li>$0.03 per million</li><li>$0.25 per million</li><li data-correct>$1.26 per million</li><li>$12.60 per million</li></ol>
+<div class="explain">\(20/(3600\times0.55\times8000)\) per token.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-12" data-topic="§10.4 Token costs">
+<p class="q">Why are cached input tokens priced at a steep discount?</p>
+<ol class="opts"><li>They are not processed</li><li data-correct>A prefix-cache hit skips prefill computation, leaving only KV storage and retrieval costs</li><li>Regulation</li><li>They are shorter</li></ol>
+<div class="explain">Some providers charge a premium for writing to the cache.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-13" data-topic="§10.4 Token costs">
+<p class="q">Why are batch APIs commonly discounted by about half?</p>
+<ol class="opts"><li>Batch outputs are lower quality</li><li data-correct>Deferrable work fills troughs at high utilisation and large batch sizes, so its marginal cost is lower</li><li>Batch tokens are shorter</li><li>Batch requests skip safety checks</li></ol>
+<div class="explain">See Chapters 7 and 19.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-14" data-topic="§10.4 Token costs">
+<p class="q">Why do some providers charge more per token above a long-context threshold?</p>
+<ol class="opts"><li>Long prompts are rarer</li><li data-correct>Large KV caches crowd out other sequences (smaller decode batch) and attention cost grows super-linearly</li><li>Tokenisation is slower</li><li>Network egress</li></ol>
+<div class="explain">GPU time per token rises with context.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-15" data-topic="§10.4 Token costs">
+<p class="q">A provider prices a 70B model at $0.20 input and $0.60 output per million. Which levers could make it profitable? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Higher utilisation</li><li data-correct>Speculative decoding and FP4</li><li data-correct>Cheaper or newer hardware</li><li>Shorter vocabulary</li></ol>
+<div class="explain">Or it may be a loss-leader.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-16" data-topic="§10.5 Pricing">
+<p class="q">Why do open-weight model prices converge towards cost?</p>
+<ol class="opts"><li>Regulation</li><li data-correct>Many providers serve the same model, so competition pushes price towards the most efficient provider's cost plus a modest margin</li><li>Open models are smaller</li><li>They cannot be cached</li></ol>
+<div class="explain">Proprietary frontier models can command larger margins.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-17" data-topic="§10.5 Pricing">
+<p class="q">If hidden reasoning tokens are generated but not billed, the effect on margin is:</p>
+<ol class="opts"><li>None</li><li data-correct>Cost rises with no matching revenue, so margin falls sharply</li><li>Margin rises</li><li>Only latency changes</li></ol>
+<div class="explain">Billing reasoning tokens as output preserves margin.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-18" data-topic="§10.5 Pricing">
+<p class="q">A higher cache-hit rate raises a provider's margin when:</p>
+<ol class="opts"><li>Always</li><li data-correct>The cached-to-uncached price ratio exceeds the cached-to-uncached cost ratio</li><li>Never</li><li>Only for output tokens</li></ol>
+<div class="explain">Then cost falls faster than revenue.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-19" data-topic="§10.6 Break-even">
+<p class="q">The break-even annual volume for self-hosting is:</p>
+<ol class="opts"><li>\(F\cdot p_{\text{api}}\)</li><li data-correct>\(F/(p_{\text{api}}-c_{\text{var}})\)</li><li>\(c_{\text{var}}/F\)</li><li>\(p_{\text{api}}/c_{\text{var}}\)</li></ol>
+<div class="explain">Fixed cost divided by the per-unit saving.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-20" data-topic="§10.6 Break-even">
+<p class="q">With \(F=\$2.4\)M, \(p_{\text{api}}=\$0.90\) and \(c_{\text{var}}=\$0.35\) per million tokens, break-even is about:</p>
+<ol class="opts"><li>440 billion tokens/year</li><li data-correct>4.4 trillion tokens/year</li><li>44 trillion tokens/year</li><li>2.4 trillion tokens/year</li></ol>
+<div class="explain">\(2.4\times10^6/0.55\approx4.4\times10^6\) million tokens.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-21" data-topic="§10.6 Break-even">
+<p class="q">Which errors make self-hosting look cheaper than it is? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Ignoring the fixed cost of the team and tooling</li><li data-correct>Assuming a specialised provider's utilisation is achievable in-house</li><li data-correct>Using GPU-hour prices that only large buyers obtain</li><li>Including the API's price</li></ol>
+<div class="explain">Variable cost depends on utilisation, expertise and purchasing power.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-22" data-topic="§10.6 Break-even">
+<p class="q">In Drill 10.2, the customer's cheaper option at 3 billion tokens/day is:</p>
+<ol class="opts"><li data-correct>Staying on Atlas (≈ $0.9M/yr vs ≈ $2.4M/yr self-hosted)</li><li>Self-hosting</li><li>They are equal</li><li>Neither</li></ol>
+<div class="explain">Fixed costs dominate at that volume.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-23" data-topic="§10.7 FinOps">
+<p class="q">A fair way to split a decode step's cost among its \(B\) sequences is in proportion to:</p>
+<ol class="opts"><li>Request arrival order</li><li data-correct>Each sequence's bytes read (its KV traffic plus a share of the weight read)</li><li>Tenant name</li><li>Equal shares regardless of context</li></ol>
+<div class="explain">Long-context sequences cost more and should be charged more.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-24" data-topic="§10.7 FinOps">
+<p class="q">Which metric is nearly useless for GPU cost attribution?</p>
+<ol class="opts"><li>Tokens per GPU-hour</li><li>Allocated-but-idle fraction</li><li data-correct>Driver-reported GPU utilisation</li><li>Cost per request</li></ol>
+<div class="explain">It reports the fraction of time any kernel runs.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-25" data-topic="§10.7 FinOps">
+<p class="q">An allocation is in the "core" if:</p>
+<ol class="opts"><li>It charges everyone equally</li><li data-correct>No group of tenants pays more than it would to serve itself alone</li><li>It equals the Shapley value</li><li>It ignores idle cost</li></ol>
+<div class="explain">Otherwise that group has a reason to leave.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-26" data-topic="§10.7 FinOps">
+<p class="q">Why is the cost function of a shared GPU fleet typically subadditive?</p>
+<ol class="opts"><li>GPUs are discounted in bulk</li><li data-correct>Batching and statistical multiplexing let combined tenants share weight reads, headroom and spares</li><li>Electricity is cheaper at night</li><li>It is not</li></ol>
+<div class="explain">This is why sharing pays.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-27" data-topic="§10.7 FinOps">
+<p class="q">Showback differs from chargeback in that it:</p>
+<ol class="opts"><li>Charges more</li><li data-correct>Reports costs to teams without moving them into their budgets</li><li>Only applies to external customers</li><li>Ignores overheads</li></ol>
+<div class="explain">Chargeback changes behaviour more but invites disputes.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-28" data-topic="§10.8 Levers">
+<p class="q">Which levers are owned mainly by infrastructure and capacity teams rather than engine teams? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Purchase terms</li><li data-correct>Utilisation through sharing and elasticity</li><li>Kernel fusion</li><li data-correct>Hardware generation choice</li></ol>
+<div class="explain">Engine teams own throughput per replica.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-29" data-topic="§10.8 Levers">
+<p class="q">Why do several modest improvements compound into an order of magnitude?</p>
+<ol class="opts"><li>They add</li><li data-correct>Cost per token is a product of factors (price, 1/throughput, 1/utilisation, model choice), so improvements multiply</li><li>They do not</li><li>Through tax effects</li></ol>
+<div class="explain">E.g. 2× × 1.5× × 1.5× × 2× ≈ 9×.</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-30" data-topic="§10.2 TCO">
+<p class="q">Power for one H100 at 1.4 kW all-in, PUE 1.3 and $0.08/kWh costs about:</p>
+<ol class="opts"><li>$0.015 per hour</li><li data-correct>$0.15 per hour</li><li>$1.50 per hour</li><li>$15 per hour</li></ol>
+<div class="explain">\(1.4\times1.3\times0.08\approx0.146\).</div>
+</div>
+
+<div class="mcq" data-id="ci10-mcq-31" data-topic="§10.3 Prices fall">
+<p class="q">A neocloud signing a 3-year H100 contract at a fixed price has transferred which risk to the customer?</p>
+<ol class="opts"><li>Power-price risk only</li><li data-correct>The risk that market GPU-hour prices fall below the contract price (depreciation risk)</li><li>Network risk</li><li>Model-quality risk</li></ol>
+<div class="explain">The customer bets prices will not fall faster than the contract assumes.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci10-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What goes into the cost of an owned GPU-hour?</summary>
+<div class="answer">
+<p>Capital (server plus its share of network and storage, ≈ $40k per H100) recovered over the useful life at the cost of capital (capital recovery factor ≈ 0.26 for 5 years at 10% → ≈ $1.20/h); space (colocation or datacenter cost per kW of IT, ≈ $0.35/h for 1.4 kW); power (≈ $0.15/h at PUE 1.3 and $0.08/kWh); operations (staff, spares, repairs, software, ≈ $0.15/h); all divided by the fraction of hours sold (≈ 90%): ≈ $2/h. Capital dominates; useful life is the most sensitive input.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Why do APIs charge more for output tokens than input tokens?</summary>
+<div class="answer">
+<p>Prefill (input) is compute-bound: thousands of tokens share each read of the weights, so a GPU processes tens of thousands of input tokens per second. Decode (output) is memory-bound: each step reads the weights and KV cache to produce only one token per sequence, so throughput per GPU-second is several times lower. Cost per token is GPU time per token, so output costs roughly \(\Phi_P/\Phi_D\) ≈ 3–10 times input; providers' 3–5× price ratios reflect this.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Why are cached input tokens and batch requests discounted?</summary>
+<div class="answer">
+<p>Cached input: a prefix-cache hit skips prefill computation; the provider pays only to keep and fetch the KV blocks (memory, transfer), roughly a tenth of the compute, and routing for hits. Batch: deferrable requests can be scheduled into troughs and run at large batch sizes and high utilisation, using capacity that would otherwise idle, so the marginal cost is far lower; the discount (≈ 50%) shares that saving and shifts demand off the peak.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-04">
+<summary><span class="lvl core">Core</span> Compute input and output token costs for Llama 3 70B on 8 H100s and propose a price list.</summary>
+<div class="answer">
+<p>Replica $20/h ($2.50 × 8). Dedicated prefill ≈ 40k tokens/s, decode ≈ 8k tokens/s at 40 ms TPOT, average utilisation 55%. Input ≈ 20/(3600 × 0.55 × 40,000) ≈ $0.25/M; output ≈ $1.26/M; cached input ≈ $0.03–0.05/M. Add overheads (spares, control plane, staff), target margin (say 50–60% gross), and market position: e.g. input $0.60, cached $0.15, output $2.40, batch at 50%, long-context surcharge above 128k. Validate margin on the actual token mix (input share, cache-hit rate) and revisit as throughput improves.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-05">
+<summary><span class="lvl core">Core</span> Should our company self-host an open model or use an API? Walk through the analysis.</summary>
+<div class="answer">
+<p>Estimate volume by token type and its growth; get API prices (including cached and batch); estimate self-hosted variable cost per token at realistic utilisation (daily troughs, headroom, engine efficiency, GPU-hour price you can actually obtain); add fixed costs (engineers, on-call, tooling, evaluations, security): break-even \(V^*=F/(p_{\text{api}}-c_{\text{var}})\), e.g. $2.4M/0.55 ≈ 4.4T tokens/year ≈ 12B/day. Below it, API; above, self-host. Then non-cost factors: data governance and residency, latency, customisation (fine-tunes, decoding control), vendor independence, roadmap risk. Often: API now, revisit at scale; or hybrid—self-host high-volume steady workloads, API for spiky or frontier needs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-06">
+<summary><span class="lvl core">Core</span> How would you attribute the cost of a shared GPU fleet to tenants?</summary>
+<div class="answer">
+<p>Two layers. Direct: per engine step, compute cost \(n_gc_{\text{gpu}}t_{\text{step}}\) and split among sequences by bytes read (KV traffic plus share of weight read) for decode and by tokens for prefill chunks; aggregate per request and tenant; or approximate with per-token-type unit costs. Overheads: idle, headroom, spares, control plane, observability—spread proportionally to direct cost, or charged to owners of policies that cause them (dedicated pools, guaranteed capacity). Publish simple, stable rules; showback first, chargeback when trusted. Check large tenants against the "core" (would they pay less alone?). Report unit costs per M tokens and per request; avoid driver GPU utilisation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-07">
+<summary><span class="lvl core">Core</span> Is $0.10 per million output tokens plausible for a 70B dense model?</summary>
+<div class="answer">
+<p>At $2.50/GPU-h on 8 H100s ($20/h) the replica would need \(20/(3600\times10^{-7})\approx55{,}600\) output tokens/s at full utilisation—about 7× Atlas's operating point. Possible only with stacked levers: much cheaper GPU-hours (owned older hardware, ≈ $1.5), near-full utilisation (batch traffic), FP4 or aggressive quantisation, very large batches (relaxed TPOT), speculative decoding (2–3×), newer bandwidth-rich hardware. So for interactive latency it is implausible as a profitable price; for batch or relaxed-latency serving on optimised stacks, conceivable; otherwise a subsidy or a smaller/MoE model in disguise.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> How should depreciation life be chosen for AI accelerators, and how does it interact with contracts?</summary>
+<div class="answer">
+<p>Economic life is when an accelerator's output value no longer covers its operating cost, driven by the market price of tokens set by newer generations (2–3× tokens per dollar each generation). Accounting lives of 5–6 years may overstate value if prices fall fast, making historical costs look low; 3–4 years is a conservative alternative. The life moves cost per hour by up to 50%. Strategies: plan cascades (frontier serving → mid-tier models → batch → retirement), negotiate contracts with upgrade rights or shorter terms, price long-term commitments anticipating deflation, and evaluate purchases by NPV of token output under price-decline scenarios rather than by cost per hour.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Derive the margin impact of launching a reasoning mode that quadruples output length.</summary>
+<div class="answer">
+<p>Per request cost \(=n_{\text{in}}c'_{\text{in}}+n_{\text{out}}c_{\text{out}}\), revenue \(=n_{\text{in}}p'_{\text{in}}+n_{\text{out}}p_{\text{out}}\) (primes include cache effects). With \(n_{\text{out}}\to4n_{\text{out}}\): if reasoning tokens are billed at \(p_{\text{out}}\), both cost and revenue scale up in the output term; margin moves towards the output-token margin \(1-c_{\text{out}}/p_{\text{out}}\). But \(c_{\text{out}}\) itself rises because longer outputs hold KV longer and shrink batches (context grows), lowering \(\Phi_D\); so margin falls unless prices adjust. If reasoning tokens are free or capped by a flat price, cost rises 4× on the output term with no revenue: margin can turn negative. Also capacity: decode fleet grows ~4× for that traffic, a capacity event (Drill 1.1). Price and capacity plans must move with the feature.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Explain cost allocation as a cooperative game and when proportional allocation fails.</summary>
+<div class="answer">
+<p>Let \(\mathcal C(S)\) be the cost of serving tenant set \(S\); sharing makes it subadditive. Efficient allocations split \(\mathcal C(\text{all})\); core allocations charge no coalition more than its stand-alone cost; Shapley charges average marginal cost over join orders. Proportional-to-usage allocation fails when tenants differ in shape: a steady, off-peak tenant contributes little to peak capacity yet pays the same rate as a peaky tenant who drives the fleet size; a tenant requiring dedicated capacity or tight latency causes headroom that proportional rules spread to others; a very large tenant might pay more than its stand-alone cost (core violation). Fixes: peak-load pricing (charge for contribution to peak), separate charges for guaranteed capacity, tiered latency pricing, and checking large tenants against stand-alone cost.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-11">
+<summary><span class="lvl design">Design</span> Design a FinOps programme for a company spending $150M/year on GPUs across 40 teams.</summary>
+<div class="answer">
+<p>Instrument: per-request token counts and engine step accounting by model, tenant and team; capacity inventory by pool and purchase term; DCGM and engine metrics for idle and headroom. Allocate: direct cost by measured consumption; overheads by published rules (shared vs owner-caused). Report: dashboards of cost per M input/cached/output tokens, cost per request, tokens per GPU-hour, idle and headroom fractions, by team and model; weekly anomalies (cost per request jumps after a prompt change). Govern: showback then chargeback, budgets and forecasts per team, cost reviews in model and feature launches, incentives for consolidation (shared pools, multi-LoRA) over dedicated pools, procurement decisions informed by forecasts. Target efficiency projects by GPUs saved.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-12">
+<summary><span class="lvl design">Design</span> You are asked to cut the cost per token of a serving fleet in half within a year. What is your plan?</summary>
+<div class="answer">
+<p>Decompose cost per token \(=n_gc_{\text{gpu}}/(3600\Phi u)\) by pool and token type; find the largest factors. Purchase: move on-demand to committed or owned, renegotiate as prices fall (often 1.5–2×). Utilisation: consolidate pools, shared scheduling with batch in troughs, better autoscaling and faster cold starts (1.3–2×). Throughput: FP8/FP4, speculative decoding, engine upgrades, larger batches with paged KV, disaggregation where it pays (1.5–2×). Input: cache-aware routing and prompt hygiene (big wins on input-heavy traffic). Model mix: route easy traffic to smaller models (cascades) (large factor). Hardware: migrate high-volume models to newer generations. Track weekly; each 1.2–1.5× compounds; ensure quality gates so cost cuts don't degrade output.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-13">
+<summary><span class="lvl core">Core</span> Why can a price below your cost still be rational for a provider?</summary>
+<div class="answer">
+<p>Because the provider's cost may be lower than yours (better utilisation, cheaper or owned hardware, aggressive optimisations), so the price is above their cost; because of strategic reasons—market share, lock-in, attracting developers to an ecosystem, data or feedback; because of elasticity (lower prices unlock volume that improves their utilisation and economies of scale); or because the price is cross-subsidised by other products. When evaluating a quoted price, reconstruct the provider's plausible cost with the levers available and decide whether it is sustainable before depending on it.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-14">
+<summary><span class="lvl deep">Deep-dive</span> How would you price long-context requests?</summary>
+<div class="answer">
+<p>Model cost per request as a function of context length \(t\): prefill FLOPs \(\approx2Nt+O(Lt^2d)\) (attention super-linear), KV memory \(t\,s_{kv}\) held for the decode duration (crowding out other sequences, reducing batch and throughput), and decode bytes per step growing with \(t\). So cost per output token grows roughly linearly with \(t\) for decode-bound regimes and per-input-token cost grows for very long prompts. Price tiers (e.g. a higher rate above 128k or 200k tokens) or a context-proportional surcharge reflect this; heavy caching discounts for reused long documents; and admission control to keep very long requests from starving others. Check margin by context bucket using measured cost.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-15">
+<summary><span class="lvl core">Core</span> Rank the levers on cost per token and say who owns each.</summary>
+<div class="answer">
+<p>Purchase terms (2–4×, capacity/finance), utilisation via sharing and elasticity (1.5–2.5×, platform), batching and memory management (10–30× vs naive, engine), quantisation (1.5–3×, engine/model), hardware generation (1.5–3× per generation, capacity), prefix caching and cache-aware routing (large on input, platform/routing), speculative decoding (1.5–3× on output, engine), model choice and routing to smaller models (3–30×, product/routing), batch tiers (≈ 2× for deferrable work, product/platform). They multiply, so organisational alignment across these owners matters.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci10-qa-16">
+<summary><span class="lvl warm">Warm-up</span> Why is electricity a small share of GPU cost but power capacity a big constraint?</summary>
+<div class="answer">
+<p>Per hour, an H100's 1.4 kW all-in at PUE 1.3 costs about $0.15 of electricity against about $2 of total cost—under 10%. But the ability to draw megawatts (grid connection, substations, cooling plant) takes years to build and cannot be bought quickly at any price, so the availability of power limits how many GPUs can be installed. Hence tokens per joule matters for capacity even though it barely moves the bill (Chapter 2).</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li>W. S. Jevons. <em>The Coal Question</em>. Macmillan, 1865.</li>
+<li>L. A. Barroso, U. Hölzle, P. Ranganathan. <em>The Datacenter as a Computer</em>, 3rd ed. (chapter on costs). Morgan &amp; Claypool, 2018.</li>
+<li>R. A. Brealey, S. C. Myers, F. Allen. <em>Principles of Corporate Finance</em>, 14th ed. McGraw-Hill, 2022 (capital recovery and NPV).</li>
+<li>L. S. Shapley. A Value for n-Person Games. In <em>Contributions to the Theory of Games II</em>, 1953.</li>
+<li>FinOps Foundation. FinOps Framework, 2023–2025.</li>
+<li>W. Kwon et al. Efficient Memory Management for LLM Serving with PagedAttention. <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+<li>L. Zheng et al. SGLang: Efficient Execution of Structured Language Model Programs (RadixAttention). 2023. <a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a>.</li>
+<li>Y. Leviathan, M. Kalman, Y. Matias. Fast Inference from Transformers via Speculative Decoding. <em>ICML</em>, 2023. <a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a>.</li>
+<li>Epoch AI. Analyses of trends in LLM inference prices and hardware price-performance, 2024–2025.</li>
+<li>Published API price lists of major providers (OpenAI, Anthropic, Google, and open-model inference platforms), 2024–2026, for input, cached-input, output and batch pricing structures.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

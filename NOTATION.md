@@ -284,3 +284,13 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(\ell_q\), \(q\) | pinball loss; forecast quantile |
 | \(\lambda_p\), \(L_{\text{job}}\) | preemption rate per hour; uninterrupted work a job needs (hours) |
 | \(w\), \(t_{\text{node}}\), \(\dot\lambda\) | warm-pool size (GPUs; elsewhere \(w\) is the attention window); node provisioning time; demand growth rate |
+
+## Economics (Vol. II Ch. 10)
+| Symbol | Meaning |
+|---|---|
+| \(K\), \(r_{\text{cap}}\), \(n_{\text{yr}}\), \(A\) | capital cost; cost of capital; useful life in years; annual capital-recovery payment |
+| \(c_{\text{in}}\), \(c_{\text{hit}}\), \(c_{\text{out}}\) | cost per uncached input, cached input and output token |
+| \(p_{\text{in}}\), \(p_{\text{hit}}\), \(p_{\text{out}}\), \(p_{\text{api}}\) | corresponding prices; blended API price per million tokens |
+| \(\Phi_P^{\text{ded}}\), \(\Phi_D^{\text{ded}}\) | prefill and decode rates of a replica doing only that phase |
+| \(F\), \(c_{\text{var}}\), \(V^{*}\) | fixed annual cost of self-hosting; variable cost per million tokens; break-even volume |
+| \(\mathcal C(S)\) | cost of serving the set \(S\) of tenants (cost-allocation game) |
