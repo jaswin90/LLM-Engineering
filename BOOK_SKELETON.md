@@ -317,7 +317,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 12 | Multi-Region Serving and Disaster Recovery | ✅ v1 |
 | 13 | Reliability Engineering for AI Services | ✅ v1 |
 | 14 | Security, Isolation and Multi-Tenancy | ✅ v1 |
-| 15 | Serving Multimodal Models | ⏳ |
+| 15 | Serving Multimodal Models | ✅ v1 |
 | 16 | Embeddings, Retrieval and Vector Search at Scale | ⏳ |
 | 17 | Agents and Compound AI Systems | ⏳ |
 | 18 | Guardrails and Moderation Infrastructure | ⏳ |

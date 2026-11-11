@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 15 · Serving Multimodal Models — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 15 of Cloud AI Infrastructure: how images become tokens in vision-language models, the compute and KV cost of an image, where to run the vision encoder (encoder caching and encode–prefill–decode disaggregation), video and long multimodal contexts, speech recognition, speech synthesis and real-time speech-to-speech, image generation serving in brief, and the infrastructure consequences of multimodal traffic.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci15" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part V · Beyond Chat — Chapter 15</div>
+<h1 id="top">Serving Multimodal Models</h1>
+<p class="lede">Users increasingly send models screenshots, photographs, scanned documents, recordings and video, and expect spoken as well as written answers. A model that sees or hears turns each image or second of audio into tokens through an encoder, and those tokens enter the same prefill, KV cache and decode machinery as text—but in quantities, and with latency requirements, that change the cost model. This chapter explains how images, video and audio become tokens, what they cost, where their encoders should run, how real-time voice is served, and what multimodal traffic demands of the infrastructure.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Volume I treated a request as a sequence of text tokens. That was a good model of LLM traffic in 2023, and it still describes most of it, but by 2025 every frontier model accepted images, most accepted documents and audio, and several produced speech directly. For an infrastructure engineer, multimodality changes three things. It changes <em>what a request costs</em>: a single high-resolution screenshot can carry more tokens than a page of text, and a minute of video more than a short book chapter, so capacity plans counted in text tokens underestimate. It adds <em>a new stage</em>: an encoder network, with its own compute profile and its own place to run, that turns pixels or waveforms into embeddings before the language model sees them. And for voice it imposes <em>a new latency regime</em>: a conversation feels natural only if the system starts answering within a few hundred milliseconds of the user stopping, which is much tighter than the TTFT targets of chat.</p>
+<p>This is one of the workload families Volume I left open (§1.8), and interviews increasingly include it: "how many tokens is an image, and what does that do to KV memory?", "should the vision encoder run on the same GPUs as the LLM?", "design a real-time voice assistant with a 500 ms response target", "what changes in capacity planning when 30% of requests contain images?". We take the modalities in turn: images (§15.1–15.3), video (§15.4), speech (§15.5), and generation of images (§15.6), and then draw the infrastructure consequences (§15.7).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Compute the number of tokens an image contributes under fixed-resolution, tiled and dynamic-resolution vision encoders.</li>
+<li>Estimate the encoder FLOPs, LLM prefill FLOPs and KV-cache bytes of an image, and compare them with text.</li>
+<li>Decide where to run vision encoders, and explain encoder caching and encode–prefill–decode disaggregation.</li>
+<li>Estimate token counts for video and apply frame sampling and token reduction.</li>
+<li>Build a latency budget for a voice assistant and compare cascaded (ASR → LLM → TTS) and native speech-to-speech designs.</li>
+<li>Describe how image generation is served and plan capacity, networking and storage for multimodal traffic.</li>
+</ol>
+<p class="small muted">Uses: prefill and KV cost (Vol. I §3.4–3.8), disaggregation (Vol. I Chapter 13), streaming protocols (Chapter 11), capacity planning (Chapters 1 and 9).</p>
+</div>
+
+<h2 id="s15-1">15.1 How an image becomes tokens</h2>
+<p>Most vision-language models of 2023–2026 follow one architecture, introduced in its modern form by LLaVA in 2023<span class="cite"><a href="#r-llava">[1]</a></span>. A <strong>vision encoder</strong>—usually a Vision Transformer (ViT) pre-trained contrastively on image–text pairs, such as CLIP or SigLIP—cuts the image into square <em>patches</em> of \(p_{\text{px}}\times p_{\text{px}}\) pixels (typically 14 or 16), embeds each patch as a vector, and runs a Transformer over the sequence of patch embeddings. A small <strong>projector</strong> (a linear layer or a two-layer MLP) maps the encoder's output vectors into the language model's embedding space, often merging neighbouring patches to reduce their number. The resulting vectors are inserted into the language model's input sequence in place of an image placeholder, and from then on they are tokens like any other: they are prefilled, occupy KV cache and are attended to by every later token.</p>
+<p>Figure 15.1 traces the path from pixels to the language model's context. The image is cut into patches; the ViT turns them into contextual patch embeddings; the projector merges and maps them; and the result is spliced into the token sequence between pieces of text, where the language model processes it exactly as it would text tokens.</p>
+
+<figure class="diagram" id="fig-15-1">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="From image pixels to language-model tokens">
+<defs><marker id="a151" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="40" width="110" height="110" rx="6" class="bx"/>
+<g class="ln"><line x1="15" y1="67" x2="125" y2="67" class="ln"/><line x1="15" y1="95" x2="125" y2="95" class="ln"/><line x1="15" y1="122" x2="125" y2="122" class="ln"/><line x1="42" y1="40" x2="42" y2="150" class="ln"/><line x1="70" y1="40" x2="70" y2="150" class="ln"/><line x1="97" y1="40" x2="97" y2="150" class="ln"/></g>
+<text x="70" y="170" text-anchor="middle" class="t-xs">image cut into 14-px patches</text>
+<rect x="160" y="55" width="130" height="80" rx="8" class="bx4"/><text x="225" y="82" text-anchor="middle" class="t-xs t-b">vision encoder</text><text x="225" y="98" text-anchor="middle" class="t-xs">ViT (CLIP / SigLIP)</text><text x="225" y="114" text-anchor="middle" class="t-xs">≈ 0.3–0.6 B params</text>
+<rect x="325" y="55" width="130" height="80" rx="8" class="bx2"/><text x="390" y="82" text-anchor="middle" class="t-xs t-b">projector</text><text x="390" y="98" text-anchor="middle" class="t-xs">2×2 merge + MLP</text><text x="390" y="114" text-anchor="middle" class="t-xs">→ LLM width d</text>
+<rect x="490" y="60" width="215" height="70" rx="8" class="bx3"/>
+<rect x="500" y="80" width="40" height="30" rx="4" class="bx"/><text x="520" y="99" text-anchor="middle" class="t-xs">text</text>
+<rect x="545" y="80" width="100" height="30" rx="4" class="bx2"/><text x="595" y="99" text-anchor="middle" class="t-xs">image tokens</text>
+<rect x="650" y="80" width="45" height="30" rx="4" class="bx"/><text x="672" y="99" text-anchor="middle" class="t-xs">text</text>
+<text x="597" y="150" text-anchor="middle" class="t-xs">LLM input: prefill, KV, attention</text>
+<line x1="125" y1="95" x2="158" y2="95" class="ln" marker-end="url(#a151)"/><line x1="290" y1="95" x2="323" y2="95" class="ln" marker-end="url(#a151)"/><line x1="455" y1="95" x2="488" y2="95" class="ln" marker-end="url(#a151)"/>
+<text x="360" y="200" text-anchor="middle" class="t-xs">Tokens per image = patches ÷ merge factor; each token then costs the LLM like a text token.</text>
+</svg>
+<figcaption><b>Figure 15.1 — From pixels to tokens.</b> A ViT encodes image patches, a projector merges and maps them to the language model's width, and the resulting vectors take their place in the token sequence.</figcaption>
+</figure>
+
+<p>The number of image tokens depends on the resolution the encoder sees. Early models resized every image to a fixed square: LLaVA-1.5 used a ViT with 14-pixel patches at 336×336 pixels, giving \((336/14)^2=576\) tokens per image whatever its original size, which is cheap but loses detail in documents and screenshots. Later models processed higher resolutions. <em>Tiling</em> schemes cut a large image into several fixed-size tiles plus a thumbnail and encode each, multiplying the token count. <em>Dynamic-resolution</em> encoders, such as the one in Qwen2-VL, process the image near its native resolution, using two-dimensional rotary position embeddings, and merge each 2×2 group of 14-pixel patches into one token, so each token covers 28×28 pixels<span class="cite"><a href="#r-qwen2vl">[2]</a></span>. For an image of \(H\times W\) pixels, a dynamic encoder with merged patch size \(p_{\text{tok}}\) produces</p>
+\[
+n_{\text{img}}=\Bigl\lceil\frac{H}{p_{\text{tok}}}\Bigr\rceil\Bigl\lceil\frac{W}{p_{\text{tok}}}\Bigr\rceil
+\]
+<p>tokens, usually capped by a maximum pixel budget. Figure 15.2 compares the two approaches.</p>
+
+<figure class="chart" id="fig-15-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Tokens per square image against resolution: fixed 336 px versus dynamic resolution (28 px per token)","height":320,
+ "x":{"label":"Image side (pixels)","min":300,"max":2100,"ticks":[448,672,896,1344,2016]},
+ "y":{"label":"Image tokens (log)","log":true,"min":150,"max":7000,"ticks":[200,500,1000,2000,5000]},
+ "series":[
+  {"name":"Fixed resize to 336×336 (LLaVA-1.5 style)","color":"s4","points":[[336,576],[448,576],[672,576],[896,576],[1344,576],[2016,576]]},
+  {"name":"Dynamic resolution, 28×28 px per token","color":"s1","points":[[336,144],[448,256],[672,576],[896,1024],[1344,2304],[2016,5184]]}
+ ]}
+</script>
+<figcaption><b>Figure 15.2 — Resolution is a token budget.</b> A fixed-resolution encoder spends the same 576 tokens on every image; a dynamic one spends tokens in proportion to pixels, so a 2,000-pixel screenshot costs about 5,000 tokens—several pages of text—unless capped. Real systems cap the pixel count per image and per request.</figcaption>
+</figure>
+
+<p>Figure 15.2 shows why multimodal capacity planning is harder than text. A text request's token count is visible in its length; an image request's count depends on resolution, which varies by orders of magnitude between a thumbnail and a full-page scan, and on the model's encoder settings, which providers tune. Many APIs therefore expose a detail level (low, high or automatic) that bounds the tokens per image, and price images by their computed token count. For the service, the relevant quantity is the distribution of image tokens per request, which, like output lengths, must be measured and forecast.</p>
+
+<h2 id="s15-2">15.2 What an image costs</h2>
+<p>An image costs work in two places: in the encoder, and in the language model, which must prefill the image's tokens and keep their KV cache. The encoder's cost follows from the Transformer arithmetic of Vol. I §2.11: a ViT with \(N_{\text{enc}}\) parameters processing \(n_{\text{patch}}\) patches performs about \(2N_{\text{enc}}n_{\text{patch}}\) FLOPs plus an attention term quadratic in \(n_{\text{patch}}\). The language model's prefill of the image tokens costs about \(2Nn_{\text{img}}\) FLOPs, and their KV cache occupies \(n_{\text{img}}s_{kv}\) bytes for as long as the conversation is cached.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — one screenshot to an 8B vision-language model</div>
+<p><strong>Setup.</strong> A 1,344×1,344 screenshot to a model with a 600M-parameter ViT encoder (14-pixel patches, 2×2 merge) and a Llama 3 8B-sized language model (\(s_{kv}=128\) KiB per token in BF16).</p>
+<p><strong>Tokens.</strong> Patches: \((1344/14)^2=9{,}216\); after 2×2 merging, \(n_{\text{img}}=2{,}304\) tokens.</p>
+<p><strong>Encoder FLOPs.</strong> Linear layers: \(2\times0.6\times10^{9}\times9{,}216\approx1.1\times10^{13}\). Attention over 9,216 patches in, say, 32 layers of width 1,280: roughly \(4\times32\times9216^2\times1280\approx1.4\times10^{13}\) (Vol. I §2.11's \(4Ld\,T^2\) estimate), comparable to the linear layers at this resolution, and growing quadratically beyond it. Total about \(2.5\times10^{13}\) FLOPs.</p>
+<p><strong>LLM prefill.</strong> \(2\times8\times10^{9}\times2{,}304\approx3.7\times10^{13}\) FLOPs—more than the encoder.</p>
+<p><strong>KV cache.</strong> \(2{,}304\times128\) KiB \(\approx288\) MiB per image, as much as a 2,300-token document, and held for every later turn of the conversation that keeps the image in context.</p>
+<p><strong>Time.</strong> At about 400 TFLOP/s of effective BF16 throughput on an H100, the encoder takes about 60 ms and the LLM's image prefill about 90 ms: an image adds roughly 150 ms to TTFT and as much KV as several pages of text.</p>
+</div>
+
+<p>The example shows that the encoder is usually not the dominant cost: the language model's processing of the image tokens costs as much or more, and the KV cache consumes memory for the lifetime of the conversation. This has two consequences. First, reducing image tokens—by capping resolution, by more aggressive merging, or by token-pruning methods that drop uninformative patches—saves far more than speeding up the encoder. Second, conversations that keep several images in context are KV-heavy, and prefix caching (Vol. I Chapter 10) matters even more: a multi-turn conversation about one screenshot should never re-encode or re-prefill it.</p>
+
+<details class="drill">
+<summary>Drill 15.1 — A scanned contract</summary>
+<p>A user uploads a 20-page scanned contract, each page rendered at 1,000×1,400 pixels, to a model with 28-pixel tokens. How many image tokens is it, how much KV cache does it occupy on a Llama 3 70B-sized model (320 KiB per token in BF16), and how does that compare with sending the extracted text (about 600 tokens per page)?</p>
+<p><em>Solution.</em> Per page \(\lceil1000/28\rceil\times\lceil1400/28\rceil=36\times50=1{,}800\) tokens; 20 pages: 36,000 tokens. KV: \(36{,}000\times320\) KiB \(\approx11\) GiB, a large share of a TP8 replica's KV pool for one conversation. Extracted text: \(20\times600=12{,}000\) tokens, 3.7 GiB—three times smaller. For text-heavy documents, running OCR or a document parser first and sending text (plus images only for figures) is far cheaper; for visually rich pages (forms, charts, handwriting), the image path may be necessary. A platform can make this choice automatically, which is an example of how preprocessing is part of serving.</p>
+</details>
+
+<h2 id="s15-3">15.3 Where the encoder runs</h2>
+<p>The simplest deployment puts the encoder inside the engine: the same process, on the same GPUs, runs the vision encoder on a request's images and then prefills the resulting tokens. vLLM and SGLang support this for most open vision-language models. It is efficient for light image traffic, but it has the same problem that prefill had before disaggregation (Vol. I Chapter 13): encoding is a burst of compute-bound work that interrupts the memory-bound decode of other requests in the batch, raising their TPOT, and the encoder's weights take memory away from the KV cache.</p>
+<p>Two refinements address this. <strong>Encoder caching</strong> stores the encoder's output for each image, keyed by a hash of the image's bytes and preprocessing parameters, so that the same image sent again—in the next turn of a conversation, or by many users (a popular meme, a company logo in every email)—is not re-encoded. Combined with prefix caching of the image tokens' KV, it makes multi-turn image conversations nearly as cheap as text ones after the first turn. <strong>Encode–prefill–decode (EPD) disaggregation</strong> extends prefill/decode disaggregation by one stage: a separate pool of encoder workers turns images into embeddings, which are sent to prefill workers, which send KV to decode workers. Figure 15.3 shows the arrangement. Each pool can be sized and placed independently: encoders are small models that run well on cheaper or older GPUs at large batch sizes, and isolating them protects decode latency from encoding bursts. Research systems published in 2024–2025 reported large gains in throughput and memory efficiency for image-heavy workloads from this separation<span class="cite"><a href="#r-epd">[3]</a></span>.</p>
+
+<figure class="diagram" id="fig-15-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Encode-prefill-decode disaggregation for vision-language models">
+<defs><marker id="a152" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="90" width="110" height="70" rx="8" class="bx"/><text x="70" y="114" text-anchor="middle" class="t-xs t-b">request</text><text x="70" y="130" text-anchor="middle" class="t-xs">text + images</text><text x="70" y="146" text-anchor="middle" class="t-xs">(object-store refs)</text>
+<rect x="150" y="30" width="130" height="64" rx="8" class="bx4"/><text x="215" y="52" text-anchor="middle" class="t-xs t-b">preprocess (CPU)</text><text x="215" y="68" text-anchor="middle" class="t-xs">decode, resize,</text><text x="215" y="82" text-anchor="middle" class="t-xs">hash for cache</text>
+<rect x="150" y="150" width="130" height="64" rx="8" class="bx5"/><text x="215" y="172" text-anchor="middle" class="t-xs t-b">encoder cache</text><text x="215" y="188" text-anchor="middle" class="t-xs">hash → embeddings</text><text x="215" y="202" text-anchor="middle" class="t-xs">(skip if hit)</text>
+<rect x="305" y="90" width="120" height="70" rx="8" class="bx2"/><text x="365" y="114" text-anchor="middle" class="t-xs t-b">encoder pool</text><text x="365" y="130" text-anchor="middle" class="t-xs">ViT, large batches</text><text x="365" y="146" text-anchor="middle" class="t-xs">cheaper GPUs</text>
+<rect x="450" y="90" width="120" height="70" rx="8" class="bx3"/><text x="510" y="114" text-anchor="middle" class="t-xs t-b">prefill pool</text><text x="510" y="130" text-anchor="middle" class="t-xs">text + image tokens</text><text x="510" y="146" text-anchor="middle" class="t-xs">→ KV</text>
+<rect x="595" y="90" width="110" height="70" rx="8" class="bx3"/><text x="650" y="114" text-anchor="middle" class="t-xs t-b">decode pool</text><text x="650" y="130" text-anchor="middle" class="t-xs">stream tokens</text><text x="650" y="146" text-anchor="middle" class="t-xs">TPOT protected</text>
+<line x1="125" y1="110" x2="148" y2="70" class="ln" marker-end="url(#a152)"/>
+<line x1="280" y1="62" x2="320" y2="88" class="ln" marker-end="url(#a152)"/>
+<line x1="215" y1="94" x2="215" y2="148" class="ln ln-acc" marker-end="url(#a152)"/>
+<line x1="280" y1="182" x2="470" y2="162" class="ln ln-acc" marker-end="url(#a152)"/>
+<line x1="425" y1="125" x2="448" y2="125" class="ln" marker-end="url(#a152)"/>
+<line x1="570" y1="125" x2="593" y2="125" class="ln" marker-end="url(#a152)"/>
+<text x="375" y="230" text-anchor="middle" class="t-xs">embeddings (≈ n_img × d × 2 bytes) to prefill; KV to decode (Vol. I Ch. 13); cache hits skip the encoder entirely</text>
+</svg>
+<figcaption><b>Figure 15.3 — Encode–prefill–decode disaggregation.</b> Images are preprocessed on CPUs, looked up in an encoder cache, encoded in a separate pool on hits that miss, and their embeddings join the text in prefill; decode never sees an encoding burst.</figcaption>
+</figure>
+
+<p>Encoder pools have scheduling properties of their own. Images vary in size, so a batch of images with different patch counts is padded or packed into variable-length sequences, as text prefill is; images can be encoded as soon as they are uploaded, before the user has finished typing their question, which hides encoding latency entirely for interactive applications; and because the encoder's attention cost grows quadratically with patch count, very large images are often split into windows or tiles that are encoded independently, trading a little global context for much less compute. All of these are easier to apply in a dedicated pool than inside an engine whose main job is decoding text.</p>
+<p>Figure 15.3 also shows a stage that is easy to forget: <strong>preprocessing</strong>. Before an image reaches the encoder it must be fetched (often from object storage, since images are uploaded separately and referenced by the request), decoded from JPEG or PNG, converted, resized and normalised. These steps run on CPUs and can take tens of milliseconds per large image; at hundreds of images per second they need many cores, and the GPU servers' CPUs, shared with the engines' own scheduling work (Vol. I §12.2), may not suffice. Production systems run preprocessing in a separate CPU service or on the gateway tier, and some decode images on the GPU with hardware JPEG decoders. Transferring embeddings is cheap: an image's \(n_{\text{img}}\) vectors of width \(d\) in BF16 are \(2{,}304\times4{,}096\times2\approx19\) MB for the example above—a few milliseconds on the back-end network—and much smaller than the KV cache they produce.</p>
+
+<h2 id="s15-4">15.4 Video and long multimodal contexts</h2>
+<p>Video multiplies everything. A video is a sequence of frames, and a model that processes \(f_{\text{fps}}\) frames per second of video at \(n_{\text{frame}}\) tokens per frame consumes \(f_{\text{fps}}n_{\text{frame}}\) tokens per second of footage. Even with aggressive choices—one frame per second and a few hundred tokens per frame—a minute of video is tens of thousands of tokens and an hour is millions. Figure 15.4 plots the token count against duration for several settings.</p>
+
+<figure class="chart" id="fig-15-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Video tokens against duration for frame rate × tokens per frame","height":320,
+ "x":{"label":"Video duration (minutes, log)","log":true,"min":0.5,"max":60,"ticks":[0.5,1,2,5,10,30,60]},
+ "y":{"label":"Tokens (log)","log":true,"min":1000,"max":20000000,"ticks":[10000,100000,1000000,10000000]},
+ "series":[
+  {"name":"2 fps × 256 tokens","color":"s2","points":[[0.5,15360],[1,30720],[5,153600],[10,307200],[60,1843200]]},
+  {"name":"1 fps × 256 tokens","color":"s1","points":[[0.5,7680],[1,15360],[5,76800],[10,153600],[60,921600]]},
+  {"name":"1 fps × 64 tokens (merged/pruned)","color":"s3","points":[[0.5,1920],[1,3840],[5,19200],[10,38400],[60,230400]]}
+ ],
+ "hlines":[{"y":128000,"text":"128k context"},{"y":1000000,"text":"1M context"}]}
+</script>
+<figcaption><b>Figure 15.4 — Video exhausts context windows quickly.</b> At one frame per second and 256 tokens per frame, a 10-minute video exceeds a 128k-token context and an hour approaches a million tokens. Frame sampling and token merging are not optional for long video.</figcaption>
+</figure>
+
+<p>Figure 15.4 makes the design choices plain. Long video cannot be processed at fixed frame rates and full token counts; systems sample frames adaptively (more frames where the scene changes, fewer where it is static), merge or prune tokens across adjacent frames (consecutive frames are highly redundant), and use long-context techniques from Vol. I Chapter 21. For infrastructure, video requests are the extreme case of the long-context requests of §14.8 and §10.4: each one occupies a large share of a replica's KV memory and prefill capacity, so they should be routed to pools sized for them, admitted under separate concurrency limits, and priced by their token count. They also bring large uploads: an hour of compressed video is gigabytes, which belongs in object storage with the request carrying a reference, not in the request body.</p>
+
+<p>A related class is <strong>live video</strong>: an assistant that watches a camera or a shared screen in real time, answering questions about what it sees. Here the token stream never ends, so the system must keep a bounded context—a sliding window of recent frames plus summaries of earlier ones—and decide continuously which frames to encode at all (only on scene changes, or when the user asks). Its serving profile combines the latency requirements of voice with the token volume of video, and in 2025 it was among the most expensive interactive workloads to serve at scale.</p>
+
+<h2 id="s15-5">15.5 Speech: recognition, synthesis and real-time conversation</h2>
+<p>Speech enters and leaves LLM systems in three ways. <strong>Automatic speech recognition</strong> (ASR) turns audio into text; Whisper, released by OpenAI in 2022, made robust multilingual ASR widely available with an encoder–decoder Transformer trained on 680,000 hours of audio<span class="cite"><a href="#r-whisper">[4]</a></span>. <strong>Text-to-speech</strong> (TTS) turns text into audio, increasingly with neural codec language models that generate discrete audio tokens. And <strong>speech-to-speech</strong> models take audio in and produce audio out directly, either by tokenising audio into the language model's input and output, or by tightly coupled streams; Kyutai's Moshi (2024) demonstrated a full-duplex speech model with a theoretical latency of about 160 ms<span class="cite"><a href="#r-moshi">[5]</a></span>, and major providers released real-time voice APIs in 2024–2025.</p>
+<p>What makes voice an infrastructure problem is latency. In human conversation, the gap between one speaker stopping and the other starting is typically a few hundred milliseconds, and a voice assistant that takes much longer than about half a second to begin answering feels sluggish. Figure 15.5 lays out the latency budget of a voice turn for the two main designs. In a <strong>cascade</strong>, the system must first decide that the user has finished speaking (<em>endpointing</em>, typically by detecting a pause of 200–500 ms), finish recognition, run the LLM to its first tokens, start synthesising speech from them, and send the first audio back. In a <strong>native</strong> speech-to-speech model, audio tokens stream in and out of one model, and the model can begin responding as soon as it predicts the user has finished, or even backchannel while they speak.</p>
+
+<figure class="diagram" id="fig-15-5">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Latency budget of a voice turn: cascade versus native speech-to-speech">
+<text x="20" y="26" class="t-sm t-b">Cascade: ASR → LLM → TTS (time from end of user speech to first audio)</text>
+<rect x="20" y="38" width="140" height="34" rx="4" class="bx2"/><text x="90" y="59" text-anchor="middle" class="t-xs">endpointing 200–400</text>
+<rect x="160" y="38" width="60" height="34" rx="4" class="bx4"/><text x="190" y="59" text-anchor="middle" class="t-xs">ASR ≈ 80</text>
+<rect x="220" y="38" width="110" height="34" rx="4" class="bx"/><text x="275" y="59" text-anchor="middle" class="t-xs">LLM TTFT 100–300</text>
+<rect x="330" y="38" width="80" height="34" rx="4" class="bx3"/><text x="370" y="59" text-anchor="middle" class="t-xs">TTS 80–150</text>
+<rect x="410" y="38" width="60" height="34" rx="4" class="bx5"/><text x="440" y="59" text-anchor="middle" class="t-xs">network</text>
+<text x="485" y="59" class="t-xs t-b">≈ 500–1,000 ms</text>
+<text x="20" y="116" class="t-sm t-b">Native speech-to-speech (audio tokens in and out of one model)</text>
+<rect x="20" y="128" width="90" height="34" rx="4" class="bx2"/><text x="65" y="149" text-anchor="middle" class="t-xs">turn predict ≈ 100</text>
+<rect x="110" y="128" width="100" height="34" rx="4" class="bx"/><text x="160" y="149" text-anchor="middle" class="t-xs">first audio tokens</text>
+<rect x="210" y="128" width="60" height="34" rx="4" class="bx5"/><text x="240" y="149" text-anchor="middle" class="t-xs">network</text>
+<text x="285" y="149" class="t-xs t-b">≈ 200–400 ms</text>
+<line x1="20" y1="190" x2="700" y2="190" class="ln"/>
+<g class="t-xs"><text x="20" y="206">0</text><text x="150" y="206">200 ms</text><text x="300" y="206">400 ms</text><text x="440" y="206">600 ms</text><text x="590" y="206">800 ms</text></g>
+<text x="20" y="232" class="t-xs">Both need: streaming in both directions (WebSockets/WebRTC), servers near users (each round trip counts), barge-in (user interrupts → cancel</text>
+<text x="20" y="248" class="t-xs">generation and audio instantly), and capacity held for the tight TTFT—voice cannot be queued like chat.</text>
+</svg>
+<figcaption><b>Figure 15.5 — Where a voice turn's time goes.</b> Bars are drawn to an approximate common scale (values in ms). A cascade spends most of its budget deciding the user has stopped and starting each stage; a native model overlaps them. Either way, network distance and queueing must be kept small.</figcaption>
+</figure>
+
+<p>Figure 15.5's consequences for infrastructure are specific. Voice needs <strong>bidirectional streaming</strong> (WebSockets or WebRTC, §11.2) so that audio flows continuously in both directions and the user can interrupt ("barge in"), which must cancel generation and audio playback within tens of milliseconds. It needs <strong>proximity</strong>: with a budget of a few hundred milliseconds and several exchanges per turn, a 150 ms intercontinental round trip is unaffordable (§2.7), so voice traffic is served from regions near users and excluded from follow-the-sun pooling (§12.3). It needs <strong>reserved low-latency capacity</strong>: a voice request cannot wait in a queue behind long prefills, so voice runs on pools with low utilisation targets, small batches and admission control tuned for TTFT, which makes it several times more expensive per token than chat. And it needs <strong>streaming audio rates</strong> to be sustained: a TTS or speech model must produce audio faster than real time for every concurrent stream, which sets a per-stream throughput floor the way TPOT does for text.</p>
+
+<p>Not all speech traffic is real time. A large share is <strong>batch transcription</strong>—meeting recordings, call-centre audio, podcasts, video subtitles—where the requirement is throughput, not latency. ASR models are usually measured by their <em>real-time factor</em>, the ratio of processing time to audio duration; an encoder–decoder model such as Whisper processes 30-second windows, and on a modern GPU with batching it transcribes hours of audio per minute, so a real-time factor well below 0.01 is achievable. Batch transcription therefore belongs with the batch workloads of Chapter 19: queued, run at large batch sizes on whatever capacity is cheapest, and checkpointed by completed files. The infrastructure distinction between "speech" workloads is thus the same as for text—latency-critical traffic held close to users on reserved capacity, throughput traffic scheduled flexibly—only more extreme on both sides.</p>
+
+<details class="drill">
+<summary>Drill 15.2 — The endpointing trade-off</summary>
+<p>A cascaded voice assistant waits for a silence of \(t_{\text{sil}}\) before treating the user's turn as finished. Suppose pauses within a user's turn are roughly exponential with mean 250 ms, and every premature cut-off (responding while the user meant to continue) costs as much user annoyance as 1 s of extra latency. Each turn has on average two internal pauses. What silence threshold minimises expected cost, and what does a learned turn-taking model that halves the premature-cut-off probability at a given threshold change?</p>
+<p><em>Solution.</em> A pause exceeds \(t_{\text{sil}}\) with probability \(e^{-t_{\text{sil}}/0.25}\); with two pauses, the probability of a premature cut-off is about \(2e^{-4t_{\text{sil}}}\) (for small values). Expected cost \(=t_{\text{sil}}+1\times2e^{-4t_{\text{sil}}}\) seconds. Minimising: \(1-8e^{-4t_{\text{sil}}}=0\), so \(t_{\text{sil}}=\ln8/4\approx0.52\) s, with cost about \(0.52+0.25=0.77\) s. Halving the cut-off probability makes the cost \(t_{\text{sil}}+e^{-4t_{\text{sil}}}\), minimised at \(\ln4/4\approx0.35\) s with cost about 0.6 s: the smarter detector saves about 170 ms per turn—as much as a large improvement in model TTFT—which is why turn detection is a first-class component of voice systems.</p>
+</details>
+
+<div class="box example">
+<div class="box-title">Worked example — capacity for a voice assistant</div>
+<p><strong>Demand.</strong> 20,000 concurrent voice sessions at peak, each with the user speaking 40% of the time and the assistant 40%, in turns of about 8 s.</p>
+<p><strong>Audio tokens.</strong> A codec at 12.5 frames per second with several codebook tokens per frame might give an effective rate of order 50–100 tokens per second of audio in each direction; take 75. The assistant's output is then \(20{,}000\times0.4\times75=600{,}000\) audio tokens/s at peak, and the input a similar amount.</p>
+<p><strong>Latency regime.</strong> Each output stream must sustain 75 tokens/s—a TPOT of about 13 ms—with a time to first audio under about 300 ms, so replicas run at small batches and low utilisation.</p>
+<p><strong>Sizing.</strong> If an 8B-class speech model on one H100 sustains about 64 concurrent streams at that TPOT (about 4,800 tokens/s), the 8,000 streams speaking at once need 125 GPUs, and with 50% utilisation for TTFT headroom and spares about 250—roughly ten times the GPUs per output token of chat at the same model size.</p>
+<p><strong>Lesson.</strong> Voice is expensive not because its models are large but because its latency targets forbid batching and queueing; regional placement, admission control and pricing must reflect that.</p>
+</div>
+
+<h2 id="s15-6">15.6 Generating images and video</h2>
+<p>Image and video <em>generation</em> is a different workload again, and it is worth a brief look because the same fleets increasingly serve it. Most generators in 2023–2026 were <strong>diffusion</strong> models, or their close relatives based on flow matching: they start from noise and apply a denoising network (a U-Net or, increasingly, a Diffusion Transformer) repeatedly, typically 20–50 times, to produce an image in a compressed latent space that a decoder turns into pixels. Unlike LLM decoding, each denoising step processes the whole image at once, so it is compute-bound rather than memory-bound, batches well, and has a fixed number of steps. The cost of an image is therefore predictable—steps × FLOPs per step—and the main levers are fewer steps (distilled "few-step" models generate in 1–4 steps), smaller latent resolutions, and caching of computations across steps.</p>
+<p>For infrastructure, generation differs from LLM serving in ways that simplify some problems and complicate others. Requests are uniform in cost, so request counts are a reasonable load measure and simple batching works; there is no KV cache to manage; latency is seconds per image, so users accept queues and progress indicators. But outputs are large (megabytes per image, much more per video), so they are written to object storage and returned by reference; safety classification of generated images is mandatory (Chapter 18); and video generation is extraordinarily expensive—minutes of GPU time per second of high-resolution video—so it is often scheduled as batch work with explicit queues and quotas (Chapter 19).</p>
+
+<h2 id="s15-7">15.7 Infrastructure consequences of multimodal traffic</h2>
+<p>Bringing the threads together, multimodal traffic changes five aspects of the infrastructure this volume has built. <em>Capacity planning</em> must count tokens per modality: image tokens per request (by detail level and resolution), video tokens per second of footage, audio tokens per second of speech, each with its own distribution, and must recognise that image-heavy prompts shift load towards prefill and KV memory (§15.2). <em>Topology</em> gains an encoder stage, which can be colocated for light traffic or disaggregated (EPD) for heavy traffic, and a CPU preprocessing stage that must be sized explicitly. <em>The front door</em> must accept large uploads, typically through a separate upload path to object storage with signed URLs, and stream bidirectionally for voice. <em>Placement</em> differs by modality: text and image requests tolerate distance and can be pooled globally, voice must be served near users, and video can be scheduled flexibly. And <em>safety and security</em> extend to new content types: images can carry prompt injections in rendered text, audio can carry hidden commands, and generated images and audio require their own classifiers.</p>
+<figure class="diagram" id="fig-15-6">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Routing multimodal requests by modality and latency class">
+<defs><marker id="a156" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="95" width="120" height="60" rx="8" class="bx4"/><text x="75" y="118" text-anchor="middle" class="t-xs t-b">gateway</text><text x="75" y="134" text-anchor="middle" class="t-xs">modality, tokens,</text><text x="75" y="146" text-anchor="middle" class="t-xs">latency class</text>
+<rect x="175" y="20" width="170" height="44" rx="8" class="bx"/><text x="260" y="38" text-anchor="middle" class="t-xs t-b">text / image chat</text><text x="260" y="54" text-anchor="middle" class="t-xs">global pooling OK</text>
+<rect x="175" y="78" width="170" height="44" rx="8" class="bx2"/><text x="260" y="96" text-anchor="middle" class="t-xs t-b">voice (real time)</text><text x="260" y="112" text-anchor="middle" class="t-xs">regional, low utilisation</text>
+<rect x="175" y="136" width="170" height="44" rx="8" class="bx3"/><text x="260" y="154" text-anchor="middle" class="t-xs t-b">long video / documents</text><text x="260" y="170" text-anchor="middle" class="t-xs">long-context pool, limits</text>
+<rect x="175" y="194" width="170" height="44" rx="8" class="bx5"/><text x="260" y="212" text-anchor="middle" class="t-xs t-b">image / video generation</text><text x="260" y="228" text-anchor="middle" class="t-xs">queued, batch-friendly</text>
+<line x1="135" y1="115" x2="173" y2="42" class="ln" marker-end="url(#a156)"/><line x1="135" y1="120" x2="173" y2="100" class="ln" marker-end="url(#a156)"/><line x1="135" y1="130" x2="173" y2="158" class="ln" marker-end="url(#a156)"/><line x1="135" y1="138" x2="173" y2="216" class="ln" marker-end="url(#a156)"/>
+<rect x="390" y="20" width="315" height="218" rx="10" class="bx"/>
+<text x="547" y="42" text-anchor="middle" class="t-sm t-b">Shared services</text>
+<text x="405" y="66" class="t-xs">• upload path → object storage (signed URLs)</text>
+<text x="405" y="88" class="t-xs">• CPU preprocessing (decode, resize, frames)</text>
+<text x="405" y="110" class="t-xs">• encoder pools + encoder cache (hash-keyed,</text>
+<text x="405" y="124" class="t-xs">  tenant-scoped)</text>
+<text x="405" y="146" class="t-xs">• safety classifiers per modality (Ch. 18)</text>
+<text x="405" y="168" class="t-xs">• token accounting per modality (pricing, limits)</text>
+<text x="405" y="190" class="t-xs">• bidirectional streaming edge for voice</text>
+<text x="405" y="212" class="t-xs">• residency rules for stored media (Ch. 12)</text>
+</svg>
+<figcaption><b>Figure 15.6 — Routing by modality.</b> The gateway classifies each request by modality, token count and latency class and sends it to a pool whose placement, utilisation target and limits suit it, while upload, preprocessing, encoding, safety and accounting are shared services.</figcaption>
+</figure>
+
+<p>Figure 15.6 summarises the resulting architecture. <p>Two further operational points are worth making explicit. <em>Observability</em> must break latency down by stage—upload, preprocessing, encoding, prefill, decode, synthesis—because a slow multimodal request can be slow anywhere, and an average TTFT hides which stage is at fault. <em>Evaluation</em> must cover modalities separately: an engine or quantisation change that preserves text quality can degrade fine-grained visual reading or speech quality, so the golden-prompt and canary checks of Chapter 13 need image and audio cases with their own references. Neither is conceptually new, but both are commonly forgotten when image or voice support is added to a platform built for text.</p>
+<p>The common thread is that the abstraction of Volume I—a request is a sequence of tokens—remains correct, but the tokens now come from several sources with very different costs per byte of input, and the latency requirements of the modalities differ by an order of magnitude. A platform that exposes modality, resolution and latency class as first-class request attributes, and routes, prices and limits by them, can serve all of them on shared infrastructure; one that treats an image as "just a bigger prompt" will discover the difference in its KV memory and its voice latency.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Multimodal models extend what a single request can contain. Many applications extend it differently: rather than sending everything to the model, they look up relevant information first—documents, code, product data—and include only what is needed. That lookup is done by embedding models and vector indexes, which sit in front of a large share of enterprise LLM traffic and have their own serving and scaling problems: how are embeddings computed at scale, how does approximate nearest-neighbour search trade recall for latency and memory, how are indexes of billions of vectors sharded and replicated, and what does retrieval add to the latency and cost of a request? Chapter 16 takes up embeddings, retrieval and vector search.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Vision-language models encode images with a ViT into patch embeddings, project and often merge them into tokens that enter prefill and the KV cache like text.</li>
+<li>Tokens per image: fixed resize (e.g. 576 at 336 px) or dynamic resolution \(\lceil H/p_{\text{tok}}\rceil\lceil W/p_{\text{tok}}\rceil\) (28 px per token: 2,304 for 1,344² px), capped by pixel budgets and detail levels.</li>
+<li>An image costs encoder FLOPs (\(\approx2N_{\text{enc}}n_{\text{patch}}\) plus quadratic attention), LLM prefill (\(2Nn_{\text{img}}\), usually larger) and KV (\(n_{\text{img}}s_{kv}\), ≈ 288 MiB for a 2,304-token image on an 8B model); reducing tokens beats speeding the encoder.</li>
+<li>Run encoders in-engine for light traffic; for heavy traffic use encoder caching by image hash and encode–prefill–decode disaggregation; size CPU preprocessing explicitly; embeddings are cheap to move.</li>
+<li>Video tokens \(=f_{\text{fps}}n_{\text{frame}}\times\) duration: 10 minutes at 1 fps × 256 exceeds 128k; sample frames adaptively, merge tokens, route to long-context pools, upload via object storage.</li>
+<li>Voice needs first audio within a few hundred ms: cascades (endpointing, ASR, LLM, TTS) ≈ 0.5–1 s; native speech-to-speech ≈ 0.2–0.4 s; requires bidirectional streaming, barge-in, proximity, low-utilisation pools and real-time audio throughput—several times the GPU cost per token of chat.</li>
+<li>Image/video generation (diffusion, flow matching) is compute-bound with fixed steps, uniform cost and large outputs; few-step distillation and batch scheduling are the main levers.</li>
+<li>Plan, route, price and limit by modality, resolution and latency class.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci15-mcq-01" data-topic="§15.1 Image tokens">
+<p class="q">LLaVA-1.5's ViT with 14-pixel patches at 336×336 produces how many tokens per image?</p>
+<ol class="opts"><li>144</li><li>256</li><li data-correct>576</li><li>2,304</li></ol>
+<div class="explain">\((336/14)^2=576\).</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-02" data-topic="§15.1 Image tokens">
+<p class="q">A dynamic-resolution encoder with 28×28 pixels per token turns a 1,344×1,344 image into:</p>
+<ol class="opts"><li>576 tokens</li><li>1,024 tokens</li><li data-correct>2,304 tokens</li><li>9,216 tokens</li></ol>
+<div class="explain">\(48\times48\).</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-03" data-topic="§15.1 Image tokens">
+<p class="q">What does the projector in a vision-language model do?</p>
+<ol class="opts"><li>Compresses JPEGs</li><li data-correct>Maps encoder outputs into the language model's embedding space, often merging neighbouring patches</li><li>Generates images</li><li>Runs attention over text</li></ol>
+<div class="explain">A linear layer or small MLP.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-04" data-topic="§15.1 Image tokens">
+<p class="q">Why do APIs expose an image "detail" setting?</p>
+<ol class="opts"><li>For colour accuracy</li><li data-correct>To bound the tokens (and so cost and KV) an image consumes</li><li>To change the model</li><li>For privacy</li></ol>
+<div class="explain">Resolution is a token budget.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-05" data-topic="§15.2 Cost">
+<p class="q">In the worked example, which costs more compute for a high-resolution image?</p>
+<ol class="opts"><li>JPEG decoding</li><li>The vision encoder</li><li data-correct>The language model's prefill of the image tokens</li><li>Network transfer</li></ol>
+<div class="explain">About 3.7×10¹³ versus 2.5×10¹³ FLOPs.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-06" data-topic="§15.2 Cost">
+<p class="q">A 2,304-token image on an 8B-class model (128 KiB/token) occupies about how much KV cache?</p>
+<ol class="opts"><li>2.9 MiB</li><li data-correct>288 MiB</li><li>2.9 GiB</li><li>29 GiB</li></ol>
+<div class="explain">\(2304\times128\) KiB.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-07" data-topic="§15.2 Cost">
+<p class="q">Which saves the most when image traffic is heavy?</p>
+<ol class="opts"><li>A faster JPEG decoder</li><li>A faster encoder kernel</li><li data-correct>Fewer image tokens (resolution caps, merging, pruning) and prefix/encoder caching</li><li>Larger GPUs for the encoder</li></ol>
+<div class="explain">LLM prefill and KV dominate.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-08" data-topic="§15.2 Cost">
+<p class="q">In Drill 15.1, why might OCR plus text be preferable for a scanned contract?</p>
+<ol class="opts"><li>OCR is always more accurate</li><li data-correct>Text uses about a third of the tokens and KV of the page images</li><li>Images cannot be cached</li><li>Contracts contain no images</li></ol>
+<div class="explain">Visually rich pages may still need the image path.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-09" data-topic="§15.3 Encoder placement">
+<p class="q">What problem does running the encoder inside the engine cause under heavy image traffic?</p>
+<ol class="opts"><li>Images cannot be batched</li><li data-correct>Compute-bound encoding bursts interrupt other requests' decode (raising TPOT) and encoder weights take KV memory</li><li>It breaks streaming</li><li>It prevents caching</li></ol>
+<div class="explain">The same interference that motivated prefill/decode disaggregation.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-10" data-topic="§15.3 Encoder placement">
+<p class="q">Encoder caching keys outputs by:</p>
+<ol class="opts"><li>The user ID</li><li data-correct>A hash of the image bytes and preprocessing parameters</li><li>The prompt text</li><li>The time of day</li></ol>
+<div class="explain">Repeated images skip encoding.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-11" data-topic="§15.3 Encoder placement">
+<p class="q">Benefits of encode–prefill–decode disaggregation include: (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Independent sizing of encoder, prefill and decode pools</li><li data-correct>Running encoders on cheaper GPUs at large batches</li><li data-correct>Protecting decode TPOT from encoding bursts</li><li>Eliminating the KV cache</li></ol>
+<div class="explain">KV still flows from prefill to decode.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-12" data-topic="§15.3 Encoder placement">
+<p class="q">Why must CPU preprocessing be sized explicitly for image traffic?</p>
+<ol class="opts"><li>GPUs cannot read images</li><li data-correct>Fetching, decoding and resizing large images takes tens of ms per image of CPU work, competing with engines' own CPU needs</li><li>It is free</li><li>It runs in the encoder</li></ol>
+<div class="explain">Separate CPU services or GPU JPEG decoders help.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-13" data-topic="§15.3 Encoder placement">
+<p class="q">Transferring an image's embeddings between pools is cheap because:</p>
+<ol class="opts"><li>They are compressed JPEGs</li><li data-correct>They are a few tens of MB at most, far smaller than the KV they produce</li><li>They are not transferred</li><li>They are text</li></ol>
+<div class="explain">\(n_{\text{img}}\times d\times2\) bytes.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-14" data-topic="§15.4 Video">
+<p class="q">At 1 frame per second and 256 tokens per frame, a 10-minute video is about:</p>
+<ol class="opts"><li>15k tokens</li><li data-correct>154k tokens</li><li>1.5M tokens</li><li>15M tokens</li></ol>
+<div class="explain">\(600\times256\).</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-15" data-topic="§15.4 Video">
+<p class="q">Which techniques make long video tractable? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Adaptive frame sampling</li><li data-correct>Merging or pruning redundant tokens across frames</li><li data-correct>Routing to long-context pools with separate limits</li><li>Sending raw video in the request body</li></ol>
+<div class="explain">Large media belong in object storage.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-16" data-topic="§15.5 Speech">
+<p class="q">What is endpointing in a voice pipeline?</p>
+<ol class="opts"><li>Choosing a region</li><li data-correct>Deciding that the user has finished speaking</li><li>Ending a WebSocket</li><li>Encrypting audio</li></ol>
+<div class="explain">Often a pause of 200–500 ms, a large share of the budget.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-17" data-topic="§15.5 Speech">
+<p class="q">Why do native speech-to-speech models achieve lower turn latency than cascades?</p>
+<ol class="opts"><li>They are smaller</li><li data-correct>Audio streams in and out of one model, overlapping stages that a cascade runs sequentially</li><li>They skip the network</li><li>They do not use tokens</li></ol>
+<div class="explain">Moshi reported about 160 ms theoretical latency.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-18" data-topic="§15.5 Speech">
+<p class="q">Which infrastructure requirements does voice add? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Bidirectional streaming and instant barge-in cancellation</li><li data-correct>Serving near users</li><li data-correct>Low-utilisation pools tuned for time to first audio</li><li>Follow-the-sun pooling across continents</li></ol>
+<div class="explain">Voice cannot tolerate intercontinental round trips.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-19" data-topic="§15.5 Speech">
+<p class="q">Why is voice several times more expensive per token than chat on the same model?</p>
+<ol class="opts"><li>Audio tokens are larger</li><li data-correct>Tight time-to-first-audio and real-time streaming forbid large batches and queueing</li><li>Voice models are huge</li><li>WebRTC costs more</li></ol>
+<div class="explain">Utilisation, not model size, drives the cost.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-20" data-topic="§15.5 Speech">
+<p class="q">A speech model producing 75 audio tokens per second of speech must sustain a TPOT of about:</p>
+<ol class="opts"><li>75 ms</li><li data-correct>13 ms</li><li>1 ms</li><li>130 ms</li></ol>
+<div class="explain">1/75 s, to stay faster than real time.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-21" data-topic="§15.5 Speech">
+<p class="q">Whisper is an example of:</p>
+<ol class="opts"><li>A diffusion model</li><li data-correct>An encoder–decoder Transformer for speech recognition</li><li>A vision encoder</li><li>A TTS codec</li></ol>
+<div class="explain">Trained on 680,000 hours of audio.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-22" data-topic="§15.6 Generation">
+<p class="q">Why is diffusion image generation compute-bound, unlike LLM decode?</p>
+<ol class="opts"><li>It uses FP64</li><li data-correct>Each denoising step processes the whole image's latent at once, reusing weights across many positions</li><li>It has no weights</li><li>It runs on CPUs</li></ol>
+<div class="explain">Batching is straightforward and cost per image is predictable.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-23" data-topic="§15.6 Generation">
+<p class="q">The main lever on the cost of a generated image is:</p>
+<ol class="opts"><li>Prefix caching</li><li data-correct>Fewer denoising steps (few-step distilled models) and smaller latents</li><li>Speculative decoding</li><li>Larger KV caches</li></ol>
+<div class="explain">Cost ≈ steps × FLOPs per step.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-24" data-topic="§15.6 Generation">
+<p class="q">Which properties of image generation simplify serving compared with LLMs? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Uniform cost per request</li><li data-correct>No KV cache to manage</li><li data-correct>Users accept seconds of latency with progress indicators</li><li>Tiny outputs</li></ol>
+<div class="explain">Outputs are large and go to object storage.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-25" data-topic="§15.7 Consequences">
+<p class="q">How should a request with a 1 GB video be submitted?</p>
+<ol class="opts"><li>Inline in the JSON body</li><li data-correct>Uploaded to object storage (e.g. via a signed URL) and referenced by the request</li><li>Streamed over SSE</li><li>Split into text</li></ol>
+<div class="explain">Keeps gateways and request paths small.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-26" data-topic="§15.7 Consequences">
+<p class="q">Which multimodal traffic can be pooled across regions like text chat?</p>
+<ol class="opts"><li>Real-time voice</li><li data-correct>Image-understanding requests with chat-like latency tolerance</li><li>Barge-in audio</li><li>None</li></ol>
+<div class="explain">Subject to residency rules.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-27" data-topic="§15.7 Consequences">
+<p class="q">Which new security issues does multimodality introduce? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Prompt injection via text rendered in images</li><li data-correct>Hidden commands in audio</li><li data-correct>Safety classification of generated images and audio</li><li>TLS downgrade</li></ol>
+<div class="explain">Chapter 14's principles extend to new content types.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-28" data-topic="§15.2 Cost">
+<p class="q">Encoder attention cost grows with the number of patches as:</p>
+<ol class="opts"><li>Logarithmically</li><li>Linearly</li><li data-correct>Quadratically</li><li>It is constant</li></ol>
+<div class="explain">Full attention over patches; hence windowed attention in some encoders.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-29" data-topic="§15.1 Image tokens">
+<p class="q">Why does multimodality complicate capacity planning?</p>
+<ol class="opts"><li>Images have no tokens</li><li data-correct>Token counts per request depend on resolution, detail settings and duration, which vary widely and must be measured per modality</li><li>GPUs cannot process images</li><li>Images are free</li></ol>
+<div class="explain">Forecast token distributions per modality.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-30" data-topic="§15.5 Speech">
+<p class="q">In the voice capacity example, roughly how many GPUs per output token did voice need compared with chat at the same model size?</p>
+<ol class="opts"><li>The same</li><li>Twice</li><li data-correct>About ten times</li><li>A hundred times</li></ol>
+<div class="explain">Small batches and low utilisation for latency.</div>
+</div>
+
+<div class="mcq" data-id="ci15-mcq-31" data-topic="§15.3 Encoder placement">
+<p class="q">For a multi-turn conversation about one screenshot, what should happen to the image after the first turn?</p>
+<ol class="opts"><li>Re-encode and re-prefill each turn</li><li data-correct>Reuse cached encoder output and the prefix-cached KV of its tokens</li><li>Drop it from context</li><li>Convert it to text every turn</li></ol>
+<div class="explain">Encoder and prefix caching make later turns cheap.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci15-qa-01">
+<summary><span class="lvl warm">Warm-up</span> How does a vision-language model turn an image into tokens?</summary>
+<div class="answer">
+<p>A ViT encoder (CLIP/SigLIP-style) splits the image into p×p pixel patches (14 or 16 px), embeds and processes them with a Transformer; a projector maps outputs into the LLM embedding space, often merging 2×2 patches; the resulting vectors replace an image placeholder in the input and behave as tokens (prefilled, cached in KV, attended to). Count: fixed-resolution models (LLaVA-1.5: 576 tokens at 336 px), tiling (multiple tiles plus thumbnail), or dynamic resolution (≈ one token per 28×28 px, capped).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What does an image cost a vision-language model?</summary>
+<div class="answer">
+<p>Encoder: ≈ 2 N_enc × patches FLOPs plus attention quadratic in patches. LLM: prefill ≈ 2N × image tokens (often larger than the encoder) and KV ≈ image tokens × s_kv held for the conversation. Example: 1,344² screenshot, 2,304 tokens on an 8B model: ≈ 2.5×10¹³ encoder FLOPs, ≈ 3.7×10¹³ prefill FLOPs, ≈ 288 MiB KV, ≈ 150 ms extra TTFT on an H100. So an image is like several pages of text.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Why is real-time voice harder to serve than chat?</summary>
+<div class="answer">
+<p>Conversation needs first audio within a few hundred ms of the user stopping; audio must stream faster than real time in both directions; users interrupt (barge-in) and generation must stop instantly. That requires bidirectional streaming (WebSockets/WebRTC), servers near users, no queueing behind long prefills (low-utilisation pools, small batches), and fast endpointing. These forbid the batching and pooling that make chat cheap, so voice costs several times more per token.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-04">
+<summary><span class="lvl core">Core</span> Should the vision encoder run on the same GPUs as the LLM?</summary>
+<div class="answer">
+<p>For light image traffic, yes: simpler, no transfer, small encoder weights. For heavy traffic, consider separating: encoding bursts are compute-bound and interfere with decode (TPOT spikes), and encoder weights and activations consume memory that could hold KV. Encode–prefill–decode disaggregation runs encoders in their own pool (cheaper GPUs, large batches), passes embeddings (tens of MB) to prefill, and protects decode. Add encoder caching keyed by image hash so repeated images skip encoding, and prefix caching for image tokens' KV. Size CPU preprocessing separately. Decide from measured image share, tokens per image, and TPOT impact.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-05">
+<summary><span class="lvl core">Core</span> Design a real-time voice assistant with a 500 ms response target.</summary>
+<div class="answer">
+<p>Budget: network RTT (serve in-region, ≤ 30–50 ms), endpointing (smart turn detection, ~100–200 ms), model TTFA. Prefer a native speech-to-speech model or a tightly streamed cascade (streaming ASR with partial results, LLM starting on partial transcripts, streaming TTS from first tokens). Transport: WebRTC/WebSockets with jitter buffers; barge-in detection cancels generation and playback within tens of ms. Serving: dedicated low-latency pools at low utilisation, small batches, admission control by TTFA, pre-warmed replicas; prefix-cache conversation context; regional placement near users (no cross-continent pooling). Fallbacks: shorter answers, smaller model under load. Monitor TTFA percentiles and interruption handling.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-06">
+<summary><span class="lvl core">Core</span> 30% of requests now include images. What changes in capacity planning?</summary>
+<div class="answer">
+<p>Measure image tokens per request (resolution and detail distribution) and add them to prefill and KV demand; image tokens shift load to prefill and KV memory (conversations hold images across turns), so prefill-bound tiers grow and KV capacity per replica supports fewer concurrent conversations. Add encoder compute (in-engine or EPD pool) and CPU preprocessing capacity, upload bandwidth and object storage for media, and image safety classification. Consider resolution caps, encoder and prefix caching, OCR for text documents. Update pricing to reflect image token counts. Forecast per modality.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-07">
+<summary><span class="lvl core">Core</span> How would you handle an hour-long video question-answering request?</summary>
+<div class="answer">
+<p>Upload to object storage; preprocess asynchronously (decode, scene detection); sample frames adaptively; encode frames in a batch-oriented encoder pool; merge/prune redundant tokens; possibly build a hierarchical summary or index (per-segment captions plus embeddings, Chapter 16) and retrieve relevant segments for each question rather than placing the whole video in context; route remaining long-context prefill to a dedicated pool with concurrency limits; cache encodings so follow-up questions are cheap; treat it as a batch or near-batch job with progress reporting; price by tokens.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> Compare cascaded and native speech-to-speech systems from an infrastructure perspective.</summary>
+<div class="answer">
+<p>Cascade (ASR → LLM → TTS): modular, each component replaceable and debuggable, text intermediate enables logging and guardrails, reuses text LLM fleets; but stage latencies add (endpointing, ASR finalisation, LLM TTFT, TTS first audio), losing prosody and emotion, typical 0.5–1 s. Native: audio tokens in and out of one model, overlapping listening and speaking, lower latency (0.2–0.4 s), full duplex and backchannels, richer prosody; but larger token rates per second, harder safety moderation (audio output), specialised models and serving stacks, less modular. Both need regional placement and low-utilisation pools. Many products mix: native for conversation, text pipeline for tool calls and logging.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> How do image tokens interact with prefix caching and KV memory management?</summary>
+<div class="answer">
+<p>Image tokens are content-derived embeddings, not vocabulary IDs, so prefix-cache keys must include an image identity (hash of image bytes and preprocessing parameters) at the image's position; with that, a conversation's image and text prefix are cached together and reused across turns. Images inflate KV per conversation (hundreds of MB each), so cache eviction pressure rises; tiered KV storage and per-tenant limits matter. Encoder caching complements it (avoid re-encoding even if KV was evicted). Placement of images early in the prompt (before changing text) maximises prefix reuse. Security: cache keys must be tenant-scoped (Chapter 14), since an image hash hit leaks that someone sent that image.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-10">
+<summary><span class="lvl design">Design</span> Design the serving architecture for a document-understanding product that processes scanned PDFs.</summary>
+<div class="answer">
+<p>Ingest: upload to object storage via signed URLs; async pipeline renders pages, runs OCR and layout analysis on CPU/GPU workers; classify pages as text-dominant or visual. Representation: text for text pages, images (capped resolution) for forms, charts, handwriting; optional embeddings for retrieval across long documents. Serving: questions answered with retrieved page text/images; VLM with encoder caching and prefix caching per document; long-context pool for whole-document queries. Capacity in tokens per page type; batch tier for bulk processing. Safety and residency per tenant; results and intermediate artefacts stored encrypted and scoped. Monitor cost per page and accuracy.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-11">
+<summary><span class="lvl core">Core</span> How is serving image generation different from serving an LLM?</summary>
+<div class="answer">
+<p>Diffusion/flow models run a fixed number of denoising steps over the whole latent: compute-bound, uniform cost, batches easily, no KV cache; latency seconds per image, acceptable with queues; outputs large (store in object storage, return URLs); safety classification of outputs required; levers are fewer steps (distillation), lower latent resolution, step caching, and batching by resolution. Video generation is far costlier and often scheduled as batch with quotas. Autoscale on queue length and requests (cost is uniform), not tokens.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Why is reducing image tokens more valuable than speeding up the vision encoder?</summary>
+<div class="answer">
+<p>The LLM's cost scales with image tokens in three ways: prefill FLOPs (2N per token, N ≫ N_enc), KV bytes held for the whole conversation (limiting batch and concurrency), and attention cost for every later token. The encoder's cost is usually smaller and is paid once (and cached). Halving image tokens by resolution caps, larger merges or learned pruning halves the LLM-side costs and KV; doubling encoder speed only trims the smaller term. Quality trade-offs must be evaluated (fine text in screenshots needs resolution), so expose detail levels and choose per use case.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-13">
+<summary><span class="lvl core">Core</span> Estimate the GPU capacity for 20,000 concurrent voice sessions.</summary>
+<div class="answer">
+<p>Assistant speaks ~40% of the time: 8,000 simultaneous output streams. At ~75 audio tokens/s per stream, output ≈ 600k tokens/s (input similar). Real-time constraint: TPOT ≈ 13 ms, TTFA ≤ ~300 ms → small batches; if an 8B-class speech model sustains ~64 streams per H100, 8,000 streams need ~125 GPUs; at ~50% utilisation for latency headroom plus spares, ~250 GPUs, placed regionally near users (no pooling across continents). Roughly 10× the GPUs per output token of chat. Validate with measured throughput at the latency target.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-14">
+<summary><span class="lvl design">Design</span> How would you add image inputs to an existing text LLM platform with minimal disruption?</summary>
+<div class="answer">
+<p>Upload path to object storage with signed URLs and references in requests; gateway validation (size, format, count limits, detail level); CPU preprocessing service; start with in-engine encoders for a VLM tier, encoder cache keyed by tenant-scoped image hashes; prefix-cache keys including image identity; token accounting and pricing for images; image safety classification; capacity model updated with image tokens; separate rate limits for image tokens; monitor TTFT/TPOT impact and move to EPD disaggregation if encoding interferes with decode; residency for stored media; observability of preprocessing and encoder latency.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> What latency components dominate a voice turn, and how can each be reduced?</summary>
+<div class="answer">
+<p>Endpointing (silence threshold 200–500 ms): use learned turn-taking models that predict end of turn from prosody and content, start speculative generation before confirmation and cancel if the user continues. ASR finalisation: streaming ASR with stable partials. LLM TTFT: in-region, low-utilisation pools, prefix caching of conversation, small models for first response. TTS first audio: streaming synthesis from first tokens. Network: WebRTC, nearby PoPs, minimal hops. Native speech-to-speech collapses several of these. Measure each component's percentile and the distribution of total TTFA.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci15-qa-16">
+<summary><span class="lvl warm">Warm-up</span> How many tokens is a minute of video, and why does it matter?</summary>
+<div class="answer">
+<p>Tokens per second of footage = frames per second sampled × tokens per frame; at 1 fps × 256 tokens, a minute is ~15k tokens; 10 minutes ~154k (beyond a 128k context); an hour ~920k. It matters because each such request consumes a large share of a replica's KV and prefill, so video needs frame sampling, token merging, retrieval over segments, dedicated long-context pools, separate concurrency limits and token-based pricing.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-llava">H. Liu, C. Li, Q. Wu, Y. J. Lee. Visual Instruction Tuning (LLaVA). <em>NeurIPS</em>, 2023. <a href="https://arxiv.org/abs/2304.08485">arXiv:2304.08485</a>.</li>
+<li id="r-qwen2vl">P. Wang et al. Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution. 2024. <a href="https://arxiv.org/abs/2409.12191">arXiv:2409.12191</a>.</li>
+<li id="r-epd">G. Singh et al. Efficiently Serving Large Multimodal Models Using EPD Disaggregation. 2024. <a href="https://arxiv.org/abs/2501.05460">arXiv:2501.05460</a>.</li>
+<li id="r-whisper">A. Radford et al. Robust Speech Recognition via Large-Scale Weak Supervision (Whisper). 2022. <a href="https://arxiv.org/abs/2212.04356">arXiv:2212.04356</a>.</li>
+<li id="r-moshi">A. Défossez et al. Moshi: a speech-text foundation model for real-time dialogue. 2024. <a href="https://arxiv.org/abs/2410.00037">arXiv:2410.00037</a>.</li>
+<li>A. Dosovitskiy et al. An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale (ViT). <em>ICLR</em>, 2021. <a href="https://arxiv.org/abs/2010.11929">arXiv:2010.11929</a>.</li>
+<li>A. Radford et al. Learning Transferable Visual Models From Natural Language Supervision (CLIP). 2021. <a href="https://arxiv.org/abs/2103.00020">arXiv:2103.00020</a>.</li>
+<li>X. Zhai et al. Sigmoid Loss for Language Image Pre-Training (SigLIP). 2023. <a href="https://arxiv.org/abs/2303.15343">arXiv:2303.15343</a>.</li>
+<li>W. Peebles, S. Xie. Scalable Diffusion Models with Transformers (DiT). 2022. <a href="https://arxiv.org/abs/2212.09748">arXiv:2212.09748</a>.</li>
+<li>J. Ho, A. Jain, P. Abbeel. Denoising Diffusion Probabilistic Models. <em>NeurIPS</em>, 2020. <a href="https://arxiv.org/abs/2006.11239">arXiv:2006.11239</a>.</li>
+<li>D. Bolya et al. Token Merging: Your ViT But Faster. <em>ICLR</em>, 2023. <a href="https://arxiv.org/abs/2210.09461">arXiv:2210.09461</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

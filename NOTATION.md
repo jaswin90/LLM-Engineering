@@ -322,3 +322,11 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | Symbol | Meaning |
 |---|---|
 | \(p_c\), \(k\) (Ch. 14 only) | probability a single timing probe is classified correctly; probes per guess |
+
+## Multimodal (Vol. II Ch. 15)
+| Symbol | Meaning |
+|---|---|
+| \(p_{\text{px}}\), \(p_{\text{tok}}\) | ViT patch size in pixels; pixels per merged image token (e.g. 28) |
+| \(n_{\text{img}}\), \(n_{\text{patch}}\), \(N_{\text{enc}}\) | image tokens; encoder patches; encoder parameters |
+| \(f_{\text{fps}}\), \(n_{\text{frame}}\) | sampled video frames per second; tokens per frame |
+| \(t_{\text{sil}}\) | silence threshold for end-of-turn detection |
