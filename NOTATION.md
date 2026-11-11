@@ -263,3 +263,6 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(t_{\text{rec}}\) | recovery time of a failed replica |
 | \(\Gamma\), \(\Gamma_{\text{res}}\) | generation time of a request; residual (remaining) time of an in-flight request (not \(S\), the attention scores) |
 | \(n_b\), \(t_{\text{drain}}\) | replicas replaced per rollout batch; time to drain a replica |
+| \(c_j\), \(a_i\), \(n_{\text{res}}\) | free-capacity vector of node \(j\); demand vector of pod \(i\); number of resource types (Ch. 7) |
+| \(\tau_c\), \(\delta_c\), \(M_{\text{bf}}\) | checkpoint interval; cost of one checkpoint; mean time between interruptions (Ch. 7) |
+| \(z\), \(n_{\text{req}}\) | number of failure domains a tier is spread over; replicas required (Ch. 7, 13) |

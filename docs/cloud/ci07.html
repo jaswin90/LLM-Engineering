@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 7 · Scheduling a GPU Cluster — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 7 of Cloud AI Infrastructure: cluster scheduling as vector bin packing, fragmentation and why packing beats spreading for GPUs, gang scheduling and deadlock, topology-aware and buddy-style placement, quotas, max-min and dominant-resource fairness with borrowing, priorities, preemption and the Young–Daly checkpoint interval, and sharing one cluster between inference and training.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci07" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part II · Orchestration — Chapter 7</div>
+<h1 id="top">Scheduling a GPU Cluster</h1>
+<p class="lede">A GPU cluster is shared by inference tiers, batch jobs, training runs and researchers, and every one of them wants more GPUs than exist. The scheduler decides who gets which GPUs, when, and for how long. Done badly, a quarter or more of a cluster sits idle while jobs wait—fragmented into remnants too small to use, reserved for gangs that never assemble, or held by low-priority work that cannot be moved. This chapter treats scheduling as the optimisation problem it is: bin packing, fragmentation, gang placement, topology, fairness, preemption and checkpointing, each with a quantitative core.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 6 showed how Kubernetes turns a pod specification into a running container, and noted that its default scheduler places one pod at a time with little knowledge of GPUs. For a web service that hardly matters: pods are small and interchangeable, and any node with spare CPU will do. For a GPU cluster it matters enormously. GPUs are expensive (an idle H100 costs about $60 a day), indivisible at the granularity most jobs need, tied to topology (eight on an NVSwitch, 72 in an NVL72 rack, rails and pods in the fabric), and contested by workloads with very different values and tolerances for interruption. Published studies of production GPU clusters have repeatedly found low utilisation and long queues at the same time—the signature of poor scheduling rather than insufficient hardware<span class="cite"><a href="#r-philly">[1]</a></span><span class="cite"><a href="#r-pai">[2]</a></span>.</p>
+<p>For an inference engineer, the scheduler determines whether a new replica can start when the autoscaler asks for it, whether a multi-node DeepSeek-V3 replica lands on one NVLink domain or is split across the fabric, whether batch and training work can use the GPUs that inference releases at night, and whether inference can take them back in the morning. Interviewers for infrastructure and ML-platform roles ask exactly these questions: "why can't my 8-GPU job schedule when the cluster is 40% free?", "how would you share a cluster between training and serving?", "how do you prevent one team from monopolising GPUs?", "how often should training checkpoint?".</p>
+<p>We formalise scheduling as bin packing (§7.1) and show that fragmentation, not capacity, is often what blocks large jobs (§7.2). We treat gang scheduling and its deadlocks (§7.3), topology-aware placement (§7.4), fair sharing among teams with quotas and borrowing (§7.5), and priorities with preemption and the optimal checkpoint interval (§7.6). We then apply all of it to the central question for a serving organisation: sharing one cluster between inference and everything else (§7.7), and close with the tools that implement these policies (§7.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Formulate cluster scheduling as multi-dimensional bin packing, and explain filter-and-score schedulers and the spread-versus-pack trade-off.</li>
+<li>Define and measure GPU fragmentation, and explain quantitatively why packing small jobs preserves capacity for large ones.</li>
+<li>Explain gang scheduling, show how partial allocation deadlocks, and describe admission-based solutions.</li>
+<li>Place multi-GPU and multi-node jobs on a topology tree to minimise communication, using buddy-style allocation.</li>
+<li>Compute max-min and dominant-resource fair shares, and design quotas with borrowing and reclamation.</li>
+<li>Derive the Young–Daly checkpoint interval, quantify preemption cost, and design a cluster shared by inference, batch and training.</li>
+</ol>
+<p class="small muted">Uses: Chapters 1, 4, 5 and 6 of this volume; Vol. I Chapter 11 (scheduling within an engine) and Chapter 18 (parallel layouts).</p>
+</div>
+
+<h2 id="s7-1">7.1 Scheduling as bin packing</h2>
+<p>Consider the scheduler's problem at one instant. There are nodes \(j=1,\dots,n_{\text{node}}\), each with a vector of free capacities \(c_j\in\mathbb R^{n_{\text{res}}}_{\ge0}\)—free GPUs, vCPUs, memory, NICs. There are pending pods \(i\), each with a demand vector \(a_i\), and constraints: which nodes it may use (GPU type, taints, zones), which pods it must or must not be near (affinity), and whether it belongs to a gang that must be placed together. A placement is an assignment \(x_{ij}\in\{0,1\}\) with \(\sum_jx_{ij}\le1\) for each pod and \(\sum_ix_{ij}a_i\le c_j\) componentwise for each node. The scheduler wants a placement that places as much valuable work as possible now <em>and</em> leaves the cluster in a state where future work can be placed too.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — vector bin packing</div>
+<p>When all pods must be placed and the goal is to use as few nodes as possible, this is <em>vector bin packing</em>, NP-hard already in one dimension. In one dimension the first-fit-decreasing heuristic (sort items by size, put each in the first bin it fits) uses at most \(\tfrac{11}{9}\mathrm{OPT}+\tfrac69\) bins, a classic result; in \(d\) dimensions, no polynomial algorithm achieves a constant ratio independent of \(d\) unless P = NP, and practical schedulers use greedy rules. One well-studied rule is to place an item where the dot product of its demand vector with the node's remaining-capacity vector is largest ("Tetris", Grandl et al., 2014), which favours nodes whose spare capacity has the same shape as the item, and so leaves fewer unusable remnants. The online version—items arrive and depart over time, and placements cannot be changed cheaply—is harder still, and its quality is judged by long-run utilisation and by how often large items are blocked.</p>
+</div>
+
+<p>Real schedulers decompose the problem into two steps per pod. <strong>Filtering</strong> removes nodes that cannot host the pod: not enough free GPUs or memory, wrong GPU type, taint not tolerated, affinity rule violated. <strong>Scoring</strong> ranks the remaining nodes by a weighted sum of plugin scores and picks the best. The Kubernetes scheduler has exactly this structure, and its resource-scoring plugin can be configured with one of two opposite strategies. <em>LeastAllocated</em> prefers the emptiest node: it <strong>spreads</strong> pods out, which balances load and limits the damage of a node failure. <em>MostAllocated</em> prefers the fullest node that still fits: it <strong>packs</strong> pods together, which leaves other nodes entirely free. For web services, spreading is the default and usually right. For GPUs it is usually wrong, for a reason Figure 7.1 shows.</p>
+
+<figure class="diagram" id="fig-7-1">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Spreading versus packing single-GPU pods on eight-GPU nodes">
+<text x="180" y="24" text-anchor="middle" class="t-sm t-b">Spread (least allocated)</text>
+<text x="540" y="24" text-anchor="middle" class="t-sm t-b">Pack (most allocated)</text>
+<g>
+<rect x="20" y="40" width="160" height="40" rx="5" class="bx"/><rect x="190" y="40" width="160" height="40" rx="5" class="bx"/>
+<rect x="20" y="90" width="160" height="40" rx="5" class="bx"/><rect x="190" y="90" width="160" height="40" rx="5" class="bx"/>
+<rect x="26" y="46" width="34" height="28" rx="3" class="bx2"/><rect x="64" y="46" width="34" height="28" rx="3" class="bx2"/><rect x="102" y="46" width="34" height="28" rx="3" class="bx2"/>
+<rect x="196" y="46" width="34" height="28" rx="3" class="bx2"/><rect x="234" y="46" width="34" height="28" rx="3" class="bx2"/><rect x="272" y="46" width="34" height="28" rx="3" class="bx2"/>
+<rect x="26" y="96" width="34" height="28" rx="3" class="bx2"/><rect x="64" y="96" width="34" height="28" rx="3" class="bx2"/><rect x="102" y="96" width="34" height="28" rx="3" class="bx2"/>
+<rect x="196" y="96" width="34" height="28" rx="3" class="bx2"/><rect x="234" y="96" width="34" height="28" rx="3" class="bx2"/><rect x="272" y="96" width="34" height="28" rx="3" class="bx2"/>
+</g>
+<text x="185" y="152" text-anchor="middle" class="t-xs">12 single-GPU pods: 3 per node, 5 GPUs free on each node</text>
+<text x="185" y="168" text-anchor="middle" class="t-xs t-s2">an 8-GPU replica cannot be placed anywhere</text>
+<g>
+<rect x="380" y="40" width="160" height="40" rx="5" class="bx"/><rect x="550" y="40" width="160" height="40" rx="5" class="bx"/>
+<rect x="380" y="90" width="160" height="40" rx="5" class="bx"/><rect x="550" y="90" width="160" height="40" rx="5" class="bx"/>
+<rect x="384" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="403" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="422" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="441" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="460" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="479" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="498" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="517" y="46" width="17" height="28" rx="2" class="bx2"/>
+<rect x="554" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="573" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="592" y="46" width="17" height="28" rx="2" class="bx2"/><rect x="611" y="46" width="17" height="28" rx="2" class="bx2"/>
+</g>
+<text x="545" y="152" text-anchor="middle" class="t-xs">the same 12 pods fill one node and half of another</text>
+<text x="545" y="168" text-anchor="middle" class="t-xs t-s3">two nodes stay completely free for 8-GPU replicas</text>
+<text x="360" y="210" text-anchor="middle" class="t-xs">Same load, same free GPU count (20). Spreading leaves 20 GPUs in four unusable fragments of 5;</text>
+<text x="360" y="226" text-anchor="middle" class="t-xs">packing leaves 16 of them as two whole nodes. The difference is invisible to a "free GPUs" metric.</text>
+</svg>
+<figcaption><b>Figure 7.1 — Spreading fragments GPUs; packing preserves whole nodes.</b> Both placements host the same twelve single-GPU pods on four eight-GPU nodes. Only the packed placement can still accept a replica that needs a whole node.</figcaption>
+</figure>
+
+<p>Figure 7.1 is the whole argument in miniature. A cluster's free GPU count says nothing about whether a large job can run; what matters is the <em>shape</em> of the free capacity. Spreading, which balances load, turns free capacity into many small remnants. Packing, which concentrates load, keeps free capacity in large blocks. When the workload mixes small and large requests—as an inference cluster with 8B, 70B and DeepSeek-V3 tiers does—the large requests are the ones that suffer, and they are usually the most valuable. How much they suffer is the subject of the next section.</p>
+
+<h2 id="s7-2">7.2 Fragmentation</h2>
+<p>We call a cluster's free GPUs <strong>fragmented</strong> with respect to a request size \(k\) when they cannot be used by requests of that size: free GPUs on nodes with fewer than \(k\) free. A useful single metric is the fraction of free GPUs that are unusable by the largest common request; another, closer to what users feel, is the probability that a request of size \(k\) arriving at a random time can be placed immediately. Both depend on load and on the placement policy, and the dependence is strong enough to be worth simulating.</p>
+<p>Figure 7.2 shows such a simulation: a cluster of 64 eight-GPU nodes receives a Poisson stream of jobs needing 1, 2, 4 or 8 GPUs (50%, 20%, 15% and 15% of jobs), each running for an exponential time; a job that cannot be placed on one node is rejected. The horizontal axis is the offered load—the GPU demand as a fraction of cluster capacity—and the vertical axis is the fraction of 8-GPU jobs rejected, under spreading and under packing.</p>
+
+<figure class="chart" id="fig-7-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Probability that an 8-GPU job cannot be placed (simulation: 64 nodes × 8 GPUs, mixed 1/2/4/8-GPU jobs)","height":330,
+ "x":{"label":"Offered GPU load (fraction of capacity)","min":0.45,"max":1.02,"fmt":"pct","ticks":[0.5,0.6,0.7,0.8,0.9,1]},
+ "y":{"label":"8-GPU jobs rejected","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"Spread (least allocated)","color":"s2","points":[[0.5,0.571],[0.6,0.738],[0.7,0.837],[0.8,0.888],[0.9,0.92],[1.0,0.945]]},
+  {"name":"Pack (best fit)","color":"s3","points":[[0.5,0.0],[0.6,0.0],[0.7,0.001],[0.8,0.017],[0.9,0.101],[1.0,0.22]]}
+ ]}
+</script>
+<figcaption><b>Figure 7.2 — Fragmentation, not capacity, blocks large jobs.</b> Under spreading, more than half of 8-GPU jobs are rejected at 50% offered load, and achieved utilisation stalls near 37–58%; under packing, rejection is negligible below 80% load and achieved utilisation tracks the offered load up to about 90%.</figcaption>
+</figure>
+
+<p>The result in Figure 7.2 is dramatic. With spreading, the small jobs scatter across every node, almost no node is ever completely free, and more than half of the 8-GPU jobs are rejected when the cluster is only half loaded; the cluster's achieved utilisation reaches only about 37% at 50% offered load, because the rejected large jobs carry much of the demand. With packing, small jobs crowd onto partially used nodes, whole nodes remain free, and 8-GPU jobs are almost never rejected until the cluster is 80% loaded. Production experience matches: the Alibaba PAI team, studying a cluster that shared GPUs among many workloads, found that fragmentation left substantial capacity unusable and proposed a scheduling rule that explicitly minimises the growth of fragmentation with each placement<span class="cite"><a href="#r-fgd">[3]</a></span>.</p>
+<p>Three practical rules follow. First, <strong>pack GPU workloads</strong>: configure the scheduler to prefer the fullest feasible node for GPU pods (MostAllocated scoring, or a best-fit plugin), while achieving fault tolerance through explicit spread constraints at the level that matters (racks and zones for replicas of one model) rather than by spreading everything. Second, <strong>segregate by size</strong> when the mix is extreme: dedicate some nodes to whole-node replicas and let small pods share the rest, or partition small pods onto MIG-sliced nodes (§3.4). Third, <strong>defragment</strong>: when a large job is blocked by scattered small ones, migrate a few small pods to consolidate free space—cheap for stateless 8B replicas that can be drained and restarted elsewhere in seconds (Chapter 5), expensive for long training jobs. Packing solves the problem for jobs that fit on one node. Jobs that need several nodes add a new problem.</p>
+
+<h2 id="s7-3">7.3 Gang scheduling</h2>
+<p>A multi-node replica (§6.6) or a distributed training job is a <strong>gang</strong>: a set of pods that are useless unless all of them run at once. A scheduler that places pods one at a time can place part of a gang and then run out of space, leaving the placed pods holding GPUs while they wait for the rest. If two gangs do this at the same time, each holding part of what the other needs, neither can ever complete. Figure 7.3 shows the smallest example.</p>
+
+<figure class="diagram" id="fig-7-3">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Deadlock between two partially placed gangs">
+<text x="20" y="24" class="t-sm t-b">Cluster: 3 nodes × 8 GPUs = 24 GPUs. Gang A needs 2 nodes; gang B needs 2 nodes.</text>
+<rect x="20" y="45" width="200" height="60" rx="6" class="bx2"/><text x="120" y="72" text-anchor="middle" class="t-xs t-b">node 1: A, pod 1</text><text x="120" y="90" text-anchor="middle" class="t-xs">placed, waiting</text>
+<rect x="260" y="45" width="200" height="60" rx="6" class="bx3"/><text x="360" y="72" text-anchor="middle" class="t-xs t-b">node 2: B, pod 1</text><text x="360" y="90" text-anchor="middle" class="t-xs">placed, waiting</text>
+<rect x="500" y="45" width="200" height="60" rx="6" class="bx"/><text x="600" y="72" text-anchor="middle" class="t-xs t-b">node 3: free</text><text x="600" y="90" text-anchor="middle" class="t-xs">only one more pod fits</text>
+<text x="20" y="135" class="t-xs">Pod-at-a-time placement: A's pod 1 → node 1, B's pod 1 → node 2. A's pod 2 → node 3 would complete A, but if the</text>
+<text x="20" y="151" class="t-xs">scheduler instead placed another gang's pod there—or if each gang needs three nodes—each gang holds GPUs the other</text>
+<text x="20" y="167" class="t-xs">needs and neither can start: 16 GPUs reserved, 0 working. This is the hold-and-wait condition for deadlock.</text>
+<rect x="20" y="182" width="680" height="38" rx="6" class="bx4"/>
+<text x="360" y="206" text-anchor="middle" class="t-xs t-b">Fix: all-or-nothing admission. Reserve the whole gang's capacity first (or none of it), then create the pods.</text>
+</svg>
+<figcaption><b>Figure 7.3 — Partial placement of gangs deadlocks.</b> Each gang holds resources while waiting for more, which is one of the four classical conditions for deadlock. Gang scheduling removes the hold-and-wait condition by placing all of a gang's pods or none.</figcaption>
+</figure>
+
+<p>The cure, <strong>gang scheduling</strong> or coscheduling, dates from Ousterhout's work on multiprocessor operating systems in 1982: the members of a gang are scheduled simultaneously or not at all. In Kubernetes it is implemented in two common ways. <em>Admission control</em>, as in Kueue: a job is represented by a single workload object that waits in a queue; when the queue's policy and the cluster's capacity allow the whole job to fit, Kueue reserves the quota and only then lets the job's pods be created, so pods never hold resources while waiting for siblings. <em>Pod groups</em>, as in Volcano, the scheduler-plugins coscheduling plugin and NVIDIA's KAI scheduler: pods carry a group label and a minimum member count, and the scheduler binds none of a group's pods until it can bind at least the minimum. Either way, the rule "all or nothing" turns a deadlock-prone system into one in which each gang either runs or waits without holding resources.</p>
+<p>Gang scheduling introduces its own inefficiency. A large gang may wait a long time for enough simultaneous free capacity while smaller jobs keep arriving and using every node that frees up, so the large gang starves. Schedulers counter this with <em>reservation</em> (once a large gang is at the head of the queue, stop placing smaller jobs on nodes it could use) and <em>backfilling</em> (allow small jobs onto reserved nodes only if they will finish before the large gang could start, which requires runtime estimates). These ideas come from HPC batch schedulers such as Slurm, which have handled gangs of thousands of nodes for decades. For inference, gangs are smaller—a DeepSeek-V3 replica of four to eight nodes—but starvation can still block scale-up at the worst moment, which is one reason inference clusters reserve capacity explicitly rather than rely on a shared queue. A gang also needs not just <em>any</em> nodes, but the right ones.</p>
+
+<h2 id="s7-4">7.4 Topology-aware placement</h2>
+<p>Recall from Chapter 1 that the physical infrastructure is a tree: GPUs in servers, servers in racks or NVLink domains, racks under leaf switches, leaves under spine blocks, and so on, with bandwidth falling as we move up (Figure 4.6). A job's communication cost depends on how far up the tree its GPUs' lowest common ancestor sits. Eight GPUs of one tensor-parallel replica must share a server (or an NVL72 domain); the four nodes of a DeepSeek-V3 replica on H100 should share a leaf switch or rail group, so that expert-parallel traffic crosses one switch rather than the spine (§4.3); disaggregated prefill and decode pools should sit where KV transfers stay within a network pod. A scheduler that ignores this places gangs wherever free nodes happen to be, and the job runs slower, sometimes much slower, than the same job placed compactly.</p>
+<p>The scheduling problem becomes: given a tree whose leaves are GPUs, some free, find for each request a set of free leaves with the lowest possible common ancestor. Greedy placement makes the tree itself fragment: free GPUs scattered under many subtrees, so that no subtree has enough for a large compact job. Operating systems faced the same problem in allocating contiguous memory, and their classic answer translates directly. The <strong>buddy allocator</strong> divides memory into blocks whose sizes are powers of two, splits a block into two "buddies" to satisfy a smaller request, and merges free buddies back together. Applied to a cluster tree, requests are rounded up to the size of a subtree level (1, 2, 4, 8 GPUs; 1, 2, 4, 8 nodes within a leaf; whole leaves), and each request is placed in the smallest free subtree that fits, choosing among candidates the one in the most heavily used parent—the tree analogue of best fit. Figure 7.4 shows the idea.</p>
+
+<figure class="diagram" id="fig-7-4">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Topology-aware placement on a cluster tree">
+<rect x="300" y="15" width="120" height="30" rx="6" class="bx4"/><text x="360" y="35" text-anchor="middle" class="t-xs t-b">spine block</text>
+<rect x="110" y="75" width="140" height="30" rx="6" class="bx"/><text x="180" y="95" text-anchor="middle" class="t-xs t-b">leaf A (rail group)</text>
+<rect x="470" y="75" width="140" height="30" rx="6" class="bx"/><text x="540" y="95" text-anchor="middle" class="t-xs t-b">leaf B (rail group)</text>
+<line x1="360" y1="45" x2="180" y2="75" class="ln"/><line x1="360" y1="45" x2="540" y2="75" class="ln"/>
+<g>
+<rect x="20" y="140" width="75" height="40" rx="5" class="bx2"/><text x="57" y="164" text-anchor="middle" class="t-xs">node 1</text>
+<rect x="105" y="140" width="75" height="40" rx="5" class="bx2"/><text x="142" y="164" text-anchor="middle" class="t-xs">node 2</text>
+<rect x="190" y="140" width="75" height="40" rx="5" class="bx2"/><text x="227" y="164" text-anchor="middle" class="t-xs">node 3</text>
+<rect x="275" y="140" width="75" height="40" rx="5" class="bx2"/><text x="312" y="164" text-anchor="middle" class="t-xs">node 4</text>
+<rect x="380" y="140" width="75" height="40" rx="5" class="bx3"/><text x="417" y="164" text-anchor="middle" class="t-xs">node 5</text>
+<rect x="465" y="140" width="75" height="40" rx="5" class="bx3"/><text x="502" y="164" text-anchor="middle" class="t-xs">node 6</text>
+<rect x="550" y="140" width="75" height="40" rx="5" class="bx"/><text x="587" y="164" text-anchor="middle" class="t-xs">node 7</text>
+<rect x="635" y="140" width="75" height="40" rx="5" class="bx"/><text x="672" y="164" text-anchor="middle" class="t-xs">node 8</text>
+</g>
+<line x1="180" y1="105" x2="57" y2="140" class="ln"/><line x1="180" y1="105" x2="142" y2="140" class="ln"/><line x1="180" y1="105" x2="227" y2="140" class="ln"/><line x1="180" y1="105" x2="312" y2="140" class="ln"/>
+<line x1="540" y1="105" x2="417" y2="140" class="ln"/><line x1="540" y1="105" x2="502" y2="140" class="ln"/><line x1="540" y1="105" x2="587" y2="140" class="ln"/><line x1="540" y1="105" x2="672" y2="140" class="ln"/>
+<text x="185" y="205" text-anchor="middle" class="t-xs t-b">4-node DeepSeek-V3 replica on leaf A</text>
+<text x="185" y="221" text-anchor="middle" class="t-xs">EP traffic crosses one switch</text>
+<text x="545" y="205" text-anchor="middle" class="t-xs t-b">2-node job on leaf B, nodes 5–6 (a "buddy" pair)</text>
+<text x="545" y="221" text-anchor="middle" class="t-xs">nodes 7–8 stay free as a pair for the next 2-node job</text>
+<text x="360" y="255" text-anchor="middle" class="t-xs">Bad placement: the 4-node replica on nodes 3, 4, 5, 6 would cross the spine and split both leaves' free blocks.</text>
+</svg>
+<figcaption><b>Figure 7.4 — Placing gangs on the topology tree.</b> Requests are rounded to subtree sizes and placed in the smallest free subtree that fits, which keeps communication local and keeps free capacity in aligned blocks for future large jobs.</figcaption>
+</figure>
+
+<p>Figure 7.4 makes the trade-off visible. Placing the 4-node replica on leaf A keeps its traffic under one switch and leaves leaf B's free nodes as an aligned pair; placing it across the leaves would slow it and fragment both. Topology-aware schedulers in production—Slurm's topology plugin, NVIDIA's KAI scheduler, cloud providers' compact-placement policies, and DRA-based claims for NVLink domains (§6.4)—implement variants of this idea. The cost of rounding requests up to aligned sizes is some internal waste (a 3-node job takes a 4-node block), which is usually far smaller than the fragmentation it prevents. With placement solved for each job in isolation, we turn to the question of which jobs get capacity at all.</p>
+
+<p>Topology cuts both ways. Packing a gang compactly keeps its communication local, but placing <em>many replicas of the same model</em> compactly concentrates them in one failure domain. For a training job, which is a single gang, compactness is everything. For an inference tier, which is many independent replicas, the scheduler must also spread: replicas of one model should be distributed across racks, power feeds, network pods and availability zones, so that the loss of any one domain removes only a bounded fraction of the tier. Kubernetes expresses this with <strong>topology spread constraints</strong>—"the number of replicas in any zone may exceed the number in any other by at most one"—evaluated over node labels that name each domain. The two goals are compatible because they act at different levels: pack within a replica (its GPUs under the lowest common ancestor), spread across replicas (different replicas under different high-level ancestors).</p>
+<p>The cost of spreading can be computed. If a tier needs capacity \(n_{\text{req}}\) replicas and is spread evenly over \(z\) domains of equal size, losing one domain removes \(1/z\) of the replicas, so to keep \(n_{\text{req}}\) serving through any single-domain failure the tier must run \(n_{\text{req}}\,z/(z-1)\) replicas. Spreading over two zones needs 100% extra capacity; over three, 50%; over four, 33%; over ten racks, 11%. This is why inference tiers are spread across three or more zones rather than two, and across many racks within a zone, and why the failover capacity belongs in the reserved floor that the tier never lends (§7.7). Chapter 13 extends the calculation to correlated failures and to the time it takes to replace lost capacity.</p>
+<p>A third placement consideration is specific to LLM serving: <em>where the caches are</em>. A replica started on a node whose NVMe already holds the model's weights cold-starts in seconds instead of minutes (Chapter 5), and a replica placed near the router shard that holds a tenant's prefix-cache affinity avoids cross-zone traffic. A scheduler can encode these as scoring preferences—prefer nodes labelled with the model's digest in their cache, prefer the zone where the tier's traffic arrives—so that placement serves cold-start speed and locality as well as packing and spreading.</p>
+
+<details class="drill">
+<summary>Drill 7.1 — What does a bad placement cost?</summary>
+<p>A DeepSeek-V3 decode replica spans four H100 nodes. Its expert-parallel traffic per step is 480 MB per GPU across nodes (§4.6 worked example). Placed under one leaf with adaptive routing it achieves 80% of the 50 GB/s NIC rate; placed across two leaves through a spine where hashed collisions cut efficiency to 35%, how much longer is each step's communication, and what does that do to throughput if communication is half-overlapped with a 20 ms compute phase?</p>
+<p><em>Solution.</em> Compactly: \(0.48/(0.8\times50)\approx12\) ms. Across the spine: \(0.48/(0.35\times50)\approx27\) ms. With half of communication overlapped, the step is about \(20+6=26\) ms compactly and \(20+13.7\approx34\) ms across the spine, so the badly placed replica produces about 24% fewer tokens per second—or must run smaller batches to meet the same TPOT. One scheduling decision costs a quarter of a replica.</p>
+</details>
+
+<h2 id="s7-5">7.5 Quotas, fair share and borrowing</h2>
+<p>A shared cluster serves several teams, and someone must decide how much of it each may use. The simplest policy is a fixed <strong>quota</strong>: team A may use at most 512 GPUs, team B 256. Fixed quotas guarantee capacity but waste it: when team A is idle, its 512 GPUs sit unused even if team B has a queue. The opposite policy, first come first served, uses capacity well but lets one team monopolise the cluster. The middle ground, used by every mature scheduler, combines a guaranteed share for each team with the ability to <strong>borrow</strong> idle capacity from others, subject to <strong>reclamation</strong> when the owner returns.</p>
+<p>What is a fair division when demands exceed capacity? The classical answer for one resource is <strong>max-min fairness</strong>: allocate so that no team can get more without taking from a team that has less. It is computed by <em>water-filling</em>: raise every unsatisfied team's allocation at the same rate until either a team's demand is met (it drops out) or capacity runs out. With weights \(w_k\) (reflecting priority or budget), allocations rise in proportion to the weights. For several resources—GPUs, CPU, memory—Ghodsi and colleagues proposed <strong>dominant resource fairness</strong> (DRF): for each team, compute its <em>dominant share</em>, the largest fraction of any one resource it is allocated, and apply max-min fairness to dominant shares<span class="cite"><a href="#r-drf">[4]</a></span>. DRF has attractive properties: no team prefers another's allocation, no team can gain by lying about its demands, and every team gets at least what it would with a static \(1/n\) partition. On GPU clusters, GPUs are almost always the dominant resource, so DRF reduces to weighted max-min on GPUs, which is why GPU quotas are usually stated in GPUs alone.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — water-filling 1,024 GPUs among three teams</div>
+<p><strong>Setup.</strong> A 1,024-GPU research cluster with equal weights. Demands: team A 200 GPUs, team B 500, team C 800.</p>
+<p><strong>Water-filling.</strong> Raise all three equally. At 200 each (600 used), team A is satisfied and drops out. 424 GPUs remain for B and C: raise both by 212, to 412 each. Capacity is exhausted before either is satisfied. Allocation: A 200, B 412, C 412.</p>
+<p><strong>Check max-min.</strong> To give B more we would have to take from C (equal) or A (smaller and satisfied); no team can gain without taking from one with no more than it has. A fixed one-third quota (341 each) would have wasted 141 of A's GPUs while B and C queued.</p>
+<p><strong>With weights 1:1:2</strong> (team C funds half the cluster): rates in proportion to weights; A saturates first at 200 when B is at 200 and C at 400 (800 used); 224 remain, split 1:2 between B and C: B 275, C 549. Allocation: 200, 275, 549.</p>
+</div>
+
+<p>Kueue expresses these ideas through <strong>ClusterQueues</strong>, each with nominal quotas per resource flavour (for example "256 H100s and 64 H200s"), grouped into <strong>cohorts</strong> within which unused nominal quota can be borrowed, with per-queue borrowing limits and lending limits. When a team needs its nominal quota back, workloads that are borrowing beyond their own quota become candidates for preemption. Slurm's fair-share scheduler works differently but to the same end: it tracks each account's historical usage, decayed over time, and lowers the priority of jobs from accounts that have recently used more than their share. Borrowing is what makes sharing efficient, and reclaiming borrowed capacity means taking it away from running work. That is preemption.</p>
+
+<h2 id="s7-6">7.6 Priorities, preemption and checkpoints</h2>
+<p>Not all work is equally valuable or equally urgent. A typical policy orders workloads into priority classes: production inference (users are waiting), then interactive and batch inference with deadlines, then training, then research and best-effort experiments. When higher-priority work needs capacity that lower-priority work holds, the scheduler <strong>preempts</strong>: it evicts the lower-priority pods and gives their resources to the higher. Kubernetes supports this through PriorityClasses, and batch schedulers add policies about who may preempt whom, how much may be preempted at once and how long a victim gets to shut down.</p>
+<p>Preemption is not free, and its cost depends on the victim. An inference replica that is preempted loses its in-flight requests (unless they are drained or resumed, §6.7) and will need a cold start if it is ever rescheduled; but it carries no long-lived state. A training job loses all the work done since its last <strong>checkpoint</strong>—a snapshot of its weights and optimiser state written to storage—and must reload that checkpoint to resume. If preemptions (or failures, which have the same effect) arrive at random with mean time between them \(M_{\text{bf}}\), and the job checkpoints every \(\tau_c\) seconds at a cost of \(\delta_c\) seconds per checkpoint, then the fraction of time lost has two terms: \(\delta_c/\tau_c\) spent writing checkpoints, and, on average, half a checkpoint interval of recomputation per interruption, \(\tau_c/(2M_{\text{bf}})\).</p>
+
+<div class="box thm">
+<div class="box-title">Proposition 7.1 — The Young–Daly checkpoint interval</div>
+<p>To first order in \(\tau_c/M_{\text{bf}}\) and \(\delta_c/\tau_c\), the overhead fraction \(h(\tau_c)=\delta_c/\tau_c+\tau_c/(2M_{\text{bf}})\) is minimised at</p>
+\[
+\tau_c^{*}=\sqrt{2\,\delta_c\,M_{\text{bf}}},\qquad h(\tau_c^*)=\sqrt{2\,\delta_c/M_{\text{bf}}} .
+\]
+<p><em>Proof.</em> \(h'(\tau_c)=-\delta_c/\tau_c^2+1/(2M_{\text{bf}})=0\) gives \(\tau_c^{*2}=2\delta_cM_{\text{bf}}\); \(h''>0\). Substituting, both terms equal \(\sqrt{\delta_c/(2M_{\text{bf}})}\), so their sum is \(\sqrt{2\delta_c/M_{\text{bf}}}\). The first-order model is due to Young (1974), refined by Daly (2006) with higher-order terms and restart costs. \(\square\)</p>
+</div>
+
+<p>Proposition 7.1 has a memorable form: the optimal overhead is the square root of twice the ratio of checkpoint cost to mean time between interruptions. Figure 7.5 plots the overhead for a large training job whose interruptions—hardware failures plus preemptions—arrive every three hours on average, for a slow synchronous checkpoint of 60 seconds and a fast asynchronous one of 10 seconds. With the slow checkpoint, the best interval is about 19 minutes and the job still loses about 10.5% of its time; with the fast checkpoint the best interval is about 8 minutes and the loss falls to about 4.3%.</p>
+
+<figure class="chart" id="fig-7-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Time lost to checkpointing and recomputation, mean time between interruptions 3 hours","height":330,
+ "x":{"label":"Checkpoint interval τ_c (minutes, log)","log":true,"min":2,"max":120,"ticks":[2,5,10,20,30,60,120]},
+ "y":{"label":"Overhead fraction","min":0,"max":0.55,"fmt":"pct","ticks":[0,0.1,0.2,0.3,0.4,0.5]},
+ "series":[
+  {"name":"Checkpoint cost δ_c = 60 s (synchronous)","color":"s2","points":[[2,0.506],[5,0.214],[10,0.128],[19,0.105],[30,0.117],[60,0.183],[120,0.342]]},
+  {"name":"Checkpoint cost δ_c = 10 s (asynchronous)","color":"s3","points":[[2,0.089],[5,0.047],[7.75,0.043],[10,0.0444],[20,0.064],[30,0.089],[60,0.183],[120,0.334]]}
+ ]}
+</script>
+<figcaption><b>Figure 7.5 — The checkpoint interval trades write cost against lost work.</b> \(h(\tau_c)=\delta_c/\tau_c+\tau_c/(2M_{\text{bf}})\). The minimum sits at \(\sqrt{2\delta_cM_{\text{bf}}}\); making checkpoints cheaper both lowers the minimum and moves it to shorter intervals.</figcaption>
+</figure>
+
+<p>For the scheduler, Figure 7.5 says that preemption of training is affordable if, and only if, training checkpoints cheaply and often. Modern training frameworks write checkpoints asynchronously—copying state to host memory in a second and writing it to storage in the background—precisely so that frequent checkpoints, and therefore frequent preemption and quick recovery from failures, cost little. A cluster policy can then make training the "sponge" that absorbs inference's fluctuations: training borrows capacity when inference needs less and is preempted, losing a few minutes of work, when inference needs more. Graceful preemption improves on this further: the scheduler gives the victim notice, the job writes a checkpoint at the moment of preemption, and lost work falls to nearly zero.</p>
+
+<details class="drill">
+<summary>Drill 7.2 — How often can we take GPUs back?</summary>
+<p>A 2,048-GPU training job checkpoints asynchronously at \(\delta_c=10\) s. Hardware failures alone interrupt it every 6 hours on average. Inference reclaims part of the cluster every morning and evening, interrupting training twice a day more. What is the mean time between interruptions, the optimal checkpoint interval and the overhead? What if reclaims came every hour?</p>
+<p><em>Solution.</em> Rates add: \(1/6+2/24=0.25\) per hour, so \(M_{\text{bf}}=4\) h \(=14{,}400\) s. \(\tau_c^*=\sqrt{2\times10\times14{,}400}\approx537\) s (about 9 minutes), overhead \(\sqrt{20/14{,}400}\approx3.7\%\). Hourly reclaims: rate \(1/6+1=1.17\) per hour, \(M_{\text{bf}}\approx3{,}090\) s, \(\tau_c^*\approx249\) s, overhead \(\approx8\%\), plus restart time per interruption (reloading the checkpoint and re-forming the job), which with a few minutes per restart adds several more percent. Twice-daily reclamation is cheap; hourly reclamation of a large synchronous job is not, so elastic training (which shrinks instead of stopping) or reclaiming from smaller, more numerous jobs is preferable.</p>
+</details>
+
+<h2 id="s7-7">7.7 Sharing one cluster between inference and everything else</h2>
+<p>We can now answer the question that matters most for a serving organisation's economics. Inference demand follows the clock (§1.6): Atlas's 70B tier needs about 311 replicas at the weekday peak and perhaps 140 at night, so a fleet sized for the peak leaves half its GPUs idle for many hours a day. Meanwhile, training, fine-tuning, evaluation, batch inference and reinforcement-learning rollouts have demand that is large, flexible in time and tolerant of interruption. Sharing one cluster among them, with inference as the high-priority tenant and the rest as preemptible borrowers, can raise the cluster's average utilisation from about 40% to 80% or more.</p>
+<p>Figure 7.6 sketches the arrangement over a day. Inference holds a reserved floor (its minimum replica count plus failover capacity) and expands into a flexible band as demand rises. The flexible band is lent to borrowers when inference does not need it: batch inference and evaluation (cheap to preempt: they restart from their last completed item), elastic training that can grow and shrink its data-parallel degree, and RL rollouts (which are themselves inference, Chapter 19). Each morning, as the autoscaler asks for more replicas, the scheduler reclaims capacity from the borrowers in priority order, giving each notice to checkpoint or drain.</p>
+
+<figure class="diagram" id="fig-7-6">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Inference and borrowed capacity over a day">
+<line x1="60" y1="210" x2="690" y2="210" class="ln"/><line x1="60" y1="30" x2="60" y2="210" class="ln"/>
+<text x="20" y="40" class="t-xs">GPUs</text>
+<rect x="60" y="40" width="630" height="20" class="bx"/><text x="375" y="54" text-anchor="middle" class="t-xs">cluster capacity</text>
+<path d="M60,150 C130,150 160,155 200,150 C250,140 280,90 330,85 C400,80 460,85 520,95 C570,110 610,140 690,150 L690,210 L60,210 Z" class="bx2"/>
+<path d="M60,60 L690,60 L690,150 C610,140 570,110 520,95 C460,85 400,80 330,85 C280,90 250,140 200,150 C160,155 130,150 60,150 Z" class="bx3"/>
+<rect x="60" y="175" width="630" height="35" class="bx4"/>
+<text x="375" y="197" text-anchor="middle" class="t-xs t-b">inference reserved floor (minimum replicas + failover)</text>
+<text x="390" y="130" text-anchor="middle" class="t-xs t-b">inference (autoscaled)</text>
+<text x="130" y="100" text-anchor="middle" class="t-xs t-b">borrowed at night:</text>
+<text x="130" y="115" text-anchor="middle" class="t-xs">training, batch, RL rollouts</text>
+<text x="390" y="74" text-anchor="middle" class="t-xs">borrowed at peak: only a thin band</text>
+<g class="t-xs"><text x="60" y="228">00:00</text><text x="210" y="228">06:00</text><text x="365" y="228">12:00</text><text x="520" y="228">18:00</text><text x="660" y="228">24:00</text></g>
+<text x="375" y="250" text-anchor="middle" class="t-xs">Each morning the scheduler reclaims the green band from borrowers in priority order, with notice to checkpoint or drain.</text>
+</svg>
+<figcaption><b>Figure 7.6 — Filling inference's troughs.</b> Inference owns a reserved floor and expands into a flexible band that is lent to preemptible work when not needed. Average utilisation of the cluster approaches its capacity instead of inference's daily mean.</figcaption>
+</figure>
+
+<div class="box example">
+<div class="box-title">Worked example — what the troughs are worth for Atlas</div>
+<p><strong>Setup.</strong> Atlas's 70B tier occupies about 2,500 GPUs at peak (Chapter 1) and about 1,150 at the overnight trough, with roughly ten hours a day below 1,600. A reserved floor of 1,300 GPUs (trough plus failover) is never lent.</p>
+<p><strong>Lendable capacity.</strong> Over the day, the gap between 2,500 and inference's actual use averages about 900 GPUs, or about 21,600 GPU-hours per day.</p>
+<p><strong>Its value.</strong> At $2.50 per GPU-hour, about $54,000 per day, $20 million per year, of capacity that a fixed inference fleet would leave idle. Lent to batch inference priced at half the online rate (Chapter 19), evaluation sweeps, or reinforcement-learning rollouts that the company would otherwise rent separately, much of that becomes real value.</p>
+<p><strong>Costs.</strong> Preemption overhead for borrowers (a few percent with asynchronous checkpoints, §7.6); a scheduler and policy capable of reclamation; cold-start speed for inference, since reclaimed GPUs must become replicas quickly (Chapter 5); and care that borrowers do not degrade inference through shared resources (network, storage, power). The economics strongly favour sharing.</p>
+</div>
+
+<p>Two caveats keep this from being free. The first is <em>reclamation latency</em>: inference must be able to get its GPUs back faster than its demand rises, so the scheduler must preempt quickly, victims must release GPUs quickly, and new replicas must start quickly. A policy that gives training ten minutes' notice and inference fifteen-minute cold starts needs twenty-five minutes of headroom; one with one-minute notice and thirty-second cold starts needs very little. The second is <em>interference</em>: borrowers share the back-end network, storage and power with inference, and a training job's all-reduces can congest a fabric that inference's KV transfers also use, or its synchronised power swings can trip the power capping of §2.4. Isolation at those layers—separate network pods, QoS classes, power-aware placement—is part of the design. Studies of real shared clusters show what happens without such care: Microsoft's Philly clusters suffered from gang-scheduling delays and locality-driven slowdowns<span class="cite"><a href="#r-philly">[1]</a></span>, and Alibaba's PAI found median GPU utilisation well below allocation because of fragmentation and idle reservations<span class="cite"><a href="#r-pai">[2]</a></span>.</p>
+
+<h2 id="s7-8">7.8 Tools: Kubernetes add-ons, Slurm and their scale</h2>
+<p>The policies of this chapter are implemented by a handful of systems, and an interviewer will expect some familiarity with them. On Kubernetes, <strong>Kueue</strong> (a Kubernetes SIG project) provides queueing, quotas with cohorts and borrowing, all-or-nothing admission and preemption, leaving pod placement to the default scheduler or a plugin. <strong>Volcano</strong> (a CNCF project) is a full batch scheduler with pod groups, gang scheduling, fair share and queue policies. NVIDIA's <strong>KAI scheduler</strong>, open-sourced in 2025 from the Run:ai platform, combines hierarchical queues and fair share with GPU-aware bin packing, gang scheduling, topology awareness and GPU sharing. The Kubernetes <strong>scheduler-plugins</strong> project offers coscheduling and capacity scheduling plugins for the default scheduler. Outside Kubernetes, <strong>Slurm</strong> remains the standard for HPC and many training clusters, with mature gang scheduling, backfill, topology-aware placement, fair-share accounting and preemption; Slinky and similar projects run Slurm inside Kubernetes so that one fleet can serve both styles of work.</p>
+<p>A scheduler is itself a service with throughput and latency. A cluster with thousands of nodes and an inference autoscaler that creates and deletes hundreds of replicas an hour, plus batch systems submitting thousands of short tasks, needs a scheduler that makes many decisions per second, and Kubernetes' default scheduler, which evaluates each pod against every feasible node, is tuned by sampling a subset of nodes when clusters are large. Very large fleets are partitioned into many clusters, each with its own control plane and scheduler, with a higher layer deciding which cluster receives each workload—a design that limits blast radius as well as scale (Chapters 12 and 13). Schedulers place pods; they do not know what a model is, which replicas hold which prefixes, or how to scale on tokens. Those responsibilities belong to the serving platform, which is our next subject.</p>
+
+<p>One more component completes the picture: the <strong>cluster autoscaler</strong>, which adds and removes <em>nodes</em> (as opposed to the serving autoscaler, which adds and removes replicas). When pods are pending because no node can host them, the cluster autoscaler asks the cloud for new nodes of a suitable type; when nodes have been underused for a while, it drains and releases them. For GPU fleets its behaviour must be tuned carefully. It should add nodes in the shapes that pending gangs need (whole NVL72 racks, not scattered servers), it should not remove a node merely because it is temporarily empty in the trough if obtaining it again may take an hour or fail altogether, and it should prefer to remove nodes whose pods can be consolidated elsewhere. Many GPU operators keep a <strong>warm pool</strong> of idle but provisioned nodes, trading their rental cost for the minutes of node provisioning they remove from cold starts (§5.1). Whether that trade is worth it depends on what capacity costs and how it is bought—the subject of Part III.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We now have the machinery to place work on a GPU cluster well: pack to avoid fragmentation, admit gangs all-or-nothing, place them compactly on the topology tree, share capacity fairly with borrowing, preempt with cheap checkpoints, and fill inference's troughs with flexible work. None of it knows anything about models. Someone must still turn "serve Llama 3 70B with these latency targets" into the right number of correctly configured replicas, route each request to a good replica, roll out new model versions safely, and offer all of this to users as an endpoint or an API. What do serving platforms such as KServe, Ray Serve, Triton, NVIDIA Dynamo, llm-d and the managed endpoints of the clouds add on top of Kubernetes and its schedulers? Chapter 8 answers this question.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Scheduling is online vector bin packing under constraints; schedulers filter feasible nodes and score them. For GPUs, packing (most allocated, best fit) beats spreading.</li>
+<li>Fragmentation is free capacity of the wrong shape. In simulation, spreading rejects over half of 8-GPU jobs at 50% load; packing rejects almost none below 80%. Segregate sizes, pack, and defragment.</li>
+<li>Gangs placed pod by pod can deadlock (hold and wait). All-or-nothing admission (Kueue) or pod groups (Volcano, KAI, coscheduling) fix it; reservation and backfill prevent starvation of large gangs.</li>
+<li>Topology-aware placement keeps a gang under the lowest possible common ancestor; buddy-style allocation in aligned blocks limits fragmentation of the tree. Bad placement can cost a quarter of a replica's throughput.</li>
+<li>Max-min fairness (water-filling) and dominant resource fairness divide contested capacity; quotas with borrowing and reclamation (Kueue cohorts, Slurm fair share) combine guarantees with efficiency.</li>
+<li>Preemption cost for training is lost work since the last checkpoint; the Young–Daly interval \(\tau_c^*=\sqrt{2\delta_cM_{\text{bf}}}\) gives overhead \(\sqrt{2\delta_c/M_{\text{bf}}}\); asynchronous checkpoints make frequent preemption cheap.</li>
+<li>Sharing one cluster between inference (high priority, reserved floor) and preemptible borrowers (training, batch, rollouts) can double average utilisation; reclamation latency and interference must be designed for.</li>
+<li>Tools: Kueue, Volcano, KAI scheduler, scheduler-plugins, Slurm (and Slurm on Kubernetes); large fleets use many clusters with a placement layer above.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci07-mcq-01" data-topic="§7.1 Bin packing">
+<p class="q">Cluster scheduling with multiple resources (GPUs, CPU, memory) is an instance of:</p>
+<ol class="opts"><li>Shortest-path routing</li><li data-correct>Vector bin packing</li><li>Linear regression</li><li>Sorting</li></ol>
+<div class="explain">NP-hard; practical schedulers use greedy filter-and-score rules.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-02" data-topic="§7.1 Bin packing">
+<p class="q">In a filter-and-score scheduler, filtering:</p>
+<ol class="opts"><li>Ranks nodes</li><li data-correct>Removes nodes that cannot host the pod</li><li>Preempts pods</li><li>Creates nodes</li></ol>
+<div class="explain">Scoring then ranks the feasible nodes.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-03" data-topic="§7.1 Bin packing">
+<p class="q">Why is spreading (least allocated) usually a poor default for GPU pods?</p>
+<ol class="opts"><li>It overheats nodes</li><li data-correct>It scatters small pods across nodes so that no node stays wholly free for large requests</li><li>It violates quotas</li><li>It requires DRA</li></ol>
+<div class="explain">Fault tolerance should come from explicit spread constraints instead.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-04" data-topic="§7.1 Bin packing">
+<p class="q">The "Tetris" heuristic places a task on the node that maximises:</p>
+<ol class="opts"><li>Free GPUs</li><li data-correct>The dot product of the task's demand vector with the node's remaining capacity</li><li>Network bandwidth</li><li>Uptime</li></ol>
+<div class="explain">It favours nodes whose spare capacity has the task's shape.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-05" data-topic="§7.2 Fragmentation">
+<p class="q">A cluster has 40% of its GPUs free but an 8-GPU job cannot schedule. The most likely reason is:</p>
+<ol class="opts"><li>Quota exhaustion only</li><li data-correct>Fragmentation: free GPUs are spread across nodes with fewer than 8 free each</li><li>etcd failure</li><li>Driver mismatch</li></ol>
+<div class="explain">Free capacity's shape matters, not its total.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-06" data-topic="§7.2 Fragmentation">
+<p class="q">In the simulation of Figure 7.2, at 50% offered load, spreading rejects roughly what fraction of 8-GPU jobs?</p>
+<ol class="opts"><li>0%</li><li>10%</li><li data-correct>Over 50%</li><li>100%</li></ol>
+<div class="explain">Packing rejects essentially none at that load.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-07" data-topic="§7.2 Fragmentation">
+<p class="q">Which practices reduce GPU fragmentation? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Best-fit packing of small pods</li><li data-correct>Dedicating some nodes to whole-node jobs</li><li data-correct>Migrating small stateless pods to consolidate free space</li><li>Requesting extra CPUs per pod</li></ol>
+<div class="explain">Oversized CPU requests strand GPUs (Chapter 6).</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-08" data-topic="§7.3 Gangs">
+<p class="q">Why can pod-at-a-time scheduling of gangs deadlock?</p>
+<ol class="opts"><li>Pods crash</li><li data-correct>Partially placed gangs hold resources while waiting for more (hold and wait)</li><li>The API server is single-threaded</li><li>Gangs need MIG</li></ol>
+<div class="explain">Two gangs can each hold what the other needs.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-09" data-topic="§7.3 Gangs">
+<p class="q">How does Kueue implement all-or-nothing placement?</p>
+<ol class="opts"><li>It restarts failed pods</li><li data-correct>It admits a workload only when its whole quota can be reserved, before the pods are created</li><li>It shrinks gangs</li><li>It uses time-slicing</li></ol>
+<div class="explain">Pods never hold resources while waiting for siblings.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-10" data-topic="§7.3 Gangs">
+<p class="q">Backfilling allows:</p>
+<ol class="opts"><li>Large jobs to skip the queue</li><li data-correct>Small jobs to use capacity reserved for a large gang if they will finish before it could start</li><li>Checkpoints to be skipped</li><li>Pods to share GPUs</li></ol>
+<div class="explain">It needs runtime estimates.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-11" data-topic="§7.3 Gangs">
+<p class="q">Gang scheduling's main residual risk is:</p>
+<ol class="opts"><li>Deadlock</li><li data-correct>Starvation of large gangs by a stream of small jobs</li><li>Memory leaks</li><li>Network congestion</li></ol>
+<div class="explain">Reservation prevents it.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-12" data-topic="§7.4 Topology">
+<p class="q">The goal of topology-aware placement is to put a gang's GPUs under:</p>
+<ol class="opts"><li>The root of the tree</li><li data-correct>The lowest possible common ancestor in the topology tree</li><li>Different zones</li><li>Random leaves</li></ol>
+<div class="explain">Bandwidth falls as the common ancestor rises.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-13" data-topic="§7.4 Topology">
+<p class="q">Buddy-style allocation helps cluster scheduling by:</p>
+<ol class="opts"><li>Doubling capacity</li><li data-correct>Allocating aligned power-of-two blocks so free capacity stays in large contiguous subtrees</li><li>Removing the need for gangs</li><li>Compressing jobs</li></ol>
+<div class="explain">Borrowed from operating-system memory allocators.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-14" data-topic="§7.4 Topology">
+<p class="q">In Drill 7.1, placing a 4-node EP replica across the spine instead of under one leaf reduced throughput by about:</p>
+<ol class="opts"><li>2%</li><li data-correct>24%</li><li>60%</li><li>90%</li></ol>
+<div class="explain">Step time grew from about 26 to about 34 ms.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-15" data-topic="§7.5 Fairness">
+<p class="q">Max-min fairness allocates resources so that:</p>
+<ol class="opts"><li>Everyone gets the same amount regardless of demand</li><li data-correct>No party can get more without taking from a party with no more than it has</li><li>The largest demand is served first</li><li>Resources are auctioned</li></ol>
+<div class="explain">Computed by water-filling.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-16" data-topic="§7.5 Fairness">
+<p class="q">With 1,024 GPUs and equal weights, demands of 200, 500 and 800 receive:</p>
+<ol class="opts"><li>341 each</li><li data-correct>200, 412, 412</li><li>200, 500, 324</li><li>137, 341, 546</li></ol>
+<div class="explain">A saturates at 200; B and C split the remaining 824 equally.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-17" data-topic="§7.5 Fairness">
+<p class="q">Dominant resource fairness applies max-min fairness to:</p>
+<ol class="opts"><li>CPU only</li><li data-correct>Each party's largest share of any single resource</li><li>Total cost</li><li>Number of jobs</li></ol>
+<div class="explain">On GPU clusters it usually reduces to fairness on GPUs.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-18" data-topic="§7.5 Fairness">
+<p class="q">What do Kueue cohorts enable?</p>
+<ol class="opts"><li>Multi-region failover</li><li data-correct>Borrowing unused nominal quota among ClusterQueues, with borrowing and lending limits</li><li>GPU sharing via MPS</li><li>Image caching</li></ol>
+<div class="explain">Borrowed capacity can be reclaimed by preemption.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-19" data-topic="§7.5 Fairness">
+<p class="q">The main drawback of fixed per-team quotas without borrowing is:</p>
+<ol class="opts"><li>Unfairness</li><li data-correct>Idle capacity stays unused while other teams queue</li><li>Deadlock</li><li>Fragmentation</li></ol>
+<div class="explain">Guarantees without sharing waste capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-20" data-topic="§7.6 Preemption">
+<p class="q">With checkpoint interval \(\tau_c\) and random interruptions, the expected recomputation per interruption is about:</p>
+<ol class="opts"><li>\(\tau_c\)</li><li data-correct>\(\tau_c/2\)</li><li>\(\tau_c^2\)</li><li>Zero</li></ol>
+<div class="explain">Interruptions fall uniformly within an interval on average.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-21" data-topic="§7.6 Preemption">
+<p class="q">The Young–Daly optimal checkpoint interval is:</p>
+<ol class="opts"><li>\(\delta_c M_{\text{bf}}\)</li><li data-correct>\(\sqrt{2\delta_cM_{\text{bf}}}\)</li><li>\(M_{\text{bf}}/2\)</li><li>\(\delta_c/M_{\text{bf}}\)</li></ol>
+<div class="explain">Overhead at the optimum is \(\sqrt{2\delta_c/M_{\text{bf}}}\).</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-22" data-topic="§7.6 Preemption">
+<p class="q">With \(\delta_c=60\) s and \(M_{\text{bf}}=3\) h, the optimal checkpoint interval is about:</p>
+<ol class="opts"><li>2 minutes</li><li data-correct>19 minutes</li><li>1.5 hours</li><li>3 hours</li></ol>
+<div class="explain">\(\sqrt{2\times60\times10{,}800}\approx1{,}138\) s.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-23" data-topic="§7.6 Preemption">
+<p class="q">Why do asynchronous checkpoints make training a good "sponge" for spare inference capacity?</p>
+<ol class="opts"><li>They use less storage</li><li data-correct>Low checkpoint cost permits frequent checkpoints, so preemption loses little work</li><li>They avoid preemption</li><li>They speed up GPUs</li></ol>
+<div class="explain">Overhead scales as \(\sqrt{\delta_c}\).</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-24" data-topic="§7.6 Preemption">
+<p class="q">Interruptions from failures every 6 h and reclaims twice a day give a mean time between interruptions of:</p>
+<ol class="opts"><li>12 h</li><li>6 h</li><li data-correct>4 h</li><li>2 h</li></ol>
+<div class="explain">Rates add: 1/6 + 1/12 = 1/4 per hour.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-25" data-topic="§7.6 Preemption">
+<p class="q">Which costs does preempting an inference replica incur? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>In-flight requests unless drained or resumed</li><li data-correct>A cold start if it is rescheduled</li><li>Loss of training progress</li><li data-correct>Capacity loss until replaced</li></ol>
+<div class="explain">Inference has no long-lived training state to lose.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-26" data-topic="§7.7 Sharing">
+<p class="q">Why does sharing an inference cluster with preemptible work raise utilisation so much?</p>
+<ol class="opts"><li>It increases peak demand</li><li data-correct>Inference demand has deep daily troughs that flexible work can fill</li><li>It reduces cold starts</li><li>It removes quotas</li></ol>
+<div class="explain">Average utilisation approaches capacity instead of inference's mean.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-27" data-topic="§7.7 Sharing">
+<p class="q">What determines how much headroom inference needs when it reclaims capacity from borrowers?</p>
+<ol class="opts"><li>The number of teams</li><li data-correct>Preemption notice time plus inference cold-start time, relative to demand growth</li><li>The checkpoint size only</li><li>GPU price</li></ol>
+<div class="explain">Fast preemption and fast cold starts shrink it.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-28" data-topic="§7.7 Sharing">
+<p class="q">Which forms of interference must be managed when training shares a cluster with inference? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Back-end network congestion from all-reduces</li><li data-correct>Shared storage bandwidth</li><li data-correct>Correlated power swings interacting with power capping</li><li>HBM sharing between pods on different GPUs</li></ol>
+<div class="explain">Separate GPUs do not share HBM; the other layers are shared.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-29" data-topic="§7.8 Tools">
+<p class="q">Which tool originated as NVIDIA's open-sourced Run:ai scheduler?</p>
+<ol class="opts"><li>Kueue</li><li>Volcano</li><li data-correct>KAI scheduler</li><li>Slurm</li></ol>
+<div class="explain">Open-sourced in 2025.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-30" data-topic="§7.8 Tools">
+<p class="q">Why are very large GPU fleets usually split into many Kubernetes clusters?</p>
+<ol class="opts"><li>Kubernetes forbids GPUs above 1,000</li><li data-correct>Control-plane scale and scheduler throughput limits, and smaller blast radius</li><li>To simplify billing</li><li>Because DRA requires it</li></ol>
+<div class="explain">A higher layer chooses the cluster for each workload.</div>
+</div>
+
+<div class="mcq" data-id="ci07-mcq-31" data-topic="§7.2 Fragmentation">
+<p class="q">Under packing in Figure 7.2, rejection of 8-GPU jobs becomes noticeable at about what offered load?</p>
+<ol class="opts"><li>30%</li><li>50%</li><li data-correct>80–90%</li><li>It never does</li></ol>
+<div class="explain">1.7% at 80%, 10% at 90%.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci07-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Why can't my 8-GPU job schedule when the cluster shows 40% of GPUs free?</summary>
+<div class="answer">
+<p>Free capacity is fragmented: the free GPUs are spread over many nodes, each with fewer than 8 free, so no single node (and NVLink domain) can host the job. Common causes: spread-style scoring for GPU pods, many small pods, oversized CPU or memory requests stranding GPUs, taints or GPU-type constraints restricting eligible nodes, or quota limits. Fixes: pack small pods (MostAllocated/best fit), segregate whole-node and small workloads, defragment by migrating stateless small pods, align CPU/memory requests to GPUs, and use a topology-aware scheduler with reservation for large jobs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is gang scheduling and why do distributed jobs need it?</summary>
+<div class="answer">
+<p>Scheduling all members of a group simultaneously or none. Distributed training jobs and multi-node replicas are useless unless all pods run. Pod-at-a-time scheduling can place some members and then run out of space, leaving GPUs reserved but idle, and two partially placed gangs can deadlock (hold and wait). Implementations: admission (Kueue reserves the whole workload's quota before creating pods) and pod groups with minimum members (Volcano, KAI, coscheduling plugin). Add reservation and backfill to avoid starving large gangs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Spread or pack: which scoring strategy for GPU pods, and why?</summary>
+<div class="answer">
+<p>Pack. Spreading balances load but scatters small pods so that no node stays wholly free, which blocks whole-node and multi-node jobs; packing keeps free capacity in whole nodes. Achieve fault tolerance by explicit topology spread constraints for replicas of one model across racks and zones, not by spreading every pod. In simulation, spreading rejects more than half of 8-GPU jobs at 50% load while packing rejects almost none below 80%.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-04">
+<summary><span class="lvl core">Core</span> Compute max-min fair shares for three teams on a 1,024-GPU cluster, with and without weights.</summary>
+<div class="answer">
+<p>Demands 200, 500, 800, equal weights: water-fill. Raise all to 200 (600 used); A satisfied. Remaining 424 split between B and C: +212 each → B 412, C 412. Allocation 200/412/412; a fixed third (341) would waste 141 of A's. Weights 1:1:2: allocations rise proportionally; A saturates at 200 with B 200, C 400 (800 used); remaining 224 split 1:2 → B 275, C 549. In practice implement with guaranteed nominal quotas plus borrowing in a cohort, reclaiming by preemption when owners return.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-05">
+<summary><span class="lvl core">Core</span> Derive the optimal checkpoint interval for a training job and apply it.</summary>
+<div class="answer">
+<p>Overhead fraction \(h=\delta_c/\tau_c+\tau_c/(2M_{\text{bf}})\): checkpoint writing plus average half-interval of recomputation per interruption. Minimise: \(\tau_c^*=\sqrt{2\delta_cM_{\text{bf}}}\), \(h^*=\sqrt{2\delta_c/M_{\text{bf}}}\) (Young 1974; Daly 2006 adds restart cost and higher-order terms). For \(\delta_c=60\) s, \(M_{\text{bf}}=3\) h: \(\tau_c^*\approx19\) min, overhead about 10.5%. Asynchronous checkpoints with \(\delta_c=10\) s: about 8 min and 4.3%. Implications: make checkpoints cheap (async to host memory, sharded parallel writes), checkpoint on preemption notice, and include restart time in the cost.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-06">
+<summary><span class="lvl core">Core</span> How would you share a GPU cluster between production inference and training?</summary>
+<div class="answer">
+<p>Priority classes: production inference highest, then batch inference with deadlines, then training, then research. Inference gets a reserved floor (minimum replicas plus failover) that is never lent, and a flexible band that it reclaims as demand rises. Borrowers are preemptible: training with frequent asynchronous checkpoints and graceful preemption notice (or elastic training that shrinks), batch inference that resumes from completed items, RL rollouts. Kueue cohorts or KAI hierarchical queues for quotas and borrowing; gang admission; topology-aware packing. Ensure reclamation is faster than demand growth (short notice, fast cold starts) and isolate network, storage and power interference. Monitor reclaim latency and borrower overhead.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-07">
+<summary><span class="lvl core">Core</span> Why does topology-aware placement matter for inference, and how would you implement it?</summary>
+<div class="answer">
+<p>Communication cost depends on the lowest common ancestor of a job's GPUs: TP within a server or NVL72 domain, EP for multi-node MoE under one leaf or rail group, disaggregated prefill-decode pairs within a network pod. A replica spread across the spine can lose a quarter or more of its throughput from slower, congested links. Implement: model the cluster as a tree (from node labels or DRA topology attributes), round requests to subtree sizes, place each in the smallest free subtree that fits, preferring the most-used parent (buddy/best fit), with gang admission. Use NVLink-domain claims via DRA for GB200, compact placement policies on clouds, and Slurm topology plugins or KAI where available.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-08">
+<summary><span class="lvl core">Core</span> What is dominant resource fairness, and is it needed on GPU clusters?</summary>
+<div class="answer">
+<p>For multiple resources, a party's dominant share is its largest fraction of any resource; DRF applies max-min fairness to dominant shares. It is envy-free, strategy-proof (no gain from misreporting) and gives each at least a 1/n static share (Ghodsi et al., NSDI 2011). On GPU clusters, GPUs are nearly always the dominant resource (pods request CPU and memory in proportion), so DRF reduces to weighted max-min on GPUs—hence quotas in GPUs. It matters where some workloads are CPU- or memory-heavy relative to GPUs (data preprocessing, CPU-only services sharing GPU nodes).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Explain quantitatively why spreading causes fragmentation in a mixed-size workload.</summary>
+<div class="answer">
+<p>Under spreading, each arriving small job goes to the emptiest node, so occupancy is equalised: with \(U\) busy GPUs over \(N\) nodes, each node has about \(U/N\) busy. A whole node is free only if its occupancy fluctuates to zero, which becomes improbable once average occupancy exceeds a GPU or two—so 8-GPU jobs are rejected even at low load (simulation: 57% at 50% offered load; achieved utilisation stalls around 40–58% because rejected large jobs carry much demand). Under best-fit packing, small jobs fill partially used nodes first, so the occupancy distribution is bimodal (full and empty nodes), and the number of empty nodes is roughly the free capacity divided by 8 minus a small remnant; rejection stays negligible until load nears capacity. Formally, packing minimises the increase in fragmentation measure per placement, which is what Alibaba's fragmentation-gradient-descent scheduler optimises explicitly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Reclaims every hour are proposed to give inference more elasticity. What does that cost a 2,048-GPU training job, and what would you suggest instead?</summary>
+<div class="answer">
+<p>Interruption rate becomes failures (say 1/6 per hour) plus 1 per hour: \(M_{\text{bf}}\approx51\) min. With \(\delta_c=10\) s, \(\tau_c^*=\sqrt{2\cdot10\cdot3090}\approx4\) min and overhead \(\sqrt{20/3090}\approx8\%\), plus restart cost (reload, re-form NCCL groups, warm-up), often minutes per interruption: another 5–10%. So 15%+ of a large job lost. Alternatives: reclaim from many small borrowers (batch inference, evaluation, RL rollouts) first; use elastic training that drops data-parallel replicas rather than stopping; give preemption notice so the job checkpoints at the reclaim point (lost work ~0); reclaim at predictable times twice a day; keep a larger reserved floor and a small on-demand buffer; speed inference cold starts so less reclaim lead time is needed.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> How do you prevent large gangs from starving in a shared queue, without wasting capacity?</summary>
+<div class="answer">
+<p>Reservation: when a large gang reaches the head of the queue (or has waited past a threshold), the scheduler reserves nodes as they free up, accumulating capacity for it rather than giving each freed node to the next small job. Backfill: while accumulating, allow small jobs onto reserved nodes if their (estimated or declared) runtime ends before the projected start of the gang. Combine with priority ageing, per-queue fairness, topology-aware reservation (accumulate within one subtree), and possibly preemption of borrowers. For inference scale-ups (time-critical), avoid the shared queue: keep explicitly reserved capacity or a high-priority class with preemption.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-12">
+<summary><span class="lvl design">Design</span> Design the scheduling policy for a 10,000-GPU cluster used by inference, fine-tuning customers, internal training and research.</summary>
+<div class="answer">
+<p>Clusters partitioned for control-plane scale and blast radius, each with Kueue or KAI over Kubernetes with DRA. Queues: production inference (reserved floor per model plus failover, highest priority, can preempt all borrowers); customer fine-tuning (contracted quotas with SLAs, preemptible only above contract); internal training (large nominal quota, borrowing, asynchronous checkpoints, preemption notice); research (best-effort, weighted fair share). Cohorts allow borrowing idle quota; reclamation order: research → training above quota → batch. Placement: packing, topology-aware buddy allocation within leaves/NVL72 domains, gang admission, reservation with backfill for large training. Size segregation: MIG-sliced node pool for small models and notebooks. Monitoring: fragmentation, queue wait by class, reclaim latency, preemption overhead, utilisation by class; feedback into quota planning.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-13">
+<summary><span class="lvl design">Design</span> The inference autoscaler sometimes cannot get GPUs in the morning even though training "should" yield them. Investigate and redesign.</summary>
+<div class="answer">
+<p>Investigate: preemption notice times and how long victims take to release GPUs (slow checkpoint, slow drain); whether reclaimed GPUs are in the right shape and place (fragmented single GPUs vs whole nodes, wrong topology for multi-node replicas); quota/priority configuration (is inference allowed to preempt this borrower?); scheduler throughput and gang admission delays; cold-start times after placement. Redesign: forecast the ramp and start reclaiming ahead of it; make borrowers release whole nodes and aligned blocks; reduce notice to what asynchronous checkpoints need; reserve a buffer that is never lent; give inference a priority class with preemption rights; speed cold starts (Chapter 5); measure "time from scale request to serving" as an SLO.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-14">
+<summary><span class="lvl core">Core</span> Compare Kubernetes with Kueue, Volcano, KAI and Slurm for AI scheduling.</summary>
+<div class="answer">
+<p>Default Kubernetes scheduler: pod-at-a-time filter-and-score, no gangs, limited GPU awareness. Kueue: queueing, quotas, cohorts with borrowing, all-or-nothing admission, preemption; delegates placement to the scheduler. Volcano: full batch scheduler with pod groups, gang scheduling, queues and fair share. KAI (NVIDIA, from Run:ai): hierarchical queues, fair share, GPU-aware bin packing, gang and topology-aware scheduling, GPU sharing. Slurm: HPC standard with mature gang scheduling, backfill, topology plugins, fair-share accounting; not container-native, but can run on Kubernetes (Slinky). Choose by workload mix and team skills: Kubernetes + Kueue/KAI for mixed serving and training; Slurm for large training-centric clusters.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> How much is filling inference troughs worth, and what limits it?</summary>
+<div class="answer">
+<p>Value: integrate the gap between provisioned peak capacity and inference's use over the day. For Atlas's 70B tier (2,500 GPUs at peak, about 1,150 at trough, reserved floor 1,300), about 900 GPUs on average, 21,600 GPU-hours/day, roughly $20M/year at $2.50/GPU-h. Limits: reclamation latency (notice + release + cold start must beat demand growth, so a buffer stays idle), borrower overhead (checkpoints, restarts), interference (network, storage, power), suitability (borrowers must be preemptible and placeable in released shapes), and demand for flexible work (there must be enough batch, training or rollouts to absorb the capacity, ideally work that would otherwise be bought).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci07-qa-16">
+<summary><span class="lvl core">Core</span> What metrics would you put on a GPU cluster scheduling dashboard?</summary>
+<div class="answer">
+<p>Allocation and utilisation by class and team (allocated vs actually busy via DCGM SM activity); fragmentation (free GPUs unusable for 8-GPU and multi-node requests; number of wholly free nodes and aligned blocks); queue wait time distributions by class and job size; gang admission latency; placement quality (fraction of multi-node jobs under one leaf/domain); preemptions per hour, reclaim latency (request to GPUs free), borrower overhead; quota usage and borrowing; scheduler throughput and latency; failed or pending pods by reason. These separate "we need more GPUs" from "we are using them badly".</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-philly">M. Jeon et al. Analysis of Large-Scale Multi-Tenant GPU Clusters for DNN Training Workloads (Philly). <em>USENIX ATC</em>, 2019. <a href="https://arxiv.org/abs/1901.05758">arXiv:1901.05758</a>.</li>
+<li id="r-pai">Q. Weng et al. MLaaS in the Wild: Workload Analysis and Scheduling in Large-Scale Heterogeneous GPU Clusters. <em>NSDI</em>, 2022.</li>
+<li id="r-fgd">Q. Weng et al. Beware of Fragmentation: Scheduling GPU-Sharing Workloads with Fragmentation Gradient Descent. <em>USENIX ATC</em>, 2023.</li>
+<li id="r-drf">A. Ghodsi et al. Dominant Resource Fairness: Fair Allocation of Multiple Resource Types. <em>NSDI</em>, 2011.</li>
+<li>R. Grandl et al. Multi-Resource Packing for Cluster Schedulers (Tetris). <em>SIGCOMM</em>, 2014.</li>
+<li>J. K. Ousterhout. Scheduling Techniques for Concurrent Systems. <em>ICDCS</em>, 1982.</li>
+<li>J. W. Young. A first order approximation to the optimum checkpoint interval. <em>Communications of the ACM</em> 17(9), 1974.</li>
+<li>J. T. Daly. A higher order estimate of the optimum checkpoint interval for restart dumps. <em>Future Generation Computer Systems</em> 22(3), 2006.</li>
+<li>K. C. Knowlton. A Fast Storage Allocator (the buddy system). <em>Communications of the ACM</em> 8(10), 1965.</li>
+<li>W. Xiao et al. Gandiva: Introspective Cluster Scheduling for Deep Learning. <em>OSDI</em>, 2018.</li>
+<li>A. Qiao et al. Pollux: Co-adaptive Cluster Scheduling for Goodput-Optimized Deep Learning. <em>OSDI</em>, 2021. <a href="https://arxiv.org/abs/2008.12260">arXiv:2008.12260</a>.</li>
+<li>A. B. Yoo, M. A. Jette, M. Grondona. SLURM: Simple Linux Utility for Resource Management. <em>JSSPP</em>, 2003.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>
