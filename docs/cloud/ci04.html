@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 4 · Datacenter Networks for AI — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 4 of Cloud AI Infrastructure: front-end and back-end networks, Clos and fat-tree topology mathematics, rail-optimised designs, RDMA over InfiniBand, RoCE and cloud fabrics, ECMP collisions and congestion, scale-up versus scale-out domains, and what LLM inference needs from the network.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci04" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part I · The Physical Cloud — Chapter 4</div>
+<h1 id="top">Datacenter Networks for AI</h1>
+<p class="lede">An AI cluster is thousands of accelerators that must behave, for some purposes, as one machine. What makes that possible is the network: a hierarchy of switches and cables, carrying RDMA traffic at hundreds of gigabits per second per GPU, arranged in topologies whose properties can be derived exactly. This chapter explains the two networks of an AI datacenter, the mathematics of fat trees and rail-optimised designs, the transports that move bytes between GPUs without involving their CPUs, why flows collide and how that halves throughput, the boundary between scale-up and scale-out, and what inference—as opposed to training—asks of the network.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Volume I treated the network as a pair of numbers. In Vol. I Chapter 17 we modelled a link by a latency \(\alpha\) and a bandwidth \(\beta_{\text{link}}\), derived the cost of ring and tree all-reduces, and observed that NVLink inside a server is about nine times faster than the network between servers. In Vol. I Chapter 13 we needed the per-GPU network bandwidth \(\beta_{\text{net}}\) to decide whether moving a KV cache between prefill and decode machines was cheap enough. Those models assumed that the network delivers its rated bandwidth to every pair of GPUs that wants it. Real networks do not. Whether they come close depends on how the switches are wired, how traffic is spread over the wires, and how the transport reacts when two flows want the same wire.</p>
+<p>The network is also one of the most expensive parts of an AI cluster—optics, switches and cabling commonly account for 10–20% of its capital cost—and one of the hardest to operate, because its failures are partial and its performance problems look like slow GPUs. Infrastructure interviews ask about it directly ("how many switches does a 16,000-GPU cluster need?", "what is a rail-optimised topology?", "why do we use RDMA?", "RoCE or InfiniBand?") and indirectly, whenever a design moves data between machines.</p>
+<p>We begin by separating the networks an AI datacenter contains (§4.1). We then derive how large non-blocking networks are built from small switches—Clos networks and fat trees—and what they cost (§4.2), and how the rail-optimised designs used in AI clusters exploit the structure of GPU traffic (§4.3). We explain the transports, RDMA over InfiniBand, RoCE and cloud-specific fabrics (§4.4), and then the central performance problem of these networks, congestion and the collisions of hashed flows, which we analyse quantitatively (§4.5). We contrast scale-up and scale-out domains (§4.6), catalogue what inference needs from the network (§4.7), and close with the front-end network and its costs (§4.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Distinguish the front-end, back-end, scale-up and management networks of an AI datacenter and the traffic each carries.</li>
+<li>Derive the number of hosts and switches in two- and three-tier Clos (fat-tree) networks from the switch radix, and define bisection bandwidth and oversubscription.</li>
+<li>Explain rail-optimised and rail-only topologies and why they suit GPU traffic.</li>
+<li>Explain RDMA, and compare InfiniBand, RoCEv2 and cloud transports (EFA/SRD) in reliability, congestion control and operational burden.</li>
+<li>Quantify the throughput lost to ECMP hash collisions for synchronous collectives and list the remedies.</li>
+<li>Decide which parallelism and data movement belong on scale-up versus scale-out links, and estimate the network load of disaggregation, expert parallelism and weight loading.</li>
+</ol>
+<p class="small muted">Uses: collectives and the α–β model (Vol. I Chapter 17), parallelism (Vol. I Chapter 18), disaggregation and KV transfer (Vol. I Chapter 13), MoE expert parallelism (Vol. I Chapter 19), and Chapters 1–3 of this volume.</p>
+</div>
+
+<h2 id="s4-1">4.1 Two networks, and two more</h2>
+<p>A conventional datacenter has one network: Ethernet links from every server to a top-of-rack switch, and a hierarchy of switches above, carrying TCP/IP traffic between servers and to the internet. An AI datacenter keeps that network and adds another, and the reason is a difference in what the traffic needs. Ordinary traffic—API requests, database queries, storage reads—consists of many small, independent flows that tolerate occasional delays and losses, and a server's share of the network is perhaps 25–100 Gb/s. GPU-to-GPU traffic consists of a few enormous, synchronised transfers: a collective in which every GPU sends gigabytes at once, all of which must finish before any GPU can continue. It needs an order of magnitude more bandwidth per server, very low and predictable latency, and no packet loss, since a lost packet stalls a whole collective.</p>
+<p>The result is the arrangement of Figure 4.1. The <strong>front-end network</strong> is the ordinary datacenter Ethernet: it connects each server through one or two NICs at 100–400 Gb/s to the rest of the provider's network, and carries user requests and responses, storage traffic (model weights from object storage, logs), control-plane traffic and anything to and from the internet. The <strong>back-end network</strong>, also called the compute fabric or the GPU fabric, connects each GPU through its own NIC at 400–800 Gb/s to a separate, isolated set of switches, and carries only accelerator traffic: collectives, pipeline activations, KV-cache transfers, expert-parallel dispatch. Inside each server or rack, the <strong>scale-up network</strong>—NVLink and NVSwitch, or a TPU's inter-chip interconnect—joins accelerators at several times the back-end bandwidth. And a slow <strong>out-of-band management network</strong> reaches every server's baseboard management controller, so that machines can be powered, reimaged and diagnosed even when everything else is broken.</p>
+
+<figure class="diagram" id="fig-4-1">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="The four networks of an AI datacenter">
+<rect x="20" y="20" width="680" height="54" rx="10" class="bx4"/>
+<text x="360" y="42" text-anchor="middle" class="t-sm t-b">Front-end network (Ethernet, TCP/IP): requests, storage, control plane, internet</text>
+<text x="360" y="60" text-anchor="middle" class="t-xs">100–400 Gb/s per server · many small flows · loss tolerated, retransmitted</text>
+<rect x="20" y="222" width="680" height="54" rx="10" class="bx2"/>
+<text x="360" y="244" text-anchor="middle" class="t-sm t-b">Back-end network (InfiniBand, RoCE, EFA): GPU-to-GPU across servers (scale-out)</text>
+<text x="360" y="262" text-anchor="middle" class="t-xs">400–800 Gb/s per GPU · few huge synchronised flows · lossless or loss-tolerant RDMA</text>
+<g>
+<rect x="60" y="100" width="180" height="96" rx="8" class="bx"/><text x="150" y="118" text-anchor="middle" class="t-xs t-b">server A</text>
+<rect x="75" y="128" width="150" height="28" rx="5" class="bx3"/><text x="150" y="146" text-anchor="middle" class="t-xs">8 GPUs on NVSwitch</text>
+<text x="150" y="176" text-anchor="middle" class="t-xs">scale-up: 450–900 GB/s per GPU</text>
+<rect x="270" y="100" width="180" height="96" rx="8" class="bx"/><text x="360" y="118" text-anchor="middle" class="t-xs t-b">server B</text>
+<rect x="285" y="128" width="150" height="28" rx="5" class="bx3"/><text x="360" y="146" text-anchor="middle" class="t-xs">8 GPUs on NVSwitch</text>
+<text x="360" y="176" text-anchor="middle" class="t-xs">scale-up: 450–900 GB/s per GPU</text>
+<rect x="480" y="100" width="180" height="96" rx="8" class="bx"/><text x="570" y="118" text-anchor="middle" class="t-xs t-b">server C</text>
+<rect x="495" y="128" width="150" height="28" rx="5" class="bx3"/><text x="570" y="146" text-anchor="middle" class="t-xs">8 GPUs on NVSwitch</text>
+<text x="570" y="176" text-anchor="middle" class="t-xs">scale-up: 450–900 GB/s per GPU</text>
+</g>
+<line x1="150" y1="74" x2="150" y2="100" class="ln"/><line x1="360" y1="74" x2="360" y2="100" class="ln"/><line x1="570" y1="74" x2="570" y2="100" class="ln"/>
+<line x1="110" y1="196" x2="110" y2="222" class="ln ln-s2"/><line x1="150" y1="196" x2="150" y2="222" class="ln ln-s2"/><line x1="190" y1="196" x2="190" y2="222" class="ln ln-s2"/>
+<line x1="320" y1="196" x2="320" y2="222" class="ln ln-s2"/><line x1="360" y1="196" x2="360" y2="222" class="ln ln-s2"/><line x1="400" y1="196" x2="400" y2="222" class="ln ln-s2"/>
+<line x1="530" y1="196" x2="530" y2="222" class="ln ln-s2"/><line x1="570" y1="196" x2="570" y2="222" class="ln ln-s2"/><line x1="610" y1="196" x2="610" y2="222" class="ln ln-s2"/>
+<text x="680" y="150" text-anchor="end" class="t-xs">+ out-of-band</text>
+<text x="680" y="164" text-anchor="end" class="t-xs">management</text>
+</svg>
+<figcaption><b>Figure 4.1 — An AI datacenter's networks.</b> Each server has one or two front-end NICs and one back-end NIC per GPU (three drawn per server for clarity). The back-end is physically separate from the front-end, so collectives never compete with API traffic. NVLink inside the server is the fastest path of all.</figcaption>
+</figure>
+
+<p>The separation of front-end and back-end is not merely tidy. It isolates the performance-critical, loss-intolerant GPU traffic from the bursty, loss-tolerant general traffic; it lets each network use the transport and congestion control that suit its traffic; and it limits the blast radius of failures and attacks, since the back-end is reachable only from GPU NICs. The cost is two sets of switches and cables, and the back-end set is much the larger: with one 400 Gb/s NIC per GPU, a 16,000-GPU cluster has 6.4 Pb/s of back-end injection bandwidth, more than the front-end networks of many entire datacenters. How such a network is built from switches of a few dozen ports each is a beautiful piece of combinatorics.</p>
+
+<h2 id="s4-2">4.2 Building a large switch from small ones: Clos networks and fat trees</h2>
+<p>The ideal network for a cluster would be a single switch with one port per GPU, through which any GPU could send to any other at full rate, whatever the other GPUs were doing. No such switch exists for thousands of ports: a single switch chip of 2024–2025 has a total capacity of about 51.2 Tb/s, which is 64 ports at 800 Gb/s or 128 at 400 Gb/s. The number of ports on a switch is its <strong>radix</strong>, \(k_{\text{sw}}\). The question is how to wire many radix-\(k_{\text{sw}}\) switches together so that the whole behaves like one large switch.</p>
+<p>The answer dates from 1953, when Charles Clos, an engineer at Bell Labs, showed how to build large telephone exchanges from small crossbar switches arranged in stages. A <strong>Clos network</strong> has an input stage, a middle stage and an output stage of small switches, with every input-stage switch connected to every middle-stage switch, and every middle-stage switch to every output-stage switch. Clos proved that if each input switch has \(n\) inputs and there are at least \(2n-1\) middle switches, any idle input can always be connected to any idle output without disturbing existing connections; Beneš later showed that \(n\) middle switches suffice if existing connections may be rearranged. Modern packet-switched datacenter networks are "folded" Clos networks, in which the input and output stages are the same physical switches, and they are usually called <strong>leaf–spine</strong> or <strong>fat-tree</strong> networks.</p>
+<p>Figure 4.2 shows the simplest case, a two-tier leaf–spine network. Each <strong>leaf</strong> switch (also called top-of-rack or tier-1) uses half of its ports for hosts and half for links up to spines. Each <strong>spine</strong> switch connects to every leaf. If every leaf has \(k_{\text{sw}}/2\) uplinks, one to each of \(k_{\text{sw}}/2\) spines, and every spine has \(k_{\text{sw}}\) ports, one to each of \(k_{\text{sw}}\) leaves, the network has \(k_{\text{sw}}\) leaves, \(k_{\text{sw}}/2\) spines and \(k_{\text{sw}}\cdot k_{\text{sw}}/2\) host ports.</p>
+
+<figure class="diagram" id="fig-4-2">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="A two-tier leaf-spine network">
+<g>
+<rect x="150" y="25" width="90" height="34" rx="6" class="bx4"/><text x="195" y="47" text-anchor="middle" class="t-xs t-b">spine 1</text>
+<rect x="315" y="25" width="90" height="34" rx="6" class="bx4"/><text x="360" y="47" text-anchor="middle" class="t-xs t-b">spine 2</text>
+<rect x="480" y="25" width="90" height="34" rx="6" class="bx4"/><text x="525" y="47" text-anchor="middle" class="t-xs t-b">spine k/2</text>
+</g>
+<g>
+<rect x="40" y="140" width="100" height="34" rx="6" class="bx"/><text x="90" y="162" text-anchor="middle" class="t-xs t-b">leaf 1</text>
+<rect x="190" y="140" width="100" height="34" rx="6" class="bx"/><text x="240" y="162" text-anchor="middle" class="t-xs t-b">leaf 2</text>
+<rect x="430" y="140" width="100" height="34" rx="6" class="bx"/><text x="480" y="162" text-anchor="middle" class="t-xs t-b">leaf k−1</text>
+<rect x="580" y="140" width="100" height="34" rx="6" class="bx"/><text x="630" y="162" text-anchor="middle" class="t-xs t-b">leaf k</text>
+<text x="360" y="162" text-anchor="middle" class="t-sm">· · ·</text>
+</g>
+<g class="ln">
+<line x1="90" y1="140" x2="195" y2="59" class="ln"/><line x1="90" y1="140" x2="360" y2="59" class="ln"/><line x1="90" y1="140" x2="525" y2="59" class="ln"/>
+<line x1="240" y1="140" x2="195" y2="59" class="ln"/><line x1="240" y1="140" x2="360" y2="59" class="ln"/><line x1="240" y1="140" x2="525" y2="59" class="ln"/>
+<line x1="480" y1="140" x2="195" y2="59" class="ln"/><line x1="480" y1="140" x2="360" y2="59" class="ln"/><line x1="480" y1="140" x2="525" y2="59" class="ln"/>
+<line x1="630" y1="140" x2="195" y2="59" class="ln"/><line x1="630" y1="140" x2="360" y2="59" class="ln"/><line x1="630" y1="140" x2="525" y2="59" class="ln"/>
+</g>
+<g>
+<rect x="40" y="205" width="100" height="26" rx="4" class="bx3"/><text x="90" y="222" text-anchor="middle" class="t-xs">k/2 GPUs</text>
+<rect x="190" y="205" width="100" height="26" rx="4" class="bx3"/><text x="240" y="222" text-anchor="middle" class="t-xs">k/2 GPUs</text>
+<rect x="430" y="205" width="100" height="26" rx="4" class="bx3"/><text x="480" y="222" text-anchor="middle" class="t-xs">k/2 GPUs</text>
+<rect x="580" y="205" width="100" height="26" rx="4" class="bx3"/><text x="630" y="222" text-anchor="middle" class="t-xs">k/2 GPUs</text>
+</g>
+<line x1="90" y1="174" x2="90" y2="205" class="ln ln-s3"/><line x1="240" y1="174" x2="240" y2="205" class="ln ln-s3"/><line x1="480" y1="174" x2="480" y2="205" class="ln ln-s3"/><line x1="630" y1="174" x2="630" y2="205" class="ln ln-s3"/>
+<text x="360" y="255" text-anchor="middle" class="t-xs">Each leaf: k/2 ports down to hosts, k/2 up (one per spine). Each spine: k ports, one per leaf. Hosts: k²/2.</text>
+<text x="20" y="38" class="t-xs">any two leaves are</text>
+<text x="20" y="52" class="t-xs">joined via every spine</text>
+</svg>
+<figcaption><b>Figure 4.2 — A two-tier leaf–spine (folded Clos) network.</b> Traffic between hosts on different leaves goes up to any spine and down again, so there are \(k_{\text{sw}}/2\) equal-cost paths between any two leaves. With as many uplinks as downlinks, the network is non-blocking: any permutation of host-to-host traffic can, in principle, run at full rate.</figcaption>
+</figure>
+
+<p>Figure 4.2's key property is that every pair of leaves is joined through every spine, by \(k_{\text{sw}}/2\) distinct paths of two hops each. If the leaves have as much uplink capacity as host capacity, the network can carry any pattern in which each host sends and receives at most its link rate—provided the traffic is spread evenly over the paths. To grow beyond \(k_{\text{sw}}^2/2\) hosts, we add a tier. In the three-tier <strong>fat tree</strong> of Al-Fares, Loukissas and Vahdat (2008), switches are grouped into <em>pods</em>: each pod is a two-tier network of \(k_{\text{sw}}/2\) leaves and \(k_{\text{sw}}/2\) aggregation switches, and the pods are joined by a layer of core switches<span class="cite"><a href="#r-fattree">[1]</a></span>.</p>
+
+<div class="box thm">
+<div class="box-title">Proposition 4.1 — Size of non-blocking Clos networks</div>
+<p>Built from switches of radix \(k_{\text{sw}}\) with half of each lower-tier switch's ports facing down, a non-blocking two-tier leaf–spine network supports \(k_{\text{sw}}^2/2\) hosts using \(3k_{\text{sw}}/2\) switches, and a three-tier fat tree supports \(k_{\text{sw}}^3/4\) hosts using \(5k_{\text{sw}}^2/4\) switches.</p>
+<p><em>Proof.</em> Two tiers: each spine has \(k_{\text{sw}}\) ports, one per leaf, so there are \(k_{\text{sw}}\) leaves; each leaf has \(k_{\text{sw}}/2\) uplinks, one per spine, so there are \(k_{\text{sw}}/2\) spines; hosts are \(k_{\text{sw}}\cdot k_{\text{sw}}/2\); switches \(k_{\text{sw}}+k_{\text{sw}}/2\). Three tiers: a pod has \(k_{\text{sw}}/2\) leaves, each with \(k_{\text{sw}}/2\) hosts, so \(k_{\text{sw}}^2/4\) hosts and \(k_{\text{sw}}\) switches. Each aggregation switch has \(k_{\text{sw}}/2\) uplinks, so a pod has \(k_{\text{sw}}^2/4\) uplinks; each core switch has one link to each pod, so there are \(k_{\text{sw}}\) pods and \(k_{\text{sw}}^2/4\) core switches. Hosts: \(k_{\text{sw}}\cdot k_{\text{sw}}^2/4\); switches: \(k_{\text{sw}}\cdot k_{\text{sw}}+k_{\text{sw}}^2/4=5k_{\text{sw}}^2/4\). \(\square\)</p>
+</div>
+
+<p>Proposition 4.1 turns network design into arithmetic. With 64-port switches at 400 Gb/s (InfiniBand NDR generation), two tiers reach 2,048 GPUs and three tiers 65,536. With 128-port switches, two tiers reach 8,192 and three tiers more than half a million. Figure 4.3 plots these limits. Because each tier adds latency, cost and failure points, designers use the fewest tiers that reach the cluster size, which is one reason switch radix is the most important property of a switch chip.</p>
+
+<figure class="chart" id="fig-4-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Hosts (GPUs) in a non-blocking Clos network against switch radix","height":320,
+ "x":{"label":"Switch radix k (ports per switch, log)","log":true,"min":28,"max":290,"ticks":[32,64,128,256]},
+ "y":{"label":"Maximum hosts (log)","log":true,"min":300,"max":6000000,"ticks":[1000,10000,100000,1000000]},
+ "series":[
+  {"name":"Two tiers: k²/2","color":"s1","points":[[32,512],[64,2048],[128,8192],[256,32768]]},
+  {"name":"Three tiers: k³/4","color":"s2","points":[[32,8192],[64,65536],[128,524288],[256,4194304]]}
+ ],
+ "hlines":[{"y":16384,"text":"16,384 GPUs"},{"y":100000,"text":"100,000 GPUs"}]}
+</script>
+<figcaption><b>Figure 4.3 — Radix determines how many tiers a cluster needs.</b> A 16,384-GPU cluster needs three tiers with 64-port switches but only two with 256-port switches (if they existed at the required speed). Each extra tier multiplies switch and optics count.</figcaption>
+</figure>
+
+<p>Two further quantities describe a network's capability. Its <strong>bisection bandwidth</strong> is the minimum, over all ways of cutting the hosts into two equal halves, of the total bandwidth of the links crossing the cut. A non-blocking fat tree of \(H\) hosts with link rate \(r\) has bisection bandwidth \(Hr/2\): half the hosts can send to the other half at full rate. Its <strong>oversubscription ratio</strong> is the ratio of downlink to uplink capacity at a tier: a leaf with 48 host ports and 16 uplinks of the same speed is 3:1 oversubscribed, so hosts under it can together send only a third of their capacity off the leaf. Front-end networks are routinely oversubscribed 3:1 or more, because general traffic rarely uses full rate everywhere at once. AI back-end networks are usually built non-blocking (1:1), because collectives do use full rate everywhere at once—though, as the next section shows, the structure of GPU traffic allows some savings.</p>
+<p>Cost scales with the number of links, and every link above the leaf is an optical cable with a transceiver at each end. A non-blocking three-tier fat tree has, per host, one host link plus two links per host at each higher tier boundary, so roughly five transceivers per GPU; at several hundred dollars to over a thousand dollars per 800 Gb/s transceiver, optics alone can cost thousands of dollars per GPU, and the optics also draw power (about 15 W per 800 Gb/s module) and fail more often than any other network component. Reducing tiers and links is therefore worth real money, and GPU traffic patterns make that possible.</p>
+
+<details class="drill">
+<summary>Drill 4.1 — Switches for a 16,384-GPU cluster</summary>
+<p>Design a non-blocking back-end for 16,384 GPUs with 64-port switches. How many tiers, pods and switches are needed, and how many host-facing and switch-to-switch links?</p>
+<p><em>Solution.</em> Two tiers support only 2,048 hosts, so three tiers are needed; a full three-tier fat tree with \(k_{\text{sw}}=64\) supports 65,536, so we build a partial one with \(16{,}384/(64^2/4)=16\) pods. Each pod has 32 leaves and 32 aggregation switches (1,024 hosts); 16 pods give 1,024 switches. Each aggregation switch has 32 uplinks, so 16 pods have \(16\times32\times32=16{,}384\) uplinks; each core switch takes one link from each of the 16 pods per port group—with 64 ports, each core switch can connect to 16 pods with 4 links each, so \(16{,}384/64=256\) core switches. Total about 1,280 switches. Links: 16,384 host links, 16,384 leaf–aggregation links and 16,384 aggregation–core links, about 49,000 links in all, three per GPU, two of them optical between racks.</p>
+</details>
+
+<h2 id="s4-3">4.3 Rail-optimised topologies</h2>
+<p>The fat tree treats all hosts alike, but GPUs in an AI cluster are not alike: each sits in a server with seven siblings joined by NVLink. Collective libraries such as NCCL exploit this structure hierarchically. An all-reduce across 1,024 GPUs in 128 servers is performed as a reduce-scatter inside each server over NVLink, then an all-reduce across servers between GPUs with the same local index—GPU 0 of every server with GPU 0 of every other, GPU 1 with GPU 1, and so on—and finally an all-gather inside each server (Vol. I §17.6). In the middle phase, GPU \(i\) of one server talks only to GPU \(i\) of other servers.</p>
+<p>A <strong>rail-optimised</strong> topology wires the network to match. The back-end NIC of GPU \(i\) in every server connects to leaf switch \(i\) of its group, called <em>rail</em> \(i\). Figure 4.4 shows the idea for eight-GPU servers: eight rails, each a leaf (or a small group of leaves) collecting the same-index GPUs of many servers. Same-rail traffic—the bulk of a hierarchical collective—crosses only one switch. Traffic between different rails, which occurs when GPU \(i\) of one server must reach GPU \(j\neq i\) of another, can either cross the spine, or first move over NVLink inside the source server to its GPU \(j\) and then travel on rail \(j\), a trick that NCCL and NVIDIA's "PXN" feature perform automatically.</p>
+
+<figure class="diagram" id="fig-4-4">
+<svg class="dg" viewBox="0 0 720 280" role="img" aria-label="Rail-optimised topology">
+<rect x="20" y="25" width="680" height="34" rx="6" class="bx4"/><text x="360" y="47" text-anchor="middle" class="t-xs t-b">spine tier (only for cross-rail traffic and beyond the rail group; can be thin or absent in "rail-only")</text>
+<g>
+<rect x="40" y="95" width="70" height="32" rx="5" class="bx2"/><text x="75" y="115" text-anchor="middle" class="t-xs t-b">rail 0</text>
+<rect x="123" y="95" width="70" height="32" rx="5" class="bx2"/><text x="158" y="115" text-anchor="middle" class="t-xs t-b">rail 1</text>
+<rect x="206" y="95" width="70" height="32" rx="5" class="bx2"/><text x="241" y="115" text-anchor="middle" class="t-xs t-b">rail 2</text>
+<text x="320" y="115" text-anchor="middle" class="t-sm">· · ·</text>
+<rect x="365" y="95" width="70" height="32" rx="5" class="bx2"/><text x="400" y="115" text-anchor="middle" class="t-xs t-b">rail 7</text>
+</g>
+<line x1="75" y1="95" x2="75" y2="59" class="ln"/><line x1="158" y1="95" x2="158" y2="59" class="ln"/><line x1="241" y1="95" x2="241" y2="59" class="ln"/><line x1="400" y1="95" x2="400" y2="59" class="ln"/>
+<rect x="30" y="172" width="415" height="40" rx="6" class="bx"/><text x="300" y="196" class="t-xs">server 1</text>
+<rect x="30" y="226" width="415" height="40" rx="6" class="bx"/><text x="300" y="250" class="t-xs">server 2</text>
+<g>
+<rect x="55" y="180" width="40" height="24" rx="4" class="bx3"/><text x="75" y="196" text-anchor="middle" class="t-xs">GPU0</text>
+<rect x="138" y="180" width="40" height="24" rx="4" class="bx3"/><text x="158" y="196" text-anchor="middle" class="t-xs">GPU1</text>
+<rect x="221" y="180" width="40" height="24" rx="4" class="bx3"/><text x="241" y="196" text-anchor="middle" class="t-xs">GPU2</text>
+<rect x="380" y="180" width="40" height="24" rx="4" class="bx3"/><text x="400" y="196" text-anchor="middle" class="t-xs">GPU7</text>
+<rect x="55" y="234" width="40" height="24" rx="4" class="bx3"/><text x="75" y="250" text-anchor="middle" class="t-xs">GPU0</text>
+<rect x="138" y="234" width="40" height="24" rx="4" class="bx3"/><text x="158" y="250" text-anchor="middle" class="t-xs">GPU1</text>
+<rect x="221" y="234" width="40" height="24" rx="4" class="bx3"/><text x="241" y="250" text-anchor="middle" class="t-xs">GPU2</text>
+<rect x="380" y="234" width="40" height="24" rx="4" class="bx3"/><text x="400" y="250" text-anchor="middle" class="t-xs">GPU7</text>
+</g>
+<g>
+<line x1="75" y1="127" x2="75" y2="180" class="ln ln-s2"/><path d="M60,127 L48,150 L48,246 L55,246" class="ln ln-s2" fill="none"/>
+<line x1="158" y1="127" x2="158" y2="180" class="ln ln-s3"/><path d="M143,127 L131,150 L131,246 L138,246" class="ln ln-s3" fill="none"/>
+<line x1="241" y1="127" x2="241" y2="180" class="ln ln-acc"/><path d="M226,127 L214,150 L214,246 L221,246" class="ln ln-acc" fill="none"/>
+<line x1="400" y1="127" x2="400" y2="180" class="ln"/><path d="M385,127 L373,150 L373,246 L380,246" class="ln" fill="none"/>
+</g>
+<text x="470" y="105" class="t-xs t-b">Rail i joins GPU i of every server.</text>
+<text x="470" y="125" class="t-xs">Hierarchical collectives: NVLink inside</text>
+<text x="470" y="140" class="t-xs">each server, then same-index GPUs</text>
+<text x="470" y="155" class="t-xs">across servers—one switch hop.</text>
+<text x="470" y="180" class="t-xs">Cross-rail traffic (GPU i → GPU j):</text>
+<text x="470" y="195" class="t-xs">hop over NVLink to local GPU j first,</text>
+<text x="470" y="210" class="t-xs">then use rail j ("PXN"), or cross</text>
+<text x="470" y="225" class="t-xs">the spine.</text>
+</svg>
+<figcaption><b>Figure 4.4 — A rail-optimised back-end.</b> Each colour is a rail: the leaf (or leaf group) that collects GPU \(i\) of every server. Most collective traffic stays within a rail, so it crosses one switch instead of three, and the spine can be thinner than in a generic fat tree.</figcaption>
+</figure>
+
+<p>Rail optimisation has three benefits. It shortens the common path to a single hop, lowering latency and the number of links each byte crosses. It concentrates traffic where it can be predicted, so congestion in the spine—the subject of §4.5—affects only the minority of cross-rail traffic. And it opens the door to removing most of the spine. Wang and colleagues analysed the traffic of large-model training in 2023 and found that with rail-optimised placement almost all of it stayed within rails, so a <strong>rail-only</strong> network, with no spine at all and cross-rail traffic forwarded over NVLink, matched the performance of a full fat tree while cutting network cost by 38–77% and power by 37–75%<span class="cite"><a href="#r-railonly">[2]</a></span>. Large production clusters, including Meta's 24,000-GPU training clusters, use rail-optimised designs.</p>
+<p>The benefit depends on the traffic, and inference traffic is not the same as training traffic. A training job is one large, regular program whose collectives map neatly onto rails. An inference cluster runs many independent replicas, and its cross-server traffic—KV transfers from a prefill server to a decode server, expert-parallel dispatch to whichever GPU hosts an expert, weight streaming from a cache—goes from GPU \(i\) of one server to GPU \(j\) of another, chosen by a scheduler. For such traffic the spine matters, and inference back-ends that support disaggregation or wide expert parallelism need a capable spine or careful rail-aware placement. Whatever the topology, the bytes must be moved by a transport, and the transports used in AI are unlike ordinary TCP.</p>
+
+<h2 id="s4-4">4.4 Moving bytes without the CPU: RDMA, InfiniBand, RoCE and cloud fabrics</h2>
+<p>In ordinary networking, sending data from one server's memory to another's involves both operating systems: the sender copies data from the application into kernel buffers, the kernel's TCP stack segments it into packets, the receiving kernel reassembles them and copies them into the receiving application's memory, and both CPUs handle interrupts along the way. At 400 Gb/s per GPU and eight GPUs per server, this would consume many CPU cores just moving bytes, and it would add tens of microseconds of software latency per message. Accelerator networks avoid it with <strong>remote direct memory access</strong> (RDMA).</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — RDMA as a remote write to a registered region</div>
+<p>RDMA lets a program on machine A read or write a region of machine B's memory directly through the network interface cards, without involving B's CPU or either operating system on the data path. The model is simple. Each side first <em>registers</em> a memory region with its NIC, which pins it in physical memory and gives it a key; the two sides exchange keys and addresses. Communication then happens through <em>queue pairs</em>: a program posts work requests—"write these bytes from my region at offset \(o_1\) to the remote region with key <code>rkey</code> at offset \(o_2\)"—to a send queue, the NIC executes them in hardware, and completions are reported on a completion queue. A one-sided <code>RDMA_WRITE</code> is, mathematically, an assignment \(B[o_2:o_2+n]\leftarrow A[o_1:o_1+n]\) performed by hardware. With <strong>GPUDirect RDMA</strong> the registered region can be GPU memory itself, so bytes move from one GPU's HBM through its NIC across the network into another GPU's HBM, touching no CPU and no host memory. This is how NCCL collectives, NIXL KV transfers and DeepEP expert dispatch work.</p>
+</div>
+
+<p>RDMA needs a network that rarely drops packets, because its hardware transports were designed assuming losses are rare, and recovering from a loss—typically by retransmitting everything after the lost packet—is expensive. Three families of fabric provide it. <strong>InfiniBand</strong>, standardised in 1999 for high-performance computing and today supplied mainly by NVIDIA (from its acquisition of Mellanox), was designed for RDMA from the start. It is <em>lossless</em> by construction: a link sends a packet only when the receiver has advertised buffer space for it (credit-based flow control), so switches never overflow. A central <em>subnet manager</em> computes routes for the whole fabric, and modern switches support adaptive routing and in-network reductions (SHARP), in which switches themselves sum the data of an all-reduce. InfiniBand is the reference fabric for AI clusters and remains common in neoclouds and on Azure; its drawbacks are a separate ecosystem from Ethernet, vendor concentration, and the need for specialists to operate it.</p>
+<p><strong>RoCE</strong> (RDMA over Converged Ethernet), in its routable version RoCEv2, carries InfiniBand's transport inside UDP/IP packets over ordinary Ethernet switches. Ethernet drops packets when buffers overflow, so RoCE deployments traditionally made Ethernet lossless with <em>priority flow control</em> (PFC), which lets a switch tell its upstream neighbour to pause a traffic class when buffers fill, combined with end-to-end congestion control such as DCQCN, in which switches mark packets when queues grow and senders reduce their rates in response<span class="cite"><a href="#r-dcqcn">[3]</a></span>. PFC has well-known pathologies—pauses propagate backwards and can block unrelated flows (head-of-line blocking), or in rare topologies deadlock—so operating RoCE at scale requires care. Meta described in 2024 how it built and ran RoCE back-ends for clusters of 24,000 GPUs, using a rail-optimised two-stage Clos, careful tuning and collective-aware routing instead of relying on generic congestion control<span class="cite"><a href="#r-meta-roce">[4]</a></span>. RoCE's attraction is Ethernet's ecosystem: many switch vendors, common tooling and operational familiarity; NVIDIA's Spectrum-X and similar products add adaptive routing and congestion control tuned for AI.</p>
+<p>The hyperscalers built their own transports to fit their networks. AWS's <strong>Elastic Fabric Adapter</strong> uses a protocol called <strong>SRD</strong> (Scalable Reliable Datagram), which sprays each flow's packets across many network paths, tolerates their arrival out of order, retransmits lost packets quickly in NIC hardware, and so works over AWS's standard lossy Ethernet fabric without PFC<span class="cite"><a href="#r-srd">[5]</a></span>. Google has described its own hardware transports, and in 2025 the Ultra Ethernet Consortium—a group of switch, NIC and cloud companies—published version 1.0 of a specification that standardises similar ideas, including multipath packet spraying and new congestion control, for AI and HPC over Ethernet. The common direction is clear: rather than make Ethernet lossless, make the transport tolerate loss and reordering, and spread traffic over every available path. Why spreading traffic matters so much is the subject of the next section.</p>
+
+<h2 id="s4-5">4.5 Congestion: why flows collide, and what it costs</h2>
+<p>A non-blocking fat tree has enough capacity for any traffic pattern in which each host sends and receives at its link rate—if the traffic is spread perfectly over the many equal-cost paths. The standard way of spreading it is <strong>equal-cost multi-path routing</strong> (ECMP): each switch computes a hash of a packet's flow identifiers (source and destination addresses and ports) and uses it to choose among the equal-cost next hops. All packets of one flow take the same path, which keeps them in order, and different flows are spread pseudo-randomly. For a datacenter full of small, numerous flows this works well, by the law of large numbers. For AI traffic it works badly, and the reason is a classic problem in probability.</p>
+<p>Consider one step of a collective in which \(n_f\) flows, each wanting the full link rate \(r\), must cross a tier with \(n_{\text{path}}\) equal-cost paths. ECMP assigns each flow to a path independently and uniformly at random. A path carrying \(c\) flows gives each of them rate \(r/c\). Because a synchronous collective step finishes only when its slowest flow finishes, the step time is proportional to the <em>largest</em> number of flows on any path, \(c_{\max}\), rather than the average \(n_f/n_{\text{path}}\). The <strong>efficiency</strong> of the step, the ratio of ideal to actual time, is therefore \((n_f/n_{\text{path}})/c_{\max}\). This is the "balls into bins" problem: throw \(n_f\) balls into \(n_{\text{path}}\) bins uniformly at random, and ask for the fullest bin.</p>
+
+<div class="box thm">
+<div class="box-title">Proposition 4.2 — Random hashing of large flows</div>
+<p>If \(n_f=n_{\text{path}}=n\) flows are hashed uniformly onto \(n\) paths, then (i) the expected fraction of paths carrying at least one flow is \(1-(1-1/n)^n\to1-1/e\approx0.63\), and (ii) the maximum load satisfies \(c_{\max}=(1+o(1))\ln n/\ln\ln n\) with high probability. Consequently the efficiency of a synchronous step is about \(\ln\ln n/\ln n\), which tends to zero as \(n\) grows.</p>
+<p><em>Proof sketch.</em> (i) A given path is empty with probability \((1-1/n)^n\); linearity of expectation gives the fraction occupied. (ii) The probability that a given path receives at least \(c\) flows is at most \(\binom{n}{c}n^{-c}\le1/c!\); by a union bound over \(n\) paths, \(\Pr(c_{\max}\ge c)\le n/c!\), which is small once \(c!\gg n\), i.e. for \(c\approx\ln n/\ln\ln n\); a matching lower bound follows from the second-moment method. \(\square\)</p>
+</div>
+
+<p>Proposition 4.2 is sobering. With one large flow per path—exactly the situation of a well-provisioned non-blocking fabric running a collective—random hashing leaves 37% of the paths idle, and the busiest path carries several flows, so the step runs at a fraction of the rate the topology could deliver. Figure 4.5 shows the efficiency from simulation as a function of the number of flows per path, for fabrics with 16, 64 and 256 paths. At one flow per path on 64 paths, efficiency is about 25%: the collective takes four times as long as it should. Only with dozens of flows per path does randomness average out.</p>
+
+<figure class="chart" id="fig-4-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Efficiency of a synchronous collective step under random ECMP (simulation)","height":330,
+ "x":{"label":"Flows per path, n_f / n_path (log)","log":true,"min":1,"max":32,"ticks":[1,2,4,8,16,32]},
+ "y":{"label":"Efficiency = mean load / max load","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"16 paths","color":"s3","points":[[1,0.324],[2,0.416],[4,0.506],[8,0.597],[16,0.681],[32,0.755]]},
+  {"name":"64 paths","color":"s1","points":[[1,0.253],[2,0.337],[4,0.426],[8,0.523],[16,0.612],[32,0.696]]},
+  {"name":"256 paths","color":"s2","points":[[1,0.208],[2,0.285],[4,0.375],[8,0.467],[16,0.56],[32,0.651]]}
+ ],
+ "hlines":[{"y":1,"text":"perfect balancing"}]}
+</script>
+<figcaption><b>Figure 4.5 — Hash collisions waste most of a fabric's capacity for elephant flows.</b> Each point averages the maximum load over thousands of random assignments. Efficiency falls as the fabric grows (more paths) and improves only slowly as flows become more numerous, because the fullest path dominates a synchronous step.</figcaption>
+</figure>
+
+<p>Figure 4.5 explains why AI networking has moved away from per-flow hashing, and the remedies follow from the proposition. One remedy is to <em>make flows numerous</em>: collective libraries split each logical transfer over many queue pairs (NCCL can use several per connection), raising \(n_f/n_{\text{path}}\). A second is <em>adaptive routing</em>: switches choose each packet's next hop by current queue depth rather than by a hash, which InfiniBand and AI-oriented Ethernet switches support. A third is <em>packet spraying</em>: send consecutive packets of one flow over different paths and let the receiving NIC reorder them, which is what SRD and Ultra Ethernet do; with spraying, each flow's load is divided evenly over all paths and the balls-into-bins problem disappears. A fourth is <em>avoiding the contended tier</em>: rail-optimised placement keeps most traffic within one switch, where there is no path choice to get wrong. A fifth is <em>scheduling</em>: assigning collective traffic to paths deterministically, as some operators do with source routing or with NCCL's topology awareness.</p>
+<p>Congestion also arises without any hashing, from <strong>incast</strong>: many senders transmitting to one receiver at once, whose link becomes the bottleneck and whose switch buffers overflow. All-to-all exchanges, such as the dispatch and combine of expert parallelism (Vol. I §19.4), produce incast whenever routing sends a disproportionate share of tokens to one GPU's experts. Congestion control—senders slowing down in response to marks or delay—limits the damage but cannot remove the bottleneck; balancing the load at the application level, as expert-load balancers do, is the real fix. For an infrastructure engineer, the lesson of this section is that a network's nominal bisection bandwidth is an upper bound that only good load balancing achieves, and that "the GPUs are slow" is often "the network is congested". Much of that congestion can be avoided by putting the heaviest traffic on links that have no congestion problem at all: those of the scale-up domain.</p>
+
+<h2 id="s4-6">4.6 Scale-up versus scale-out</h2>
+<p>An accelerator has two kinds of network port. Its <strong>scale-up</strong> links—NVLink for NVIDIA, Infinity Fabric for AMD, ICI for TPUs, NeuronLink for Trainium—connect it to a bounded group of peers with very high bandwidth, low latency and memory semantics: a GPU can load and store directly into a peer's memory. Its <strong>scale-out</strong> port, the back-end NIC, connects it to the whole cluster through the switched network with lower bandwidth and higher latency. Table 4.1 compares them for recent generations.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 4.1 — Scale-up and scale-out bandwidth per accelerator (per direction, approximate)</caption>
+<thead><tr><th>System</th><th>Scale-up domain</th><th class="num">Scale-up per GPU</th><th class="num">Scale-out per GPU</th><th class="num">Ratio</th></tr></thead>
+<tbody>
+<tr><td>HGX H100 / H200</td><td>8 GPUs (NVLink 4)</td><td class="num">450 GB/s</td><td class="num">50 GB/s (400 Gb/s)</td><td class="num">9×</td></tr>
+<tr><td>HGX B200</td><td>8 GPUs (NVLink 5)</td><td class="num">900 GB/s</td><td class="num">50–100 GB/s</td><td class="num">9–18×</td></tr>
+<tr><td>GB200 / GB300 NVL72</td><td>72 GPUs (NVLink 5)</td><td class="num">900 GB/s</td><td class="num">100 GB/s (800 Gb/s)</td><td class="num">9×</td></tr>
+<tr><td>TPU pods</td><td>hundreds to thousands of chips (ICI torus)</td><td class="num">hundreds of GB/s (sum over torus links)</td><td class="num">data-centre network</td><td class="num">—</td></tr>
+</tbody></table></div>
+
+<figure class="diagram" id="fig-4-6">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Bandwidth ladder from HBM to inter-region links">
+<text x="20" y="24" class="t-sm t-b">Per-GPU bandwidth at each level (H100 generation, per direction, log-like spacing)</text>
+<rect x="20" y="40" width="660" height="30" rx="5" class="bx2"/><text x="30" y="60" class="t-xs t-b">HBM: 3,350 GB/s</text><text x="670" y="60" text-anchor="end" class="t-xs">weights and KV cache</text>
+<rect x="20" y="80" width="520" height="30" rx="5" class="bx4"/><text x="30" y="100" class="t-xs t-b">NVLink / NVSwitch (scale-up): 450 GB/s</text><text x="530" y="100" text-anchor="end" class="t-xs">TP, EP (NVL72)</text>
+<rect x="20" y="120" width="330" height="30" rx="5" class="bx3"/><text x="30" y="140" class="t-xs t-b">back-end NIC (scale-out): 50 GB/s</text><text x="340" y="140" text-anchor="end" class="t-xs">PP, KV transfer, EP</text>
+<rect x="20" y="160" width="200" height="30" rx="5" class="bx"/><text x="30" y="180" class="t-xs t-b">front-end share: ≈ 3–12 GB/s</text>
+<text x="228" y="180" class="t-xs">requests, weights from storage</text>
+<rect x="20" y="200" width="110" height="30" rx="5" class="bx5"/><text x="30" y="220" class="t-xs t-b">cross-region</text>
+<text x="138" y="220" class="t-xs">shared, tens of ms away: replication, failover</text>
+<text x="690" y="140" text-anchor="end" class="t-xs">each step down: ≈ 4–10×</text>
+<text x="690" y="154" text-anchor="end" class="t-xs">less bandwidth, more latency</text>
+</svg>
+<figcaption><b>Figure 4.6 — The bandwidth ladder.</b> Bar lengths are drawn on a compressed scale. Placement of parallelism and data follows the ladder: the more often and the more latency-sensitively data moves, the higher on the ladder it must stay.</figcaption>
+</figure>
+
+<p>Figure 4.6 places the scale-up/scale-out boundary in the context of the whole hierarchy of Chapter 1. Every step down the ladder costs roughly an order of magnitude in bandwidth and adds latency, and a well-designed deployment keeps each kind of data movement on the highest rung it can reach: weights and KV in HBM, the per-layer collectives of tensor and expert parallelism on NVLink, per-request transfers on the back-end, bulk loads on the front-end, and only replication and failover across regions.</p>
+
+<p>The ratio in the last column—an order of magnitude—is the most important number in parallel layout. It means that traffic which can stay within a scale-up domain costs about a tenth as much time per byte as traffic that cannot, and has none of the congestion problems of §4.5, since NVSwitch is a true crossbar. Volume I's rule of thumb follows directly: put tensor parallelism, whose all-reduces occur twice per layer per step, inside the scale-up domain; put pipeline parallelism, data parallelism and disaggregated KV transfer, which move fewer bytes less often, across scale-out (Vol. I §18.6). Expert parallelism sits in between: its all-to-all moves a modest number of bytes per token but on every layer, and it is very sensitive to latency and incast. This is why the 72-GPU NVLink domain of GB200 NVL72 was so significant for mixture-of-experts inference: it lets expert parallelism of degree 64 or 72 run entirely on scale-up links.</p>
+<div class="box example">
+<div class="box-title">Worked example — expert parallelism across servers versus inside NVL72</div>
+<p><strong>Setup.</strong> DeepSeek-V3 decode with expert parallelism of degree 32 on four eight-GPU H100 servers. Each GPU holds a batch of 64 tokens per step. Each token is dispatched to \(k_r=8\) experts as a hidden vector of \(d=7168\) values in FP8 (1 byte), and the experts' outputs are combined back in BF16 (2 bytes). There are 58 MoE layers.</p>
+<p><strong>Bytes per GPU per step.</strong> Dispatch: \(64\times8\times7168\times1\approx3.7\) MB per layer. Combine: about 7.3 MB per layer. Total about 11 MB per layer, or \(58\times11\approx640\) MB per step.</p>
+<p><strong>Across servers.</strong> With experts spread evenly, about 24 of every 31 destinations are on other servers, so about 480 MB per GPU per step crosses the back-end at 50 GB/s: about 9.6 ms if load were perfectly balanced over the fabric. At the 25–40% efficiency of hashed flows (Figure 4.5), it would be 24–38 ms—longer than a typical 20–30 ms TPOT budget by itself. This is why DeepSeek overlapped communication with computation using two micro-batches, wrote custom RDMA kernels (DeepEP), and depended on adaptive routing.</p>
+<p><strong>Inside an NVL72 rack.</strong> The same 640 MB per step on NVLink at 450–900 GB/s per GPU takes about 0.7–1.4 ms, with no hashing and no incast at the switch.</p>
+<p><strong>Lesson.</strong> Moving wide expert parallelism from scale-out to scale-up reduces its communication time by roughly an order of magnitude, which allows larger batches per GPU within the latency target and is the main reason rack-scale NVLink systems lower the cost per token of large MoE models.</p>
+</div>
+
+<p>The scale-up domain has grown with each generation—8 GPUs for a decade, then 72 in 2024–2025, with announced designs of 144 and 576 GPU dies—and its growth is limited by physics: copper links work only over short distances at these rates, so the domain must fit in a rack or two, which drives the power densities of Chapter 2. Optics can reach further. Google's TPU v4 used optical circuit switches—mirrors that physically redirect light between fibres—to reconfigure its torus among 4,096 chips, which also lets it route around failed chips<span class="cite"><a href="#r-tpuv4">[6]</a></span>. Industry consortia formed in 2024–2025 to define open scale-up standards (UALink, and Ethernet-based scale-up proposals) so that non-NVIDIA accelerators can build large scale-up domains too. Whatever the technology, the infrastructure engineer's question is the same: which traffic of the workload must cross the scale-up boundary, and how much does it cost when it does? For inference, the answer requires a catalogue of the traffic.</p>
+
+<h2 id="s4-7">4.7 What inference needs from the network</h2>
+<p>AI networking has been designed mostly around training, whose collectives are the most demanding traffic in the datacenter. Inference has different and more varied needs, and Table 4.2 lists them for Atlas. Working through the magnitudes is the best way to see which ones matter.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 4.2 — Network traffic of LLM inference, with magnitudes for Atlas</caption>
+<thead><tr><th>Traffic</th><th>Network</th><th>Magnitude</th><th>Sensitive to</th></tr></thead>
+<tbody>
+<tr><td>Tensor-parallel all-reduces</td><td>scale-up</td><td>2 per layer per step; ≈ MBs per step</td><td>latency</td></tr>
+<tr><td>Expert-parallel dispatch/combine</td><td>scale-up or back-end</td><td>every MoE layer; ≈ \(2k_rd\,b\) bytes per token per layer</td><td>latency, incast</td></tr>
+<tr><td>KV transfer, prefill → decode</td><td>back-end</td><td>\(s_{kv}\) per prompt token: 137 MB per Atlas-Max request</td><td>bandwidth</td></tr>
+<tr><td>Prefix-cache fetch from remote store</td><td>back-end or front-end</td><td>like KV transfer, for cached prefixes</td><td>bandwidth, latency</td></tr>
+<tr><td>Weight loading (cold start)</td><td>front-end (or back-end)</td><td>16–700 GB per replica</td><td>bandwidth</td></tr>
+<tr><td>Requests and streamed tokens</td><td>front-end</td><td>≈ KB per request; tiny</td><td>latency</td></tr>
+</tbody></table></div>
+
+<p>The <em>scale-up</em> traffic of tensor and expert parallelism is handled within the server or rack, and the network design question is only whether the replica fits within one scale-up domain. The <em>front-end</em> request traffic is negligible in volume: Atlas's 10,000 requests per second at a few kilobytes each, plus streamed tokens of a few dozen bytes each, amount to well under a gigabit per second of payload. The interesting traffic is in the middle: KV transfers for disaggregation and remote prefix caches, and weight loading.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — the network load of disaggregating Atlas-Max</div>
+<p><strong>Setup.</strong> Atlas-Max (DeepSeek-V3) runs disaggregated: prefill GPUs compute the KV cache of each prompt and send it to decode GPUs (Vol. I Chapter 13). With MLA, each token's cache is \((d_c+d_h^R)\times L\times b_{kv}=(512+64)\times61\times2\approx70{,}300\) bytes in BF16, about 68.6 KiB (Vol. I §8.4). Each request has 2,000 prompt tokens, and the decode side needs the cache of all of them.</p>
+<p><strong>Per request.</strong> \(2000\times70{,}300\approx141\) MB, or about 70 MB in FP8.</p>
+<p><strong>Aggregate.</strong> At 500 requests per second at peak, the prefill pool sends about 70 GB/s (BF16) to the decode pool, or 35 GB/s in FP8.</p>
+<p><strong>Per GPU.</strong> Spread over 100 prefill GPUs, each sends about 0.7 GB/s (BF16)—about 1.4% of a 50 GB/s NIC. Each of 417 decode GPUs receives about 0.17 GB/s.</p>
+<p><strong>Latency.</strong> One request's 141 MB over a single 50 GB/s NIC takes about 2.8 ms, against a prefill time for 800 uncached tokens of tens of milliseconds, so the transfer ratio \(\chi\) of Vol. I §13.4 is small and the transfer can be overlapped layer by layer.</p>
+<p><strong>Lesson.</strong> With MLA's compact cache, KV transfer is a light load. With Llama 3 70B's GQA cache (320 KiB per token in BF16, about 4.7 times larger), the same traffic would be about 330 GB/s, still well within a back-end fabric but no longer negligible on a front-end network—which is why disaggregation runs over the back-end with RDMA (NIXL, Mooncake's transfer engine) rather than over TCP.</p>
+</div>
+
+<p>Weight loading is the other heavy flow, and it arrives in bursts. When the autoscaler adds replicas, each must fetch its weights: 16 GB for Llama 3 8B in BF16, about 70 GB for Llama 3 70B in FP8, about 700 GB for DeepSeek-V3 in FP8. If fifty new 70B replicas start at once after a traffic spike or a failure, they ask the storage system for 3.5 TB within a minute or two, roughly 30–60 GB/s of aggregate throughput, concentrated on a few objects. Whether that comes over the front-end network from object storage, from local NVMe caches, or peer to peer over the back-end from replicas that already have the weights is the main design question of cold starts, and Chapter 5 develops it. The final network concern is the one every cloud bill makes visible: the front-end network and its costs.</p>
+
+<h2 id="s4-8">4.8 The front-end network, virtual networks and egress</h2>
+<p>To the customer, the front-end network of a cloud appears as a <strong>virtual private cloud</strong> (VPC): a private address space in which instances, load balancers and managed services communicate, isolated from other customers' traffic even though all of it shares the provider's physical switches. Providers implement VPCs with <em>overlays</em>: each packet between instances is encapsulated in an outer packet addressed between physical hosts (VXLAN and Geneve are common encapsulations), and the offload cards of §3.1 perform the encapsulation, apply security-group rules and enforce bandwidth limits in hardware. The overlay is why one customer's addresses can overlap another's and why instances can move between physical hosts without changing address. It is also why the front-end network is oversubscribed and why its bandwidth per instance is capped: it is a shared, multiplexed resource.</p>
+<p>Clouds charge for some traffic, and the charges shape architecture. Traffic within an availability zone is usually free; traffic between zones in a region is charged at about a cent per gigabyte in each direction on the major clouds; traffic out to the internet (<strong>egress</strong>) is charged at several cents per gigabyte, with volume discounts. For an LLM API the egress of streamed responses is small—Atlas's \(2.2\times10^{11}\) output tokens a day at perhaps 50 bytes each including framing are about 11 TB per day, a few hundred dollars—compared with tens of thousands of dollars a day of accelerator time. Cross-zone and cross-region charges matter more for internal flows: replicating 700 GB of weights to every zone, moving KV caches across zones, or shipping logs and traces. A design that routes every request through a load balancer in one zone to replicas in another doubles its internal transfer charges; most providers' guidance is to keep request paths zone-local, which is also good for latency and for limiting failure domains.</p>
+
+<details class="drill">
+<summary>Drill 4.2 — Can the front-end carry a cold start?</summary>
+<p>A replica of Llama 3 70B in FP8 (about 70 GB) starts on an eight-GPU instance whose front-end bandwidth is 200 Gb/s. How long does downloading the weights take at full rate, and at a realistic 60% of it? What if eight such instances start at once and share a 400 Gb/s uplink from their rack?</p>
+<p><em>Solution.</em> 200 Gb/s is 25 GB/s, so 70 GB takes 2.8 s at full rate and about 4.7 s at 60%. Eight instances sharing a 400 Gb/s (50 GB/s) rack uplink fetch 560 GB in about 11 s at full rate, 19 s at 60%—if the storage service can supply 50 GB/s for these objects, which is a large ask of a single bucket and prefix. The network is rarely the binding constraint for one replica; storage throughput and concurrency for many simultaneous replicas usually are, which is why weights are cached locally or distributed peer to peer (Chapter 5).</p>
+</details>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We now understand how thousands of accelerators are joined: fat trees and rails in the back-end, RDMA transports that bypass the CPU, the collisions that waste capacity and the remedies for them, the scale-up domain where the heaviest traffic belongs, and the front-end network through which requests arrive. One flow kept appearing at the edge of our analysis: the tens to hundreds of gigabytes of weights that each new replica must load before it can serve a single token. Where do weights live, in what format, how fast can they be read, and how can a fleet start hundreds of replicas in minutes rather than hours? Chapter 5 takes up storage and the anatomy of a cold start.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>An AI datacenter has a front-end network (Ethernet, TCP/IP, 100–400 Gb/s per server), a separate back-end network (RDMA, 400–800 Gb/s per GPU), scale-up links inside servers or racks, and an out-of-band management network.</li>
+<li>Clos/fat-tree networks build large non-blocking switches from small ones: two tiers give \(k_{\text{sw}}^2/2\) hosts with \(3k_{\text{sw}}/2\) switches; three tiers give \(k_{\text{sw}}^3/4\) hosts with \(5k_{\text{sw}}^2/4\) switches. Radix decides the number of tiers.</li>
+<li>Bisection bandwidth measures capacity across the worst cut; oversubscription is downlink/uplink capacity; back-ends are usually non-blocking; optics dominate cost and failures.</li>
+<li>Rail-optimised topologies connect GPU \(i\) of every server to rail \(i\), so hierarchical collectives take one hop; rail-only designs drop the spine for training, but inference's any-to-any traffic needs spine capacity or rail-aware placement.</li>
+<li>RDMA moves bytes NIC-to-NIC (GPUDirect: HBM to HBM) without CPUs. InfiniBand is lossless by credits; RoCEv2 uses PFC plus congestion control (DCQCN) with operational pitfalls; EFA's SRD and Ultra Ethernet spray packets over lossy Ethernet.</li>
+<li>ECMP hashing of large synchronous flows is a balls-into-bins problem: with one flow per path, about 37% of paths sit idle and efficiency is about 25% on 64 paths. Remedies: more flows, adaptive routing, packet spraying, rail locality, scheduling. Incast needs load balancing at the application.</li>
+<li>Scale-up bandwidth is about 9–18× scale-out; TP and, ideally, EP belong inside the scale-up domain; NVL72 made 64–72-way expert parallelism possible on NVLink.</li>
+<li>Inference network loads: KV transfer (light with MLA, heavier with GQA), weight loading in bursts, tiny request traffic. Cloud charges: cross-zone and egress traffic shape architecture more than token streaming does.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci04-mcq-01" data-topic="§4.1 Networks">
+<p class="q">Why do AI datacenters build a separate back-end network?</p>
+<ol class="opts"><li>To save money</li><li data-correct>GPU traffic needs far more bandwidth per server, low predictable latency and near-zero loss, and must be isolated from bursty general traffic</li><li>Because Ethernet cannot carry GPU data</li><li>For the management controllers</li></ol>
+<div class="explain">Collectives are few, huge, synchronised flows that stall on any loss.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-02" data-topic="§4.1 Networks">
+<p class="q">Which traffic belongs on the front-end network?</p>
+<ol class="opts"><li>Tensor-parallel all-reduces</li><li>KV transfer between prefill and decode GPUs</li><li data-correct>API requests, streamed responses and object-storage reads</li><li>Expert-parallel dispatch</li></ol>
+<div class="explain">Accelerator traffic uses the back-end or scale-up links.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-03" data-topic="§4.1 Networks">
+<p class="q">What is the out-of-band management network for?</p>
+<ol class="opts"><li>Backing up model weights</li><li data-correct>Reaching baseboard management controllers to power, reimage and diagnose servers even when other networks fail</li><li>Carrying user traffic during outages</li><li>Synchronising clocks only</li></ol>
+<div class="explain">It is slow but independent.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-04" data-topic="§4.2 Clos">
+<p class="q">How many hosts does a non-blocking two-tier leaf–spine network of 64-port switches support?</p>
+<ol class="opts"><li>64</li><li>1,024</li><li data-correct>2,048</li><li>65,536</li></ol>
+<div class="explain">\(k^2/2=2048\).</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-05" data-topic="§4.2 Clos">
+<p class="q">A three-tier fat tree of 64-port switches supports up to:</p>
+<ol class="opts"><li>8,192 hosts</li><li data-correct>65,536 hosts</li><li>262,144 hosts</li><li>4,194,304 hosts</li></ol>
+<div class="explain">\(k^3/4=65{,}536\).</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-06" data-topic="§4.2 Clos">
+<p class="q">Clos's strictly non-blocking condition for a three-stage network with \(n\) inputs per input switch requires at least how many middle switches?</p>
+<ol class="opts"><li>\(n\)</li><li data-correct>\(2n-1\)</li><li>\(n^2\)</li><li>\(\log n\)</li></ol>
+<div class="explain">\(n\) suffice if connections may be rearranged (Beneš).</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-07" data-topic="§4.2 Clos">
+<p class="q">A leaf with 48 host ports and 16 uplinks of equal speed has an oversubscription ratio of:</p>
+<ol class="opts"><li>1:1</li><li>2:1</li><li data-correct>3:1</li><li>16:48</li></ol>
+<div class="explain">Downlink capacity / uplink capacity = 48/16.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-08" data-topic="§4.2 Clos">
+<p class="q">The bisection bandwidth of a non-blocking fat tree with \(H\) hosts at link rate \(r\) is:</p>
+<ol class="opts"><li>\(Hr\)</li><li data-correct>\(Hr/2\)</li><li>\(r\)</li><li>\(r\log H\)</li></ol>
+<div class="explain">Half the hosts can send to the other half at full rate.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-09" data-topic="§4.2 Clos">
+<p class="q">Why is switch radix so important?</p>
+<ol class="opts"><li>It sets the clock rate</li><li data-correct>It determines how many tiers a cluster needs, and each tier multiplies switches, optics, latency and failure points</li><li>It sets RDMA support</li><li>It determines PUE</li></ol>
+<div class="explain">Hosts grow as \(k^{\text{tiers}}\) up to constants.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-10" data-topic="§4.2 Clos">
+<p class="q">Which component typically dominates the cost and failure rate of a large back-end fabric?</p>
+<ol class="opts"><li>Copper cables in the server</li><li data-correct>Optical transceivers and cables between racks</li><li>Switch fans</li><li>The subnet manager</li></ol>
+<div class="explain">About five transceivers per GPU in a non-blocking three-tier design.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-11" data-topic="§4.3 Rails">
+<p class="q">In a rail-optimised topology, rail \(i\) connects:</p>
+<ol class="opts"><li>All GPUs in server \(i\)</li><li data-correct>GPU \(i\) of every server in the group</li><li>Spine switch \(i\) to all leaves</li><li>Rack \(i\) to the internet</li></ol>
+<div class="explain">Same-index GPUs exchange most hierarchical-collective traffic.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-12" data-topic="§4.3 Rails">
+<p class="q">How does cross-rail traffic avoid the spine in a rail-optimised design?</p>
+<ol class="opts"><li>It cannot</li><li data-correct>It moves over NVLink to the local GPU on the destination rail, then travels on that rail (PXN)</li><li>It uses the front-end network</li><li>It is compressed</li></ol>
+<div class="explain">The scale-up fabric acts as the cross-rail switch.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-13" data-topic="§4.3 Rails">
+<p class="q">Why may inference clusters need more spine capacity than rail-only training designs?</p>
+<ol class="opts"><li>Inference uses more bandwidth per GPU</li><li data-correct>Inference traffic (KV transfers, EP dispatch, weight streaming) goes between arbitrary GPUs chosen by schedulers, not neatly within rails</li><li>Inference does not use NVLink</li><li>Inference has no collectives</li></ol>
+<div class="explain">Rail-aware placement can recover some locality.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-14" data-topic="§4.4 Transport">
+<p class="q">What does GPUDirect RDMA enable?</p>
+<ol class="opts"><li>GPUs to run TCP stacks</li><li data-correct>NICs to read and write GPU memory directly, moving data HBM-to-HBM across the network without host CPUs or memory</li><li>NVLink across racks</li><li>Encryption of HBM</li></ol>
+<div class="explain">Used by NCCL, NIXL and DeepEP.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-15" data-topic="§4.4 Transport">
+<p class="q">How does InfiniBand avoid dropping packets?</p>
+<ol class="opts"><li>Large buffers only</li><li data-correct>Credit-based link-level flow control: a sender transmits only when the receiver has advertised buffer space</li><li>Packet spraying</li><li>TCP retransmission</li></ol>
+<div class="explain">It is lossless by construction.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-16" data-topic="§4.4 Transport">
+<p class="q">Which are known pitfalls of PFC in RoCE networks? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Pause frames propagating backwards and blocking unrelated flows</li><li data-correct>Deadlocks in some topologies</li><li>It encrypts traffic</li><li data-correct>Operational complexity of tuning at scale</li></ol>
+<div class="explain">Hence end-to-end congestion control and careful design.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-17" data-topic="§4.4 Transport">
+<p class="q">AWS's SRD transport differs from classic RDMA transports in that it:</p>
+<ol class="opts"><li>Requires lossless Ethernet</li><li data-correct>Sprays packets over many paths, tolerates out-of-order arrival and retransmits quickly in NIC hardware over lossy Ethernet</li><li>Uses InfiniBand switches</li><li>Runs in the guest kernel</li></ol>
+<div class="explain">Ultra Ethernet standardises similar ideas.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-18" data-topic="§4.4 Transport">
+<p class="q">DCQCN is:</p>
+<ol class="opts"><li>A topology</li><li data-correct>A congestion-control scheme in which switches mark packets as queues grow and senders reduce their rates</li><li>A switch chip</li><li>An encryption protocol</li></ol>
+<div class="explain">Used with RoCEv2.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-19" data-topic="§4.5 Congestion">
+<p class="q">With \(n\) large flows hashed onto \(n\) paths, the expected fraction of idle paths tends to:</p>
+<ol class="opts"><li>0</li><li data-correct>\(1/e\approx37\%\)</li><li>50%</li><li>\(1-1/e\)</li></ol>
+<div class="explain">Each path is empty with probability \((1-1/n)^n\).</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-20" data-topic="§4.5 Congestion">
+<p class="q">Why is a synchronous collective step's time set by the maximum path load rather than the mean?</p>
+<ol class="opts"><li>Switches process the largest flow first</li><li data-correct>The step completes only when its slowest flow completes, and flows on the busiest path are slowest</li><li>NCCL waits for timeouts</li><li>The mean is undefined</li></ol>
+<div class="explain">Efficiency = mean load / max load.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-21" data-topic="§4.5 Congestion">
+<p class="q">Which remedies improve on random ECMP for AI traffic? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Adaptive routing on queue depth</li><li data-correct>Packet spraying with reordering at the receiver</li><li data-correct>Splitting transfers into many flows (queue pairs)</li><li>Reducing the number of paths</li></ol>
+<div class="explain">Rail locality and deterministic scheduling also help.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-22" data-topic="§4.5 Congestion">
+<p class="q">From Figure 4.5, roughly what efficiency does one flow per path achieve on 64 paths?</p>
+<ol class="opts"><li>95%</li><li>63%</li><li data-correct>25%</li><li>5%</li></ol>
+<div class="explain">The fullest of 64 bins typically holds about four balls.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-23" data-topic="§4.5 Congestion">
+<p class="q">Incast in expert-parallel all-to-all is best fixed by:</p>
+<ol class="opts"><li>Larger switch buffers only</li><li data-correct>Balancing expert load so no GPU receives a disproportionate share</li><li>Disabling congestion control</li><li>Using TCP</li></ol>
+<div class="explain">Congestion control limits damage but cannot remove the bottleneck receiver.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-24" data-topic="§4.6 Scale-up">
+<p class="q">For HGX H100, scale-up bandwidth per GPU exceeds scale-out by about:</p>
+<ol class="opts"><li>2×</li><li data-correct>9×</li><li>100×</li><li>1,000×</li></ol>
+<div class="explain">450 GB/s vs 50 GB/s.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-25" data-topic="§4.6 Scale-up">
+<p class="q">Why was GB200 NVL72 especially significant for MoE inference?</p>
+<ol class="opts"><li>It has more FP64</li><li data-correct>Its 72-GPU NVLink domain lets wide expert parallelism run entirely on scale-up links</li><li>It removes the need for HBM</li><li>It uses optical NVLink</li></ol>
+<div class="explain">EP all-to-all is latency- and incast-sensitive.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-26" data-topic="§4.6 Scale-up">
+<p class="q">TPU v4's optical circuit switches allow:</p>
+<ol class="opts"><li>Packet spraying</li><li data-correct>Reconfiguring the torus among thousands of chips, including routing around failures</li><li>Lossless Ethernet</li><li>Liquid cooling</li></ol>
+<div class="explain">Mirrors redirect light between fibres.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-27" data-topic="§4.7 Inference">
+<p class="q">With MLA, DeepSeek-V3's BF16 KV cache per token is about:</p>
+<ol class="opts"><li>4 KiB</li><li data-correct>69 KiB</li><li>320 KiB</li><li>1 MiB</li></ol>
+<div class="explain">\((512+64)\times61\times2\approx70{,}300\) bytes.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-28" data-topic="§4.7 Inference">
+<p class="q">Which inference traffic is the smallest in volume?</p>
+<ol class="opts"><li>Weight loading</li><li>KV transfer</li><li data-correct>Requests and streamed tokens</li><li>EP dispatch</li></ol>
+<div class="explain">Kilobytes per request.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-29" data-topic="§4.7 Inference">
+<p class="q">Why does disaggregated KV transfer use the back-end with RDMA rather than TCP over the front-end?</p>
+<ol class="opts"><li>TCP cannot carry binary data</li><li data-correct>Transfers are large and latency-sensitive, and RDMA moves HBM-to-HBM at high bandwidth without CPU copies</li><li>The front-end is always down</li><li>RDMA encrypts data</li></ol>
+<div class="explain">E.g. NIXL and Mooncake's transfer engine.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-30" data-topic="§4.8 Front-end">
+<p class="q">How do clouds isolate customers' virtual networks on shared physical switches?</p>
+<ol class="opts"><li>Separate cables per customer</li><li data-correct>Overlays: packets are encapsulated (e.g. VXLAN/Geneve) by offload hardware that also enforces security rules</li><li>Time-division multiplexing</li><li>Different IP versions</li></ol>
+<div class="explain">This also lets addresses overlap across customers.</div>
+</div>
+
+<div class="mcq" data-id="ci04-mcq-31" data-topic="§4.8 Front-end">
+<p class="q">For an LLM API, which network cost is usually largest?</p>
+<ol class="opts"><li>Internet egress of streamed tokens</li><li data-correct>Internal cross-zone or cross-region transfers (weights, caches, logs) if architecture ignores locality</li><li>DNS queries</li><li>TLS handshakes</li></ol>
+<div class="explain">Token streams are tiny; keep request paths zone-local.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci04-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What are the front-end and back-end networks of a GPU cluster, and why are they separate?</summary>
+<div class="answer">
+<p>Front-end: ordinary datacenter Ethernet with TCP/IP, one or two NICs per server at 100–400 Gb/s, often oversubscribed; carries API traffic, storage, control plane and internet. Back-end: a separate fabric with one NIC per GPU at 400–800 Gb/s, usually non-blocking, running RDMA (InfiniBand, RoCE, EFA); carries collectives, KV transfers, expert dispatch. Separation gives the GPU traffic dedicated bandwidth, the right transport and congestion behaviour, isolation from bursty general traffic, and a smaller attack surface. Plus scale-up (NVLink) inside servers and an out-of-band management network.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is RDMA and why do AI clusters use it?</summary>
+<div class="answer">
+<p>Remote direct memory access lets NICs read or write a registered memory region on another machine without involving either CPU or OS on the data path; with GPUDirect RDMA the region can be GPU HBM. Programs post work requests to queue pairs; NIC hardware executes them. It avoids kernel copies, interrupts and protocol processing, delivering line rate (400–800 Gb/s per GPU) with microsecond latency and negligible CPU use. Collectives (NCCL), KV transfer (NIXL, Mooncake) and expert dispatch (DeepEP) depend on it. It needs a network with rare losses (InfiniBand, RoCE with PFC/congestion control) or a loss-tolerant transport (SRD, Ultra Ethernet).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-03">
+<summary><span class="lvl warm">Warm-up</span> InfiniBand or RoCE for a new inference cluster?</summary>
+<div class="answer">
+<p>InfiniBand: designed for RDMA, lossless by credit flow control, adaptive routing, in-network reductions, mature for AI, centrally managed; but a separate ecosystem, mostly one vendor, specialist operations. RoCEv2: RDMA over Ethernet with many vendors and common tooling, integrates with the rest of the datacenter; but needs PFC and congestion control tuning (head-of-line blocking, deadlocks) or newer loss-tolerant NICs and AI Ethernet switches (Spectrum-X, Ultra Ethernet). At very large scale both work (Meta runs both). Choose by team expertise, vendor strategy, scale, required features, and whether the cloud dictates the fabric (EFA on AWS).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-04">
+<summary><span class="lvl core">Core</span> Derive the number of hosts and switches in two- and three-tier fat trees, and size a 16k-GPU back-end with 64-port switches.</summary>
+<div class="answer">
+<p>Two tiers: \(k\) leaves each with \(k/2\) host ports and \(k/2\) uplinks; \(k/2\) spines each with \(k\) ports; \(k^2/2\) hosts, \(3k/2\) switches. Three tiers: \(k\) pods, each \(k/2\) leaves and \(k/2\) aggregation switches (\(k^2/4\) hosts per pod), \(k^2/4\) core switches; \(k^3/4\) hosts, \(5k^2/4\) switches. With \(k=64\): two tiers max 2,048, so three tiers; 16,384 GPUs need 16 pods (1,024 hosts each): 512 leaves and 512 aggregation switches, plus 256 core switches with 64 ports each: about 1,280 switches and about 49,000 links (three per GPU). A rail-optimised variant groups same-index GPUs on the same leaves; a higher-radix switch could reduce the design to two tiers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-05">
+<summary><span class="lvl core">Core</span> Explain why ECMP performs poorly for collectives, with a quantitative argument.</summary>
+<div class="answer">
+<p>ECMP hashes each flow to one of the equal-cost paths. Collectives create few, large, synchronised flows, roughly one per path in a non-blocking fabric. This is balls into bins: with \(n\) flows on \(n\) paths, about \(1/e\) (37%) of paths are empty and the busiest carries about \(\ln n/\ln\ln n\) flows. Since the step ends when the slowest flow finishes, time scales with the maximum load, so efficiency is mean/max—about 25% on 64 paths. Remedies: many flows per transfer (multiple QPs), adaptive routing, packet spraying with receiver reordering (SRD, UEC), rail-optimised placement to avoid path choice, and topology-aware or scheduled routing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-06">
+<summary><span class="lvl core">Core</span> What is a rail-optimised topology and when does it help?</summary>
+<div class="answer">
+<p>Each server's GPU \(i\) NIC connects to leaf group \(i\) (rail \(i\)). Hierarchical collectives (reduce-scatter over NVLink, then same-index all-reduce across servers, then all-gather) keep inter-server traffic within one rail—one switch hop, no spine. Cross-rail traffic can hop over NVLink to the right local GPU first (PXN). Benefits: lower latency, fewer links per byte, less spine congestion, and the option of thin or no spine (rail-only), cutting cost substantially for training. It helps less for inference traffic between arbitrary GPUs (KV transfer, EP across nodes), which needs spine capacity or rail-aware scheduling (e.g. send KV from prefill GPU \(i\) to decode GPU \(i\)).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-07">
+<summary><span class="lvl core">Core</span> Estimate the network load of disaggregated serving for DeepSeek-V3 and for Llama 3 70B.</summary>
+<div class="answer">
+<p>KV bytes per prompt token: DeepSeek-V3 with MLA \((512+64)\times61\times2\approx70\) KB BF16; Llama 3 70B with GQA \(2\times80\times8\times128\times2=320\) KiB BF16. For 2,000-token prompts at 500 requests/s: DeepSeek about 70 GB/s total (35 GB/s FP8), Llama about 330 GB/s. Per prefill GPU (100 GPUs) that is 0.7 vs 3.3 GB/s, a few percent of a 50 GB/s NIC; per request transfer time on one NIC 2.8 ms vs 13 ms, small relative to prefill compute and overlappable layer by layer. So both fit easily on a back-end fabric, but GQA models put meaningful load on front-end networks, hence RDMA over the back-end and KV quantisation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-08">
+<summary><span class="lvl core">Core</span> Which parallelism should cross the scale-out network and which should not?</summary>
+<div class="answer">
+<p>Scale-up is about 9–18× faster per GPU and congestion-free. Tensor parallelism (two all-reduces per layer per step, latency-critical) stays within the scale-up domain. Expert parallelism (all-to-all every MoE layer, latency- and incast-sensitive) ideally stays within it (NVL72, TPU pods); across nodes it needs RDMA kernels like DeepEP and careful load balancing. Pipeline parallelism (point-to-point activations between stages, once per micro-batch per stage), data parallelism (no communication at inference), disaggregated KV transfer (once per request, overlappable) and weight loading can cross scale-out. Context parallelism for long prompts can cross scale-out with ring attention overlapping communication with compute.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Prove that with \(n\) flows hashed onto \(n\) paths the maximum load is \(O(\ln n/\ln\ln n)\) and explain its implications.</summary>
+<div class="answer">
+<p>For a fixed path, \(\Pr(\text{load}\ge c)\le\binom{n}{c}(1/n)^c\le\frac{n^c}{c!}\frac{1}{n^c}=1/c!\). Union bound over \(n\) paths: \(\Pr(c_{\max}\ge c)\le n/c!\). Choose \(c\) with \(c!\ge n^2\): by Stirling, \(c\ln c\approx2\ln n\), so \(c\approx2\ln n/\ln\ln n\) makes the probability at most \(1/n\). A second-moment argument shows the maximum is at least \((1-\epsilon)\ln n/\ln\ln n\) w.h.p. Implications: efficiency \(\approx\ln\ln n/\ln n\to0\) as fabrics grow, so bigger non-blocking networks waste more of their capacity under per-flow hashing; balancing must be done per packet or adaptively. The "power of two choices" result (choose the less loaded of two random paths) reduces max load to \(\ln\ln n/\ln2+O(1)\), which is the theory behind adaptive and flowlet routing.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Why did hyperscalers and the Ultra Ethernet Consortium move towards loss-tolerant, multipath transports rather than lossless Ethernet?</summary>
+<div class="answer">
+<p>Lossless Ethernet with PFC brings head-of-line blocking, pause storms, congestion spreading and deadlock risks, and requires delicate tuning; and classic RDMA transports (go-back-N) recover badly from loss, so they depend on losslessness. Meanwhile per-flow ECMP wastes capacity for elephant flows. A transport that sprays packets across all paths, accepts out-of-order delivery (with NIC reorder buffers or direct placement), uses selective retransmission in hardware and modern congestion control solves both: load balances evenly (no balls-into-bins problem) and tolerates the occasional drop on standard switches. AWS's SRD demonstrated this at scale; UEC 1.0 (2025) standardises it so that multiple vendors' NICs and switches interoperate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Users report that a multi-node inference deployment is "randomly slow". How do you determine whether the network is at fault?</summary>
+<div class="answer">
+<p>Correlate per-step latencies with communication phases: instrument engine steps (time in all-to-all or KV transfer vs compute), collect NCCL/NIXL timing and NIC counters (retransmits, out-of-order packets, PFC pause frames, ECN marks, congestion drops), switch telemetry (queue depths, link utilisation, errors, flaps), and per-link optical diagnostics. Test pairwise bandwidth and latency between affected nodes with perftest or NCCL tests, compare with healthy pairs. Look for patterns: specific links or switches (bad optics, CRC errors), specific times (other jobs creating incast or hash collisions), specific GPUs (expert hotspots causing incast), or topology (cross-rail traffic crossing an oversubscribed spine). Fixes range from replacing optics and draining bad links, to rebalancing experts, enabling adaptive routing or spraying, and rail-aware placement.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-12">
+<summary><span class="lvl design">Design</span> Design the network for a 4,096-GPU inference cluster that will run disaggregated serving of DeepSeek-V3 and many smaller replicas.</summary>
+<div class="answer">
+<p>Scale-up: prefer NVL72 racks (57 racks) so DeepSeek-V3 decode uses wide EP inside one NVLink domain; smaller models fit within a server or rack. Back-end: one 400–800 Gb/s NIC per GPU, rail-optimised, non-blocking two-tier if radix allows (128-port 400G: 8,192 hosts) else three-tier; adaptive routing or packet spraying for any-to-any KV traffic; RDMA (NIXL) for prefill→decode transfers and remote prefix caches; rail-aware placement of prefill and decode pairs. Front-end: 200–400 Gb/s per server for weight downloads and requests, zone-local load balancers. Storage: local NVMe weight caches, peer-to-peer weight distribution over the back-end. Operations: telemetry on NICs and switches, optics monitoring, automatic link draining, failure domains aligned with racks and switch groups.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-13">
+<summary><span class="lvl design">Design</span> How would you reduce network cost for a training-and-inference cluster without hurting performance?</summary>
+<div class="answer">
+<p>Use the highest-radix switches available to cut tiers; rail-optimised design so most training traffic avoids the spine; thin the spine (oversubscribe cross-rail) if measurements show little cross-rail traffic, keeping enough for inference KV and EP traffic, or schedule inference pairs on the same rails; put the heaviest traffic (TP, EP) on scale-up domains (NVL72); use copper (DACs) within racks and optics only where needed; consider linear-drive or co-packaged optics to cut transceiver power; share one back-end between training and inference with QoS; and keep the front-end oversubscribed as it serves general traffic. Validate with traffic matrices from real workloads rather than worst-case assumptions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-14">
+<summary><span class="lvl core">Core</span> What drives cloud network charges for an LLM service, and how do you design to minimise them?</summary>
+<div class="answer">
+<p>Intra-zone traffic is usually free; inter-zone is about a cent per GB each way; egress to the internet several cents per GB; inter-region charges vary. Token streams are small (≈ tens of bytes per token), so egress for responses is minor. Large internal flows dominate: weight replication across zones/regions, KV or prefix-cache movement across zones, logs/traces/telemetry, dataset and checkpoint copies, cross-zone load balancing that sends requests to replicas in other zones. Minimise by zone-local request paths and caches, replicating weights once per zone into local caches, compressing and sampling telemetry, using private interconnects for cross-region flows, and tracking network cost per million tokens as a FinOps metric.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> Explain incast and how it shows up in MoE inference.</summary>
+<div class="answer">
+<p>Incast is many senders transmitting to one receiver simultaneously; the receiver's link (and the last switch's buffers) becomes the bottleneck, causing queueing, ECN marks, pauses or drops, and long tail latency. In expert-parallel all-to-all, each GPU sends the tokens routed to experts on every other GPU. If routing is unbalanced—popular experts, correlated prompts—some GPUs receive far more tokens than average, so their inbound links congest while others idle, and the whole step waits for them. Mitigations: auxiliary-loss-free or bias-based load balancing during training, expert replication and placement (EPLB) at serving time, capacity factors with token dropping (rarely used at inference), topology-aware dispatch kernels (DeepEP's hierarchical NVLink-then-RDMA scheme), and keeping EP within NVLink domains.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci04-qa-16">
+<summary><span class="lvl core">Core</span> Explain bisection bandwidth and oversubscription, and why AI back-ends are usually built non-blocking.</summary>
+<div class="answer">
+<p>Bisection bandwidth is the minimum total capacity across any cut splitting the hosts into equal halves; for a non-blocking fat tree it is \(Hr/2\). Oversubscription is the ratio of downlink to uplink capacity at a tier; 3:1 means hosts under a leaf can send only a third of their capacity outward simultaneously. General traffic rarely saturates all hosts at once, so front-ends are oversubscribed to save cost. Collectives drive every GPU at line rate simultaneously and synchronously, so oversubscription directly lengthens every step, hence 1:1 back-ends—though rail-optimised designs can oversubscribe the spine when most traffic stays within rails.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-fattree">M. Al-Fares, A. Loukissas, A. Vahdat. A Scalable, Commodity Data Center Network Architecture. <em>SIGCOMM</em>, 2008.</li>
+<li id="r-railonly">W. Wang et al. How to Build Low-cost Networks for Large Language Models (without Sacrificing Performance)? 2023. <a href="https://arxiv.org/abs/2307.12169">arXiv:2307.12169</a>.</li>
+<li id="r-dcqcn">Y. Zhu et al. Congestion Control for Large-Scale RDMA Deployments (DCQCN). <em>SIGCOMM</em>, 2015.</li>
+<li id="r-meta-roce">A. Gangidi et al. RDMA over Ethernet for Distributed AI Training at Meta Scale. <em>SIGCOMM</em>, 2024.</li>
+<li id="r-srd">L. Shalev, H. Ayoub, N. Bshara, E. Sabbag. A Cloud-Optimized Transport Protocol for Elastic and Scalable HPC (SRD). <em>IEEE Micro</em> 40(6), 2020.</li>
+<li id="r-tpuv4">N. P. Jouppi et al. TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning. <em>ISCA</em>, 2023. <a href="https://arxiv.org/abs/2304.01433">arXiv:2304.01433</a>.</li>
+<li>C. Clos. A Study of Non-Blocking Switching Networks. <em>Bell System Technical Journal</em> 32(2), 1953.</li>
+<li>A. Singh et al. Jupiter Rising: A Decade of Clos Topologies and Centralized Control in Google's Datacenter Network. <em>SIGCOMM</em>, 2015.</li>
+<li>M. Mitzenmacher. The Power of Two Choices in Randomized Load Balancing. <em>IEEE TPDS</em> 12(10), 2001.</li>
+<li>Ultra Ethernet Consortium. Ultra Ethernet Specification 1.0. 2025.</li>
+<li>C. Zhao et al. DeepEP: an efficient expert-parallel communication library. DeepSeek-AI, 2025. <a href="https://github.com/deepseek-ai/DeepEP">github.com/deepseek-ai/DeepEP</a>.</li>
+<li>R. Qin et al. Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving. 2024. <a href="https://arxiv.org/abs/2407.00079">arXiv:2407.00079</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

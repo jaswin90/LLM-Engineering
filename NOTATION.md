@@ -239,3 +239,10 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(B_{\max}\), \(\bar t\), \(t^{*}\) | largest batch that fits; mean context length of resident sequences; TPOT target (Ch. 3) |
 | \(\beta_{\text{eff}}\) | effective bandwidth of a replica, \(n_g\cdot\text{MBU}\cdot\beta\) (Ch. 3) |
 | \(\upsilon_i\) | fraction of time tenant \(i\) is active on a shared device (Ch. 3) |
+
+## Networks (Vol. II Ch. 4)
+| Symbol | Meaning |
+|---|---|
+| \(k_{\text{sw}}\) | switch radix (ports per switch) |
+| \(H\), \(r\) | number of hosts on a fabric; link rate per host |
+| \(n_f\), \(n_{\text{path}}\), \(c_{\max}\) | flows in a collective step; equal-cost paths; largest number of flows on one path |

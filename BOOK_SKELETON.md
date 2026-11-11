@@ -306,7 +306,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 1 | Why Serving Became a Cloud Problem | ✅ v1 |
 | 2 | The AI Datacenter: Power, Cooling and Space | ✅ v1 |
 | 3 | Accelerators as Cloud Products | ✅ v1 |
-| 4 | Datacenter Networks for AI | ⏳ |
+| 4 | Datacenter Networks for AI | ✅ v1 |
 | 5 | Storage, Weights and Cold Starts | ⏳ |
 | 6 | Containers and Kubernetes for Accelerators | ⏳ |
 | 7 | Scheduling a GPU Cluster | ⏳ |
