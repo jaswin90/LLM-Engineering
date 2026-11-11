@@ -1,0 +1,658 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 6 · Containers and Kubernetes for Accelerators — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 6 of Cloud AI Infrastructure: processes, namespaces and cgroups, containers versus virtual machines, GPUs inside containers, the Kubernetes architecture and object model, device plugins and Dynamic Resource Allocation, the GPU Operator and node software stack, multi-node replicas with LeaderWorkerSet, and probes, rollouts and graceful termination for LLM servers.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci06" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part II · Orchestration — Chapter 6</div>
+<h1 id="top">Containers and Kubernetes for Accelerators</h1>
+<p class="lede">A fleet of thousands of GPU servers is useless until something decides which program runs on which GPU, starts it, watches it, restarts it when it dies and replaces it when its code changes. In most AI infrastructure that something is Kubernetes, running containers. This chapter explains, from the operating system upward, what a container is, how Kubernetes turns declarations of desired state into running replicas, how GPUs are exposed to it, what software a GPU node needs, how one replica can span several machines, and how to configure the probes and shutdown behaviour of an inference server whose requests last minutes.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Part I built the physical cloud: power, accelerators, networks and storage. Its last chapter repeatedly said "start a replica on a node" without asking who does the starting. In a small deployment a person does: they log into a machine and run <code>vllm serve</code>. In Atlas, with thousands of GPUs, three model tiers, daily autoscaling from about 140 to more than 300 replicas of the 70B model alone, weekly engine upgrades and daily hardware failures, it must be software. That software has two layers. A <em>packaging</em> layer—containers—makes a replica's code and dependencies into a single artefact that runs identically on any machine. An <em>orchestration</em> layer—Kubernetes, in most clouds and AI labs—places those artefacts on machines and keeps them in the state the operators asked for.</p>
+<p>Kubernetes was designed for web services that need a fraction of a CPU and a few hundred megabytes of memory, start in seconds and can run anywhere. LLM replicas need eight GPUs connected by NVLink, terabytes of memory, specific NICs, minutes to start, and sometimes several machines that must start and stop together. Much of the engineering of AI platforms in 2023–2026 consisted of adapting Kubernetes to these needs, and interviewers for ML-platform and infrastructure roles probe that adaptation: "how does a pod get a GPU?", "what is a device plugin and why was DRA introduced?", "how do you deploy a model that spans two nodes?", "why did our rollout kill requests mid-stream?".</p>
+<p>We begin with the operating-system mechanisms that make a container (§6.1). We then explain why an orchestrator is needed and how Kubernetes is built (§6.2), its object model with LLM-specific examples (§6.3), how accelerators are exposed through device plugins and Dynamic Resource Allocation (§6.4), and the software stack on a GPU node (§6.5). We extend to replicas that span nodes (§6.6), and finish with the operational details that most often go wrong for LLM servers: probes, rollouts and graceful termination (§6.7), and the limits of Kubernetes for AI (§6.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain processes, namespaces and cgroups, and how they combine into a container; contrast containers with virtual machines; explain how a container uses the host's GPU driver.</li>
+<li>Describe the Kubernetes architecture (API server, etcd, scheduler, controllers, kubelet) and its declarative, reconciling model.</li>
+<li>Write the essential parts of a pod specification for an LLM server, and use Deployments, Services, labels, taints and affinity appropriately.</li>
+<li>Compare device plugins with Dynamic Resource Allocation for exposing GPUs, MIG slices and multi-node NVLink domains.</li>
+<li>List the components of a GPU node's software stack and their version dependencies, and what the GPU Operator automates.</li>
+<li>Deploy multi-node replicas as groups (LeaderWorkerSet), and configure probes, rolling updates and termination grace periods for long-running generation requests.</li>
+</ol>
+<p class="small muted">Uses: Chapter 1 (control and data planes), Chapter 3 (instances, MIG), Chapter 5 (images, cold starts), and Vol. I Chapters 12 and 18 (engines, parallelism).</p>
+</div>
+
+<h2 id="s6-1">6.1 Processes, isolation and the container</h2>
+<p>A running program on Linux is a <strong>process</strong>: an address space (the memory it can see), one or more threads of execution, and a set of resources the kernel tracks for it—open files, network sockets, a user identity, a current directory. The <strong>kernel</strong> is the privileged program that owns the hardware and mediates every process's access to it, through system calls. By default every process sees the same global world: the same file system tree, the same list of other processes, the same network interfaces, the same host name. Two programs that need different versions of the same library, or that both want to listen on port 8000, collide in that shared world.</p>
+<p>A <strong>container</strong> is a process, or group of processes, whose view of that world has been restricted and whose resource use has been capped, by two kernel mechanisms. <strong>Namespaces</strong> give a process a private copy of some global name space: a <em>mount</em> namespace gives it its own file-system tree (whose root is the container image's files), a <em>PID</em> namespace its own process numbering (it sees itself as process 1 and cannot see the host's processes), a <em>network</em> namespace its own interfaces, addresses and ports, and further namespaces isolate host names, inter-process communication and user identities. <strong>Control groups</strong> (cgroups) place the process in a hierarchy of resource budgets: at most so many CPU-seconds per second, at most so many bytes of memory (exceeding it triggers the out-of-memory killer), limits on I/O and process counts. A container runtime such as containerd or CRI-O creates these namespaces and cgroups, mounts the image's layers (§5.6) as the root file system, and starts the program inside.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — namespaces as restricted views, cgroups as budgets</div>
+<p>Model the kernel's global state as a collection of name spaces: a set of file paths \(\mathcal F\), a set of process identifiers \(\mathcal P\), a set of network endpoints \(\mathcal E\), and so on. Without containers, every process's view is the identity map on each. A namespace replaces the identity with a different map for a group of processes: the mount namespace maps the container's paths into a subtree of \(\mathcal F\) (its image) plus explicitly shared mounts; the PID namespace is an injective map from the container's process numbers into \(\mathcal P\) that hides everything outside its image. Isolation is the statement that the images of different containers' maps are disjoint except where sharing was declared. Cgroups are a separate structure: a rooted tree whose nodes carry budgets \((c_{\text{cpu}},c_{\text{mem}},\dots)\), with each container a leaf, each node's budget at most its parent's, and the kernel's scheduler and memory manager enforcing the constraint that the usage of every subtree stays within its node's budget. Kubernetes' resource requests and limits (§6.3) are written straight into this tree.</p>
+</div>
+
+<p>The crucial difference from a virtual machine (§3.1) is that all containers on a machine share one kernel. A VM runs its own kernel on virtual hardware; a container is just a restricted process on the host kernel. Containers therefore start in milliseconds rather than tens of seconds, use no memory for a second kernel, and run at native speed. The price is weaker isolation: a kernel vulnerability can let a process escape its container, so containers from mutually untrusting parties are often placed in separate VMs, or in sandboxes such as gVisor or Firecracker microVMs (Chapter 17), when isolation matters (Chapter 14).</p>
+<p>GPUs fit into this picture in a specific way that explains a whole class of production failures. The GPU's <em>kernel-mode driver</em> is part of the host kernel, so it is shared by all containers and is installed on the host, not in the image. A container reaches the GPU through device files such as <code>/dev/nvidia0</code> and <code>/dev/nvidiactl</code>, which the runtime exposes into its mount namespace only if it has been granted that GPU. The <em>user-mode</em> parts of the driver—the libraries that CUDA programs call, such as <code>libcuda.so</code>—must match the kernel-mode driver's version exactly, so they too come from the host: the NVIDIA Container Toolkit, a hook in the container runtime, mounts them into the container at start-up. The CUDA toolkit libraries the program was built against (cuBLAS, cuDNN, NCCL) live in the image. The resulting rule is that the image's CUDA version must be supported by the host's driver version; CUDA's compatibility guarantees allow a newer driver to run older CUDA images, but not, in general, the reverse. A fleet that upgrades its engine image to a newer CUDA before upgrading node drivers finds its pods failing with "CUDA driver version is insufficient", and this is among the most common GPU incidents.</p>
+
+<figure class="diagram" id="fig-6-1">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Virtual machines versus containers on a GPU server">
+<rect x="15" y="15" width="335" height="232" rx="10" class="bx"/>
+<text x="182" y="36" text-anchor="middle" class="t-sm t-b">Virtual machines</text>
+<rect x="30" y="48" width="145" height="96" rx="6" class="bx4"/><text x="102" y="66" text-anchor="middle" class="t-xs t-b">VM 1</text><text x="102" y="84" text-anchor="middle" class="t-xs">engine + CUDA libs</text><text x="102" y="100" text-anchor="middle" class="t-xs">guest kernel</text><text x="102" y="116" text-anchor="middle" class="t-xs">+ GPU driver</text><text x="102" y="134" text-anchor="middle" class="t-xs">(own kernel)</text>
+<rect x="190" y="48" width="145" height="96" rx="6" class="bx4"/><text x="262" y="66" text-anchor="middle" class="t-xs t-b">VM 2</text><text x="262" y="84" text-anchor="middle" class="t-xs">engine + CUDA libs</text><text x="262" y="100" text-anchor="middle" class="t-xs">guest kernel</text><text x="262" y="116" text-anchor="middle" class="t-xs">+ GPU driver</text><text x="262" y="134" text-anchor="middle" class="t-xs">(own kernel)</text>
+<rect x="30" y="152" width="305" height="30" rx="6" class="bx2"/><text x="182" y="172" text-anchor="middle" class="t-xs">hypervisor</text>
+<rect x="30" y="190" width="305" height="44" rx="6" class="bx3"/><text x="182" y="210" text-anchor="middle" class="t-xs">hardware: CPUs, memory, GPUs (passed through)</text><text x="182" y="225" text-anchor="middle" class="t-xs">boot: tens of seconds; strong isolation</text>
+<rect x="370" y="15" width="335" height="232" rx="10" class="bx"/>
+<text x="537" y="36" text-anchor="middle" class="t-sm t-b">Containers</text>
+<rect x="385" y="48" width="145" height="70" rx="6" class="bx4"/><text x="457" y="68" text-anchor="middle" class="t-xs t-b">container 1</text><text x="457" y="86" text-anchor="middle" class="t-xs">engine + CUDA toolkit</text><text x="457" y="102" text-anchor="middle" class="t-xs">namespaces + cgroup</text>
+<rect x="545" y="48" width="145" height="70" rx="6" class="bx4"/><text x="617" y="68" text-anchor="middle" class="t-xs t-b">container 2</text><text x="617" y="86" text-anchor="middle" class="t-xs">engine + CUDA toolkit</text><text x="617" y="102" text-anchor="middle" class="t-xs">namespaces + cgroup</text>
+<rect x="385" y="124" width="305" height="22" rx="6" class="bx5"/><text x="537" y="139" text-anchor="middle" class="t-xs">user-mode driver libs mounted from host (Container Toolkit)</text>
+<rect x="385" y="152" width="305" height="30" rx="6" class="bx2"/><text x="537" y="172" text-anchor="middle" class="t-xs">one shared host kernel + GPU kernel-mode driver</text>
+<rect x="385" y="190" width="305" height="44" rx="6" class="bx3"/><text x="537" y="210" text-anchor="middle" class="t-xs">hardware: CPUs, memory, GPUs (/dev/nvidia*)</text><text x="537" y="225" text-anchor="middle" class="t-xs">start: milliseconds; shared-kernel isolation</text>
+</svg>
+<figcaption><b>Figure 6.1 — Virtual machines and containers.</b> A VM carries its own kernel and GPU driver; containers share the host's, receive the matching user-mode driver libraries from the host at start-up, and bring only the CUDA toolkit and application in their image. The driver on the host must be new enough for the CUDA version in the image.</figcaption>
+</figure>
+
+<p>Figure 6.1 summarises the layering. In practice, cloud GPU fleets often use both: VMs or bare-metal machines as the unit the cloud provides, and containers inside them as the unit that operators deploy. Containers solve packaging; they do not decide where anything runs. That is the orchestrator's job.</p>
+
+<h2 id="s6-2">6.2 Why an orchestrator, and how Kubernetes is built</h2>
+<p>Suppose Atlas's operators had containers but no orchestrator. To deploy the 70B tier they would need to choose 311 eight-GPU machines that are healthy and free, start a container on each with the right image, arguments and GPU assignment, register each with the router, notice when one crashes and restart it, notice when a machine dies and start its replica elsewhere, add and remove replicas as the autoscaler requests, and replace every replica with a new image during a rollout without dropping below capacity. Each of these is simple; doing all of them correctly, continuously, for thousands of containers, while machines fail and operators make changes, is not. It is the problem Google solved internally with <strong>Borg</strong>, a cluster manager running hundreds of thousands of jobs across many clusters, described publicly in 2015<span class="cite"><a href="#r-borg">[1]</a></span>. Kubernetes, open-sourced by Google in 2014 and governed since 2015 by the Cloud Native Computing Foundation, distils Borg's lessons into a general-purpose system<span class="cite"><a href="#r-bok">[2]</a></span>.</p>
+<p>Kubernetes' central idea is the <strong>declarative API with reconciliation</strong> that we met abstractly in §1.7. Users do not issue commands such as "start a container on machine 17". They write objects that declare desired state—"there should be 311 replicas of this pod template"—into a store, and a set of independent <em>controllers</em> each watches part of the state and acts to make reality match the declaration. If a machine dies, nobody has to notice and reissue commands: the controller responsible sees that only 303 replicas exist where 311 were declared, and creates eight more. Figure 6.2 shows the components that implement this.</p>
+
+<figure class="diagram" id="fig-6-2">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Kubernetes architecture">
+<defs><marker id="a62" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="15" width="690" height="120" rx="10" class="bx4"/>
+<text x="30" y="35" class="t-sm t-b">Control plane</text>
+<rect x="280" y="50" width="160" height="40" rx="6" class="bx2"/><text x="360" y="75" text-anchor="middle" class="t-xs t-b">API server</text>
+<rect x="500" y="50" width="120" height="40" rx="6" class="bx"/><text x="560" y="68" text-anchor="middle" class="t-xs t-b">etcd</text><text x="560" y="82" text-anchor="middle" class="t-xs">replicated store</text>
+<rect x="40" y="50" width="100" height="40" rx="6" class="bx"/><text x="90" y="68" text-anchor="middle" class="t-xs t-b">scheduler</text><text x="90" y="82" text-anchor="middle" class="t-xs">pod → node</text>
+<rect x="150" y="50" width="110" height="40" rx="6" class="bx"/><text x="205" y="68" text-anchor="middle" class="t-xs t-b">controllers</text><text x="205" y="82" text-anchor="middle" class="t-xs">replicas, jobs…</text>
+<text x="360" y="118" text-anchor="middle" class="t-xs">every component reads and writes state only through the API server (watch + update)</text>
+<line x1="440" y1="70" x2="498" y2="70" class="ln" marker-end="url(#a62)"/>
+<line x1="140" y1="70" x2="150" y2="70" class="ln"/>
+<line x1="260" y1="70" x2="278" y2="70" class="ln" marker-end="url(#a62)"/>
+<rect x="15" y="160" width="220" height="125" rx="10" class="bx"/>
+<text x="125" y="180" text-anchor="middle" class="t-sm t-b">GPU node 1</text>
+<rect x="30" y="190" width="190" height="26" rx="5" class="bx3"/><text x="125" y="207" text-anchor="middle" class="t-xs">kubelet + container runtime</text>
+<rect x="30" y="222" width="190" height="26" rx="5" class="bx2"/><text x="125" y="239" text-anchor="middle" class="t-xs">device plugin / DRA driver</text>
+<rect x="30" y="254" width="190" height="24" rx="5" class="bx5"/><text x="125" y="270" text-anchor="middle" class="t-xs">pods: engine on 8 GPUs</text>
+<rect x="250" y="160" width="220" height="125" rx="10" class="bx"/>
+<text x="360" y="180" text-anchor="middle" class="t-sm t-b">GPU node 2</text>
+<rect x="265" y="190" width="190" height="26" rx="5" class="bx3"/><text x="360" y="207" text-anchor="middle" class="t-xs">kubelet + container runtime</text>
+<rect x="265" y="222" width="190" height="26" rx="5" class="bx2"/><text x="360" y="239" text-anchor="middle" class="t-xs">device plugin / DRA driver</text>
+<rect x="265" y="254" width="190" height="24" rx="5" class="bx5"/><text x="360" y="270" text-anchor="middle" class="t-xs">pods: 8 × 8B replicas</text>
+<rect x="485" y="160" width="220" height="125" rx="10" class="bx"/>
+<text x="595" y="180" text-anchor="middle" class="t-sm t-b">… thousands of nodes</text>
+<text x="595" y="215" text-anchor="middle" class="t-xs">each kubelet watches for pods</text>
+<text x="595" y="231" text-anchor="middle" class="t-xs">bound to its node, starts them,</text>
+<text x="595" y="247" text-anchor="middle" class="t-xs">and reports their status</text>
+<line x1="330" y1="92" x2="125" y2="158" class="ln" marker-end="url(#a62)"/>
+<line x1="360" y1="92" x2="360" y2="158" class="ln" marker-end="url(#a62)"/>
+<line x1="390" y1="92" x2="595" y2="158" class="ln" marker-end="url(#a62)"/>
+</svg>
+<figcaption><b>Figure 6.2 — How Kubernetes is built.</b> State lives in etcd behind the API server; controllers and the scheduler compute what should change; each node's kubelet makes it happen locally and reports back. No component commands another directly.</figcaption>
+</figure>
+
+<p>Walk through Figure 6.2 from the top. All cluster state—every object's desired specification and observed status—is stored in <strong>etcd</strong>, a strongly consistent key–value store replicated across a few machines with the Raft consensus protocol, so that the cluster's state survives the loss of a control-plane machine. The <strong>API server</strong> is the only component that talks to etcd; it validates objects, enforces access control and lets clients <em>watch</em> for changes. <strong>Controllers</strong> run reconciliation loops: the ReplicaSet controller, for instance, watches ReplicaSet objects and their pods, and creates or deletes pods to make their number match the declared count. The <strong>scheduler</strong> watches for pods that have no node, chooses a node for each according to resource requests and constraints, and records the choice (it "binds" the pod). On every node, the <strong>kubelet</strong> watches for pods bound to its node, asks the container runtime to start them with the requested devices, runs their health probes, and reports their status back through the API server. The data plane of a served model—requests flowing to engines—never passes through any of this; Kubernetes is purely a control plane, and a well-built serving system keeps serving if the Kubernetes control plane is briefly unavailable (static stability, §1.7).</p>
+
+<h2 id="s6-3">6.3 The object model, for an LLM server</h2>
+<p>Kubernetes exposes several dozen object types, but a model deployment needs only a handful, and it is easiest to learn them through one. The smallest deployable unit is the <strong>pod</strong>: one or more containers that are always scheduled together on one node, share a network namespace (and so an IP address) and can share volumes. An inference replica on one machine is one pod, usually with one main container running the engine and perhaps a small sidecar for metrics or log shipping. The pod's specification lists images, arguments, environment, volumes and—most importantly for scheduling—<strong>resource requests and limits</strong>. Requests are what the scheduler reserves on the node; limits are the cgroup caps the kubelet enforces. For GPUs, which cannot be overcommitted, request and limit are the same integer.</p>
+<p>A fragment of a pod template for Atlas's 70B replica looks like this:</p>
+<pre><code>containers:
+- name: engine
+  image: registry.example.com/atlas/vllm@sha256:3f1c…   # immutable digest
+  args: ["--model", "/models/llama3-70b-fp8", "--tensor-parallel-size", "8"]
+  resources:
+    requests: {cpu: "96", memory: 1200Gi, nvidia.com/gpu: 8}
+    limits:   {cpu: "96", memory: 1200Gi, nvidia.com/gpu: 8}
+  volumeMounts:
+  - {name: dshm, mountPath: /dev/shm}       # NCCL needs a large shared-memory area
+  - {name: model-cache, mountPath: /models} # node-local NVMe cache (§5.5)
+volumes:
+- {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+- {name: model-cache, hostPath: {path: /nvme/models}}
+nodeSelector: {gpu.example.com/type: h100-sxm}
+tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]</code></pre>
+<p>Each line encodes a lesson. The image is referenced by digest, so every replica runs identical bytes. The GPU request of eight forces the scheduler to place the pod on a node with eight free GPUs, and since all eight must share an NVSwitch, on a single eight-GPU server. The shared-memory volume exists because container runtimes give <code>/dev/shm</code> only 64 MB by default, which is far too small for NCCL and for engines that pass tensors between processes, and this default has caused countless mysterious hangs. The model cache mounts the node's NVMe so that weights load from the local tier (§5.5). The node selector and toleration express placement: GPU nodes carry a <strong>taint</strong> that repels ordinary pods (so that a log shipper does not occupy a GPU node's scheduling capacity), and GPU pods carry the matching <strong>toleration</strong>. Richer placement uses <strong>affinity</strong> rules: "schedule near pods with label X" or, more commonly for reliability, <strong>anti-affinity</strong> and <strong>topology spread constraints</strong>, "spread replicas evenly across zones and racks" (Chapter 13).</p>
+<div class="box example">
+<div class="box-title">Worked example — CPU requests can strand GPUs</div>
+<p><strong>Setup.</strong> Atlas-Small runs one Llama 3 8B replica per H100. A node has 8 GPUs, 192 vCPUs and 2,048 GiB of memory, of which the system reserves 8 vCPUs and 64 GiB for the kubelet, runtime and agents, leaving 184 vCPUs and 1,984 GiB allocatable.</p>
+<p><strong>A generous request.</strong> An engineer, having seen CPU-bound engines (Vol. I §12.2), sets each pod to request 32 vCPUs and 256 GiB. The scheduler can fit only \(\lfloor184/32\rfloor=5\) pods per node: three GPUs on every node are <em>stranded</em>—free, but unusable because no pod that wants them fits in the remaining CPU. Across 60 nodes, 180 H100s sit idle, about $3.9 million a year at $2.50 per GPU-hour.</p>
+<p><strong>A balanced request.</strong> Requests should divide the node's allocatable resources by the number of GPUs: \(184/8=23\) vCPUs and \(1984/8=248\) GiB per single-GPU pod. Setting 22 vCPUs and 240 GiB fits all eight pods, with a little room for sidecars.</p>
+<p><strong>Lesson.</strong> On a GPU node, every other resource should be requested in proportion to the GPUs a pod takes, so that the GPU is the binding resource. Chapter 7 generalises this into the fragmentation problem of multi-resource bin packing.</p>
+</div>
+
+<p>Pods are rarely created directly. A <strong>Deployment</strong> declares a pod template and a replica count, and manages a ReplicaSet that keeps that many pods running; changing the template triggers a <strong>rolling update</strong>, which we examine in §6.7. A <strong>Service</strong> gives a stable virtual address and DNS name to the set of pods matching a label selector, so that clients and routers can find replicas as they come and go; for LLM serving, the router of Vol. I §27.2 usually needs to know individual replicas, so it watches the Service's <em>endpoints</em> directly rather than relying on Kubernetes' simple load balancing. <strong>ConfigMaps</strong> and <strong>Secrets</strong> hold configuration and credentials. <strong>Namespaces</strong> (a Kubernetes concept, unrelated to kernel namespaces) partition objects among teams, with <strong>ResourceQuotas</strong> limiting what each may request—"the research namespace may use at most 512 GPUs"—which Chapter 7 develops into a scheduling policy. And because a Kubernetes object is just structured data, operators extend the system with <strong>custom resources</strong> and their own controllers; most AI platforms (KServe, LeaderWorkerSet, Ray, Dynamo, llm-d) are sets of custom resources and controllers layered on these primitives (Chapter 8).</p>
+
+<h2 id="s6-4">6.4 Exposing accelerators: device plugins and Dynamic Resource Allocation</h2>
+<p>Kubernetes knows about CPUs and memory natively. Everything else—GPUs, NICs, FPGAs—is exposed through extensions, and the design of those extensions has shaped AI on Kubernetes. The first mechanism, the <strong>device plugin</strong> framework, arrived in 2017 (alpha in Kubernetes 1.8). A device plugin is a small daemon on each node that tells the kubelet how many devices of a named resource the node has—for NVIDIA's plugin, <code>nvidia.com/gpu: 8</code>—and, when a pod is assigned some of them, tells the runtime which device files and environment variables to give the container. The scheduler treats the resource as an integer count, like CPU, and places pods wherever enough units are free.</p>
+<p>Integer counts were enough for "give me one GPU" and became awkward for everything else. A count cannot say <em>which</em> GPUs a pod should get: whether they share an NVSwitch, whether they are close to particular NICs and CPU sockets, whether they are H100s or H200s, or how much memory they have. It cannot express sharing (MIG slices or time-sliced replicas were bolted on by advertising each slice as a separate resource name, such as <code>nvidia.com/mig-3g.40gb</code>, which made the scheduler's view rigid). It cannot describe devices that span nodes, such as the 72-GPU NVLink domain of a GB200 rack. Kubernetes added a <strong>Topology Manager</strong> on each node to align CPU, memory and device assignments to the same NUMA node, but cluster-wide, the scheduler remained blind to device attributes.</p>
+<p><strong>Dynamic Resource Allocation</strong> (DRA), developed from 2022 and generally available in Kubernetes 1.34 in 2025, replaces counts with structured descriptions. A DRA driver on each node publishes a <em>ResourceSlice</em> listing its devices with typed attributes—model, memory, MIG profile, PCIe and NVLink topology, driver version—and capacities. Cluster administrators define <em>DeviceClasses</em>, and workloads create <em>ResourceClaims</em> that select devices with expressions over those attributes ("two GPUs with at least 80 GB of memory on the same NVLink domain") and can be shared between pods. Because the attributes are structured, the scheduler itself can evaluate claims and allocate specific devices during scheduling, rather than leaving the choice to the node. NVIDIA's DRA driver uses this to expose GPUs and MIG partitions with their properties and to represent multi-node NVLink domains, so that the pods of one replica on a GB200 NVL72 rack can be placed on the same domain and granted the cross-node memory channels they need.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 6.1 — Device plugins versus Dynamic Resource Allocation</caption>
+<thead><tr><th>Question a workload needs answered</th><th>Device plugin</th><th>DRA</th></tr></thead>
+<tbody>
+<tr><td>How many GPUs are free on this node?</td><td>Yes (integer count)</td><td>Yes</td></tr>
+<tr><td>Which GPU model, memory, driver?</td><td>Only via node labels</td><td>Per-device attributes, selectable</td></tr>
+<tr><td>Are these GPUs on one NVLink domain, near this NIC?</td><td>No (node-local Topology Manager only)</td><td>Yes, through topology attributes</td></tr>
+<tr><td>Can a GPU or MIG slice be shared among pods?</td><td>Via special resource names</td><td>Shared ResourceClaims, partitionable devices</td></tr>
+<tr><td>Can a device span nodes (NVL72 domain)?</td><td>No</td><td>Yes, with driver support</td></tr>
+<tr><td>Who chooses the specific devices?</td><td>Kubelet on the node</td><td>Scheduler, using structured parameters</td></tr>
+</tbody></table></div>
+
+<p>Table 6.1 is the reason DRA matters for inference. Atlas's fleet mixes H100 and H200 nodes, some partitioned with MIG for small isolated models (§3.4), and GB200 racks for DeepSeek-V3; with device plugins, each of these needs its own resource names, labels and taints, and the scheduler cannot reason about NVLink or NIC locality. With DRA, a replica's claim can state what it needs, and the scheduler can find it. Whatever the allocation mechanism, the devices only work if the node's software stack is correct, and that stack is more intricate than it looks.</p>
+
+<h2 id="s6-5">6.5 The software stack of a GPU node</h2>
+<p>Figure 6.3 shows the layers of software that must be present, in compatible versions, for a pod to run a CUDA program on a GPU node. From the bottom: the <strong>GPU firmware</strong> (and NVSwitch and NIC firmware); the <strong>kernel-mode driver</strong> loaded into the host kernel; on NVSwitch systems, the <strong>Fabric Manager</strong> service that configures the NVLink switch fabric (without it, multi-GPU NVLink traffic fails); on InfiniBand or RoCE nodes, the <strong>NIC drivers</strong> and the kernel modules that let NICs access GPU memory directly (GPUDirect RDMA); the <strong>container toolkit</strong> that injects user-mode driver libraries and device files into containers; the device plugin or DRA driver; <strong>DCGM</strong> (Data Center GPU Manager), which monitors health and exports metrics such as utilisation, memory usage, temperatures, power, ECC errors and NVLink errors; and, in the container image, the CUDA toolkit libraries, NCCL and the engine.</p>
+
+<figure class="diagram" id="fig-6-3">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Software stack on a GPU node">
+<rect x="20" y="20" width="460" height="34" rx="5" class="bx4"/><text x="250" y="42" text-anchor="middle" class="t-xs t-b">container image: engine, PyTorch, CUDA toolkit libs, NCCL, NIXL</text>
+<rect x="20" y="60" width="460" height="30" rx="5" class="bx5"/><text x="250" y="80" text-anchor="middle" class="t-xs">user-mode driver libs + device files, injected by the container toolkit</text>
+<rect x="20" y="96" width="225" height="30" rx="5" class="bx"/><text x="132" y="116" text-anchor="middle" class="t-xs">kubelet, container runtime</text>
+<rect x="255" y="96" width="225" height="30" rx="5" class="bx"/><text x="367" y="116" text-anchor="middle" class="t-xs">device plugin / DRA driver</text>
+<rect x="20" y="132" width="225" height="30" rx="5" class="bx3"/><text x="132" y="152" text-anchor="middle" class="t-xs">DCGM + exporter (health, metrics)</text>
+<rect x="255" y="132" width="225" height="30" rx="5" class="bx3"/><text x="367" y="152" text-anchor="middle" class="t-xs">Fabric Manager (NVSwitch)</text>
+<rect x="20" y="168" width="460" height="30" rx="5" class="bx2"/><text x="250" y="188" text-anchor="middle" class="t-xs">host kernel + GPU kernel-mode driver + NIC drivers + GPUDirect RDMA module</text>
+<rect x="20" y="204" width="460" height="30" rx="5" class="bx"/><text x="250" y="224" text-anchor="middle" class="t-xs">firmware: GPU, NVSwitch, NIC, BMC</text>
+<rect x="20" y="240" width="460" height="30" rx="5" class="bx3"/><text x="250" y="260" text-anchor="middle" class="t-xs">hardware</text>
+<rect x="510" y="60" width="195" height="174" rx="10" class="bx4"/>
+<text x="607" y="82" text-anchor="middle" class="t-xs t-b">GPU Operator manages:</text>
+<text x="525" y="104" class="t-xs">• driver (as a container)</text>
+<text x="525" y="122" class="t-xs">• container toolkit</text>
+<text x="525" y="140" class="t-xs">• device plugin / DRA driver</text>
+<text x="525" y="158" class="t-xs">• DCGM exporter</text>
+<text x="525" y="176" class="t-xs">• MIG manager</text>
+<text x="525" y="194" class="t-xs">• node feature discovery</text>
+<text x="525" y="212" class="t-xs">• validation workloads</text>
+<text x="20" y="290" class="t-xs">Compatibility rule: host driver must support the image's CUDA version; Fabric Manager must match the driver exactly.</text>
+</svg>
+<figcaption><b>Figure 6.3 — The GPU node stack.</b> Everything below the top two layers is installed on the host and shared by all containers; the image carries only the toolkit and application. Most "the GPU doesn't work in my pod" incidents are version mismatches between adjacent layers.</figcaption>
+</figure>
+
+<p>Keeping these layers consistent on thousands of nodes, through driver upgrades and node replacements, is itself an orchestration problem, and NVIDIA's <strong>GPU Operator</strong> solves it the Kubernetes way: it runs the driver, toolkit, device plugin or DRA driver, DCGM exporter, MIG manager and validation workloads as containers managed by controllers, so that a node joining the cluster is configured automatically and an upgrade is a change to a declared version that the operator rolls out node by node. Cloud providers' managed Kubernetes services offer GPU node images with these components preinstalled, and either approach works; what matters is that versions are declared, tested together and upgraded deliberately, with the driver upgraded before images that need newer CUDA.</p>
+<p>DCGM deserves a special mention, because GPU health is the foundation of reliability at scale (Chapter 13). GPUs fail in ways that do not crash the machine: an HBM page develops uncorrectable errors, an NVLink lane degrades, a GPU falls off the PCIe bus, clocks throttle because of a cooling fault. The driver reports many of these as <em>Xid</em> error codes in the kernel log, and DCGM can run active diagnostics. A node agent that watches these signals and <em>cordons</em> a node—marks it unschedulable—and drains its pods when a GPU is unhealthy turns silent degradation into a clean replacement. Health is per GPU, but many replicas use several machines, which raises the question of how Kubernetes handles a replica that spans nodes.</p>
+
+<h2 id="s6-6">6.6 Replicas that span nodes</h2>
+<p>Kubernetes' basic objects assume that each replica is one pod on one node. Several inference deployments break that assumption. A model too large for one eight-GPU server in the chosen precision—Llama 3 405B in BF16, or DeepSeek-V3 with wide expert parallelism on H100s—needs a <em>group</em> of pods on several nodes, connected over the back-end network, that together form one replica. Disaggregated serving (Vol. I Chapter 13) pairs prefill and decode workers that may be scaled separately but must find each other. And distributed engines typically need a <em>leader</em> process that receives requests and coordinates, plus <em>workers</em> that execute shards.</p>
+<p>Treating each pod of such a group as an independent replica goes wrong in three ways. The scheduler may place some pods of a group and not others, leaving GPUs reserved for a replica that cannot run (Chapter 7 develops this "gang scheduling" problem). A failure of one pod leaves the others running but useless, unless something restarts the whole group. And a rolling update that replaces pods one at a time produces groups with mixed versions, which may not even communicate. The <strong>LeaderWorkerSet</strong> API (LWS), developed under the Kubernetes SIG Apps project from 2024 for exactly this purpose, makes the group the unit: an LWS object declares a leader template, a worker template and a group size, and replicates <em>groups</em>; each group's pods share an identity and network names so that workers can find their leader, a failure of any pod restarts the whole group by default, and rolling updates replace whole groups. Figure 6.4 shows the structure. Related APIs—JobSet for batch, KubeRay for Ray clusters—solve the same problem in other settings.</p>
+
+<figure class="diagram" id="fig-6-4">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="LeaderWorkerSet groups for multi-node replicas">
+<rect x="15" y="15" width="690" height="40" rx="8" class="bx4"/><text x="360" y="40" text-anchor="middle" class="t-xs t-b">LeaderWorkerSet: replicas = 3 groups, size = 4 pods per group (e.g. 32 GPUs per DeepSeek-V3 replica on H100)</text>
+<g>
+<rect x="15" y="75" width="220" height="150" rx="10" class="bx"/><text x="125" y="95" text-anchor="middle" class="t-xs t-b">group 0 (one replica)</text>
+<rect x="30" y="105" width="190" height="26" rx="5" class="bx2"/><text x="125" y="122" text-anchor="middle" class="t-xs">leader pod: API, scheduler, 8 GPUs</text>
+<rect x="30" y="137" width="190" height="24" rx="5" class="bx3"/><text x="125" y="153" text-anchor="middle" class="t-xs">worker 1: 8 GPUs</text>
+<rect x="30" y="165" width="190" height="24" rx="5" class="bx3"/><text x="125" y="181" text-anchor="middle" class="t-xs">worker 2: 8 GPUs</text>
+<rect x="30" y="193" width="190" height="24" rx="5" class="bx3"/><text x="125" y="209" text-anchor="middle" class="t-xs">worker 3: 8 GPUs</text>
+</g>
+<g>
+<rect x="250" y="75" width="220" height="150" rx="10" class="bx"/><text x="360" y="95" text-anchor="middle" class="t-xs t-b">group 1</text>
+<rect x="265" y="105" width="190" height="26" rx="5" class="bx2"/><text x="360" y="122" text-anchor="middle" class="t-xs">leader pod</text>
+<rect x="265" y="137" width="190" height="24" rx="5" class="bx3"/><text x="360" y="153" text-anchor="middle" class="t-xs">worker 1</text>
+<rect x="265" y="165" width="190" height="24" rx="5" class="bx3"/><text x="360" y="181" text-anchor="middle" class="t-xs">worker 2 ✗ failed</text>
+<rect x="265" y="193" width="190" height="24" rx="5" class="bx3"/><text x="360" y="209" text-anchor="middle" class="t-xs">worker 3</text>
+</g>
+<g>
+<rect x="485" y="75" width="220" height="150" rx="10" class="bx"/><text x="595" y="95" text-anchor="middle" class="t-xs t-b">group 2</text>
+<rect x="500" y="105" width="190" height="26" rx="5" class="bx2"/><text x="595" y="122" text-anchor="middle" class="t-xs">leader pod</text>
+<rect x="500" y="137" width="190" height="24" rx="5" class="bx3"/><text x="595" y="153" text-anchor="middle" class="t-xs">worker 1</text>
+<rect x="500" y="165" width="190" height="24" rx="5" class="bx3"/><text x="595" y="181" text-anchor="middle" class="t-xs">worker 2</text>
+<rect x="500" y="193" width="190" height="24" rx="5" class="bx3"/><text x="595" y="209" text-anchor="middle" class="t-xs">worker 3</text>
+</g>
+<text x="360" y="236" text-anchor="middle" class="t-xs">A failure anywhere in group 1 restarts all of group 1; rollouts replace whole groups; the router sees three replicas.</text>
+</svg>
+<figcaption><b>Figure 6.4 — Multi-node replicas as groups.</b> Each group is one model replica spread over several nodes; the group, not the pod, is the unit of scaling, failure and update.</figcaption>
+</figure>
+
+<p>Grouping has a cost that a mathematician can compute immediately. If each node fails independently at rate \(\lambda_f\) per hour, a replica that needs all \(g\) of its nodes fails at rate \(g\lambda_f\), and if each failure takes the whole group out of service for a recovery time \(t_{\text{rec}}\), the fraction of time the replica is unavailable is about \(g\lambda_ft_{\text{rec}}\) when this is small. A four-node replica is down four times as often as a one-node replica, and its recovery takes longer because four nodes' worth of weights must be reloaded and a multi-node engine re-initialised. Chapter 13 turns this into a sizing rule for spare capacity; here it is the reason why large-memory hardware (H200, B200, MI300X) and rack-scale NVLink domains, which shrink \(g\), make large models operationally easier as well as faster.</p>
+
+<details class="drill">
+<summary>Drill 6.1 — How often is a multi-node replica down?</summary>
+<p>Suppose each eight-GPU node suffers a fault that takes it out of service on average once every 60 days, and a replica's recovery (replacement node, weight load, initialisation, warm-up) takes 10 minutes. What fraction of time is a one-node Llama 3 70B replica unavailable, and a four-node DeepSeek-V3 replica? How many spare DeepSeek-V3 replicas does a pool of 20 need to keep 20 serving at least 99.9% of the time?</p>
+<p><em>Solution.</em> \(\lambda_f=1/1440\) per hour. One node: unavailability \(\approx(1/1440)\times(1/6)\approx1.2\times10^{-4}\). Four nodes: \(4\times1.2\times10^{-4}\approx4.6\times10^{-4}\). In a pool of \(n\) replicas, the number down at a random moment is approximately Poisson with mean \(n\times4.6\times10^{-4}\); with 21 replicas the mean is about 0.0097, and \(\Pr(\ge2\text{ down})\approx0.0097^2/2\approx4.7\times10^{-5}\), so one spare already keeps at least 20 serving more than 99.99% of the time. The calculation is cheap here because recovery is fast; with a two-hour recovery (no caching, slow cold start), the mean rises twelve-fold to about 0.12 and \(\Pr(\ge2)\approx0.0066\), so two spares would be needed for 99.9%.</p>
+</details>
+
+<h2 id="s6-7">6.7 Probes, rollouts and graceful termination for LLM servers</h2>
+<p>Kubernetes manages a container's lifecycle through three kinds of <strong>probe</strong>—periodic checks the kubelet runs against the container—and a shutdown protocol. Their defaults were designed for web services that start in seconds and answer requests in milliseconds, and an LLM server that takes a minute to start and streams responses for minutes violates both assumptions. Many production incidents in LLM serving are probe and shutdown misconfigurations.</p>
+<p>A <strong>startup probe</strong> tells the kubelet when the container has finished starting; until it succeeds, the other probes are suspended. For an engine whose cold start takes 35 seconds on a good day and several minutes on a bad one (cache miss, slow storage), the startup probe must allow a generous window—often ten minutes or more—or the kubelet will kill the container mid-load and restart it, forever. A <strong>readiness probe</strong> tells Kubernetes whether the pod should receive traffic; a failing readiness probe removes the pod from its Service's endpoints without killing it. For an LLM server, "ready" should mean "weights loaded, engine warmed up, and able to accept work", and some platforms also report not-ready when the engine is saturated so that new requests go elsewhere—though load-aware routing (Vol. I §27.2) is a better tool for that. A <strong>liveness probe</strong> tells the kubelet whether the container is stuck and should be restarted. It is the most dangerous of the three: if it checks an endpoint served by the same busy event loop that runs inference, a long prefill or a burst of load can delay its answer beyond the timeout, and the kubelet then kills a healthy, busy replica—making the overload worse. Liveness checks for engines should be cheap, served independently of the inference loop, and lenient.</p>
+<p><strong>Graceful termination</strong> is the other half. When a pod is deleted—during a rollout, a scale-down or a node drain—the kubelet sends the container a termination signal, waits up to <code>terminationGracePeriodSeconds</code> (30 seconds by default), and then kills it. A well-behaved engine responds to the signal by failing readiness (so no new requests arrive), finishing the requests in flight, and exiting. The question is how long that takes, and the answer contains a subtlety. A request that is in flight at the moment of termination is not a typical request: long requests occupy the engine for longer, so they are over-represented among the requests in flight at any instant. This is the <em>inspection paradox</em>.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — the inspection paradox and residual generation time</div>
+<p>Let generation times \(S\) be independent with distribution \(F\) and mean \(\mathbb E[S]\). Sample a request that is in progress at a random instant. Its total length has the <em>length-biased</em> density \(s\,dF(s)/\mathbb E[S]\), and its remaining time \(R\) has the <em>equilibrium residual</em> distribution</p>
+\[
+\Pr(R>x)=\frac{1}{\mathbb E[S]}\int_x^{\infty}\bigl(1-F(u)\bigr)\,du ,
+\]
+<p>with mean \(\mathbb E[R]=\mathbb E[S^2]/(2\,\mathbb E[S])\). For heavy-tailed \(F\)—and output lengths are heavy-tailed, especially with reasoning models—\(\mathbb E[S^2]/\mathbb E[S]\) can greatly exceed \(\mathbb E[S]\), so the requests in flight at shutdown take far longer to finish than a typical request. A grace period sized to the median request time kills a large fraction of in-flight work.</p>
+</div>
+
+<p>Figure 6.5 makes this concrete. It plots, from simulation, the fraction of in-flight requests that would be cut off by a given grace period, for two workloads at a TPOT of 30 ms: a chat workload with lognormal output lengths of median 400 tokens, and a reasoning workload with median 2,000 tokens. A typical chat response streams for 12 seconds, but a 30-second grace period cuts off about one in five of the requests in flight. For the reasoning workload, a 30-second grace period cuts off nearly three-quarters, and even five minutes leaves one in ten unfinished.</p>
+
+<figure class="chart" id="fig-6-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Fraction of in-flight requests cut off by a termination grace period (simulation, TPOT 30 ms)","height":330,
+ "x":{"label":"Grace period (seconds, log)","log":true,"min":10,"max":600,"ticks":[10,30,60,120,300,600]},
+ "y":{"label":"In-flight requests not finished","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"Chat: lognormal output, median 400 tokens, σ = 0.9","color":"s1","points":[[10,0.539],[30,0.196],[60,0.0644],[120,0.0143],[180,0.0046],[300,0.0009],[600,0.0001]]},
+  {"name":"Reasoning: lognormal output, median 2,000 tokens, σ = 1.0","color":"s2","points":[[10,0.901],[30,0.727],[60,0.54],[120,0.326],[180,0.214],[300,0.107],[600,0.031]]}
+ ],
+ "vlines":[{"x":30,"text":"Kubernetes default 30 s"}]}
+</script>
+<figcaption><b>Figure 6.5 — The default grace period is far too short for LLM servers.</b> In-flight requests are length-biased, so their remaining times follow the equilibrium residual distribution. Each point samples 100,000 in-flight requests.</figcaption>
+</figure>
+
+<p>Figure 6.5 suggests three remedies, usually combined. First, set the grace period from the residual distribution of the workload, not from intuition: for chat, two to three minutes cuts off under 1%; for reasoning, ten minutes or more may be needed. Second, make interruption cheap: a client or gateway that can <em>resume</em> a stream on another replica—by resending the prompt plus the tokens already generated, which a prefix cache makes inexpensive—turns a cut-off request into a short pause rather than a failure (Chapter 11). Third, drain before terminating: a rollout controller that removes a replica from the router's pool well before deleting its pod lets in-flight work finish while no new work arrives. Kubernetes' <strong>PodDisruptionBudgets</strong>, which limit how many pods of a set may be voluntarily disrupted at once, protect capacity during node maintenance.</p>
+<details class="drill">
+<summary>Drill 6.2 — The mean residual of a lognormal</summary>
+<p>For lognormal generation times with median \(m_S\) and log-standard deviation \(\sigma\), \(\mathbb E[S]=m_Se^{\sigma^2/2}\) and \(\mathbb E[S^2]=\mathbb E[S]^2e^{\sigma^2}\). Compute the mean generation time and the mean residual time of in-flight requests for the chat workload (median 400 tokens, \(\sigma=0.9\)) and the reasoning workload (median 2,000 tokens, \(\sigma=1.0\)) at 30 ms per token.</p>
+<p><em>Solution.</em> The mean residual is \(\mathbb E[S^2]/(2\mathbb E[S])=\tfrac12\mathbb E[S]e^{\sigma^2}\). Chat: \(\mathbb E[S]=12\text{ s}\times e^{0.405}\approx18\) s, and the mean residual is \(\tfrac12\times18\times e^{0.81}\approx20\) s—longer than the mean request itself. Reasoning: \(\mathbb E[S]=60\text{ s}\times e^{0.5}\approx99\) s, and the mean residual is \(\tfrac12\times99\times e\approx134\) s. A grace period equal to even the <em>mean</em> residual would still cut off a large fraction, because the residual distribution is itself heavy-tailed; that is why Figure 6.5 needs minutes for chat and ten minutes for reasoning.</p>
+</details>
+
+<p>Grace periods interact with rollouts. A Deployment's rolling update replaces pods in batches controlled by <code>maxSurge</code> (how many extra pods may be created above the desired count) and <code>maxUnavailable</code> (how many pods may be missing). Each batch costs a drain time plus a cold start, so the duration of a rollout of \(n_r\) replicas with batches of \(n_b\) is about \(\lceil n_r/n_b\rceil(t_{\text{drain}}+t_{\text{cold}})\). Figure 6.6 shows how strongly this depends on the cold-start time of Chapter 5.</p>
+
+<figure class="chart" id="fig-6-6">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Duration of a rolling update of 100 replicas, with a 60 s drain per batch","height":320,
+ "x":{"label":"Batch size as a fraction of replicas (maxUnavailable, log)","log":true,"min":0.01,"max":0.25,"fmt":"pct","ticks":[0.01,0.02,0.05,0.1,0.25]},
+ "y":{"label":"Rollout duration (minutes, log)","log":true,"min":4,"max":2000,"ticks":[5,10,30,100,300,1000]},
+ "series":[
+  {"name":"Naive cold start, 15 min","color":"s2","points":[[0.01,1600],[0.02,800],[0.05,320],[0.1,160],[0.2,80],[0.25,64]]},
+  {"name":"Optimised cold start, 35 s","color":"s3","points":[[0.01,158],[0.02,79],[0.05,31.7],[0.1,15.8],[0.2,7.9],[0.25,6.3]]}
+ ]}
+</script>
+<figcaption><b>Figure 6.6 — Cold-start time sets the pace of change.</b> With slow cold starts, a cautious rollout of 1–2% of replicas at a time takes more than a day; teams then use large batches, losing capacity and risking a bad version reaching many replicas at once. Fast cold starts allow small, safe batches.</figcaption>
+</figure>
+
+<p>Figure 6.6 connects the plumbing of Chapter 5 to the safety practices of Chapter 13. With fifteen-minute cold starts, a rollout of 100 replicas in batches of 2% takes thirteen hours, so in practice teams roll out 20–25% at a time, which removes a quarter of capacity at once and lets a bad version reach a quarter of traffic before anyone notices. With cold starts of half a minute, 2% batches finish in about eighty minutes. The engineering that shortens cold starts therefore also makes deployments safer.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — configuring Atlas's 70B replicas</div>
+<p><strong>Startup probe.</strong> Typical cold start 35 s on a warm node with cached weights, worst case about 6 minutes (object-storage fallback, cold compilation): allow 15 minutes (e.g. check every 10 s, 90 failures).</p>
+<p><strong>Readiness.</strong> Ready when the engine has loaded weights, captured graphs and answered a warm-up request; the router additionally reads queue depth and KV usage from the engine's metrics for load-aware routing.</p>
+<p><strong>Liveness.</strong> A lightweight endpoint served by a separate thread, which fails only if the engine's step counter has not advanced for several minutes while requests are queued; timeout 10 s, five failures before restart.</p>
+<p><strong>Termination.</strong> Chat traffic, output P99 about 3,000 tokens at 30 ms, but in-flight residuals are longer: from Figure 6.5, 180 s leaves about 0.5% unfinished. Set a pre-stop hook that fails readiness and waits for the router to stop sending traffic (10 s), then <code>terminationGracePeriodSeconds: 240</code>; the gateway resumes any stream that is still cut off.</p>
+<p><strong>Rollout.</strong> A first canary batch of 2% (6 replicas) held for 30 minutes of metric comparison, then <code>maxSurge</code> of about 20 replicas (6%) with <code>maxUnavailable: 0</code> where spare GPUs allow (surge capacity instead of reduced capacity), and an automated pause on SLO regression. With 311 replicas at peak that is about 16 further batches at about 5 minutes each including drains: about two hours in all.</p>
+<p><strong>Disruption budget.</strong> At most 5% of the tier's replicas voluntarily disrupted at once, so node maintenance cannot drain a large part of the fleet simultaneously.</p>
+</div>
+
+<h2 id="s6-8">6.8 What Kubernetes does not do for AI</h2>
+<p>Kubernetes is the most common substrate for AI serving, but it is not complete, and it is worth stating its gaps clearly, since each is filled by a component discussed elsewhere in this volume. Its default scheduler places one pod at a time and has no notion of a group that must be placed together or not at all, nor of fair sharing of scarce GPUs among teams, nor of preempting low-priority training for high-priority inference in a controlled way; batch-scheduling add-ons such as Kueue, Volcano and NVIDIA's KAI scheduler (and, outside Kubernetes, Slurm) provide these, and Chapter 7 is devoted to them. It knows nothing about models, adapters, tokens or prefix caches, so model deployment, autoscaling on token-level metrics and cache-aware routing are built on top by serving platforms (Chapter 8). Its control plane has scale limits—the project's tested limit is about 5,000 nodes per cluster, and although cloud providers have demonstrated much larger clusters, large fleets are usually split across many clusters and regions, which requires a layer above Kubernetes (Chapter 12). And its abstractions are per-cluster and per-region, so global concerns—capacity across regions, failover, data residency—are outside it.</p>
+<p>There are also alternatives. High-performance computing centres and many training clusters use <strong>Slurm</strong>, a batch scheduler with mature gang scheduling, topology awareness and fair-share accounting, and some organisations run Slurm and Kubernetes side by side or Slurm on top of Kubernetes. <strong>Ray</strong> provides a distributed programming model with its own scheduler, widely used for batch inference and reinforcement-learning rollouts (Chapter 19), usually deployed on Kubernetes through KubeRay. For online serving at scale, however, Kubernetes plus a set of AI-specific extensions has become the default, and the most important of those extensions is a scheduler that understands GPUs.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We now know how a replica is packaged, how Kubernetes turns declarations into running pods, how GPUs and multi-node domains are allocated to them, and how to start, check, update and stop LLM servers safely. We repeatedly met the limits of Kubernetes' default scheduler: it places pods one at a time, cannot guarantee that all pods of a multi-node replica are placed together, does not prevent GPUs from being fragmented into unusable remnants, and has no policy for sharing a scarce cluster among inference, training and research teams. How should a GPU cluster be scheduled, and what does it cost to do it badly? Chapter 7 answers these questions.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>A container is a process with namespaces (restricted views of files, processes, network) and cgroups (resource budgets), rooted in an image; containers share the host kernel and start in milliseconds, with weaker isolation than VMs.</li>
+<li>GPUs in containers use the host's kernel-mode driver; matching user-mode libraries are injected by the container toolkit; the host driver must support the image's CUDA version.</li>
+<li>Kubernetes is declarative: desired state in etcd behind the API server, controllers reconcile, the scheduler binds pods to nodes, kubelets run them. It is a control plane; serving must survive its outages.</li>
+<li>LLM pod specs need: GPU requests (integers), image digests, large <code>/dev/shm</code>, node-local model caches, taints/tolerations for GPU nodes, and spread constraints across failure domains.</li>
+<li>Device plugins expose GPUs as integer counts; DRA (GA in 1.34, 2025) exposes structured device attributes and claims, enabling topology-aware placement, sharing and multi-node NVLink domains.</li>
+<li>The node stack—firmware, driver, Fabric Manager, NIC and GPUDirect modules, container toolkit, device plugin/DRA, DCGM—must be version-consistent; the GPU Operator manages it; DCGM and Xid signals drive health-based cordoning.</li>
+<li>Multi-node replicas are groups (LeaderWorkerSet): placed, failed and updated together; a \(g\)-node replica fails \(g\) times as often, so fewer, larger devices simplify operations.</li>
+<li>Startup probes must allow long cold starts; liveness probes must not kill busy engines; in-flight requests are length-biased (inspection paradox), so grace periods must follow the residual distribution—minutes, not 30 s—and streams should be resumable.</li>
+<li>Rollout time \(\approx\lceil n_r/n_b\rceil(t_{\text{drain}}+t_{\text{cold}})\): fast cold starts allow small, safe batches.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci06-mcq-01" data-topic="§6.1 Containers">
+<p class="q">Which two kernel mechanisms make a container?</p>
+<ol class="opts"><li>Hypervisors and IOMMUs</li><li data-correct>Namespaces and cgroups</li><li>Pickle and safetensors</li><li>NVLink and PCIe</li></ol>
+<div class="explain">Namespaces restrict what a process sees; cgroups cap what it uses.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-02" data-topic="§6.1 Containers">
+<p class="q">The main reason containers start much faster than VMs is that they:</p>
+<ol class="opts"><li>Use smaller images</li><li data-correct>Share the host kernel instead of booting their own</li><li>Do not use memory</li><li>Skip the GPU driver</li></ol>
+<div class="explain">A container is just a restricted process on the host kernel.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-03" data-topic="§6.1 Containers">
+<p class="q">Where does the GPU kernel-mode driver live when GPUs are used from containers?</p>
+<ol class="opts"><li>In each container image</li><li data-correct>On the host, shared by all containers</li><li>In etcd</li><li>In the GPU firmware only</li></ol>
+<div class="explain">User-mode libraries matching it are mounted into containers by the toolkit.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-04" data-topic="§6.1 Containers">
+<p class="q">Pods fail with "CUDA driver version is insufficient" after an image upgrade. The likely cause is:</p>
+<ol class="opts"><li>Too little HBM</li><li data-correct>The new image's CUDA version is newer than the host driver supports</li><li>A bad readiness probe</li><li>etcd is down</li></ol>
+<div class="explain">Upgrade node drivers before images that need newer CUDA.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-05" data-topic="§6.1 Containers">
+<p class="q">Which kernel namespace gives a container its own file-system tree?</p>
+<ol class="opts"><li>PID</li><li data-correct>Mount</li><li>Network</li><li>UTS</li></ol>
+<div class="explain">Its root is the image's layers plus declared mounts.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-06" data-topic="§6.2 Architecture">
+<p class="q">In Kubernetes, which component is the only one that talks to etcd?</p>
+<ol class="opts"><li>The scheduler</li><li>The kubelet</li><li data-correct>The API server</li><li>The container runtime</li></ol>
+<div class="explain">All others read and write state through the API server.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-07" data-topic="§6.2 Architecture">
+<p class="q">When a node with eight replicas dies, how does Kubernetes restore the declared count?</p>
+<ol class="opts"><li>An operator reissues commands</li><li data-correct>The ReplicaSet controller sees fewer pods than declared and creates new ones, which the scheduler places</li><li>The kubelet on the dead node restarts them</li><li>etcd copies the pods</li></ol>
+<div class="explain">Reconciliation, not commands.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-08" data-topic="§6.2 Architecture">
+<p class="q">etcd uses which protocol to remain consistent across replicas?</p>
+<ol class="opts"><li>Gossip</li><li data-correct>Raft consensus</li><li>Two-phase commit only</li><li>ECMP</li></ol>
+<div class="explain">So the cluster state survives the loss of a control-plane machine.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-09" data-topic="§6.2 Architecture">
+<p class="q">If the Kubernetes API server is unavailable for five minutes, a well-designed serving system should:</p>
+<ol class="opts"><li>Stop serving</li><li data-correct>Keep serving with existing replicas; only changes (scaling, rollouts) wait</li><li>Restart all pods</li><li>Fail over to another region immediately</li></ol>
+<div class="explain">Kubernetes is a control plane; static stability keeps the data plane up.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-10" data-topic="§6.3 Objects">
+<p class="q">Why do LLM pods typically mount a large memory-backed <code>/dev/shm</code>?</p>
+<ol class="opts"><li>To store weights</li><li data-correct>The default 64 MB is too small for NCCL and inter-process tensor sharing, causing hangs</li><li>For logging</li><li>Kubernetes requires it for GPUs</li></ol>
+<div class="explain">A classic source of mysterious multi-GPU failures.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-11" data-topic="§6.3 Objects">
+<p class="q">What is the purpose of a taint on GPU nodes and a matching toleration on GPU pods?</p>
+<ol class="opts"><li>To encrypt traffic</li><li data-correct>To keep pods that do not need GPUs off GPU nodes</li><li>To speed up scheduling</li><li>To limit memory</li></ol>
+<div class="explain">Only pods that tolerate the taint are scheduled there.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-12" data-topic="§6.3 Objects">
+<p class="q">Why reference images by digest rather than by a tag such as <code>latest</code>?</p>
+<ol class="opts"><li>Digests are shorter</li><li data-correct>Every replica is guaranteed to run identical bytes, and rollbacks are exact</li><li>Tags are not allowed</li><li>Digests pull faster</li></ol>
+<div class="explain">Tags are mutable references.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-13" data-topic="§6.3 Objects">
+<p class="q">Why do LLM routers usually watch a Service's endpoints rather than use Kubernetes' built-in Service load balancing?</p>
+<ol class="opts"><li>Services cannot route HTTP</li><li data-correct>They need per-replica load, cache and adapter information for token-aware, cache-affine routing</li><li>Endpoints are faster to encrypt</li><li>Services do not support GPUs</li></ol>
+<div class="explain">See Vol. I §27.2.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-14" data-topic="§6.4 Devices">
+<p class="q">A limitation of the device-plugin framework is that GPUs are exposed as:</p>
+<ol class="opts"><li>Structured objects with attributes</li><li data-correct>Integer counts without topology or attributes visible to the scheduler</li><li>Fractions of a CPU</li><li>Network endpoints</li></ol>
+<div class="explain">Hence DRA.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-15" data-topic="§6.4 Devices">
+<p class="q">What can DRA express that device plugins cannot? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Selecting devices by attributes such as memory and model</li><li data-correct>Topology constraints such as a shared NVLink domain</li><li data-correct>Devices spanning nodes, such as an NVL72 domain</li><li>Running containers without images</li></ol>
+<div class="explain">Claims are evaluated by the scheduler using structured parameters.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-16" data-topic="§6.4 Devices">
+<p class="q">DRA became generally available in which Kubernetes release?</p>
+<ol class="opts"><li>1.8</li><li>1.20</li><li data-correct>1.34</li><li>2.0</li></ol>
+<div class="explain">In 2025; device plugins dated from 1.8 (2017).</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-17" data-topic="§6.4 Devices">
+<p class="q">The node-level Topology Manager aligns:</p>
+<ol class="opts"><li>Pods across zones</li><li data-correct>CPU, memory and device assignments to the same NUMA node</li><li>Image layers</li><li>Network routes</li></ol>
+<div class="explain">It works only within a node.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-18" data-topic="§6.5 Node stack">
+<p class="q">Without the NVIDIA Fabric Manager running on an NVSwitch system:</p>
+<ol class="opts"><li>GPUs run faster</li><li data-correct>The NVLink switch fabric is not configured, so multi-GPU NVLink communication fails</li><li>Containers cannot start</li><li>DCGM stops</li></ol>
+<div class="explain">It must match the driver version exactly.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-19" data-topic="§6.5 Node stack">
+<p class="q">What does the GPU Operator do?</p>
+<ol class="opts"><li>Schedules GPU pods</li><li data-correct>Installs and upgrades the driver, toolkit, device plugin/DRA driver, DCGM exporter and MIG manager as managed containers</li><li>Trains models</li><li>Routes requests</li></ol>
+<div class="explain">It makes node configuration declarative.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-20" data-topic="§6.5 Node stack">
+<p class="q">Xid errors are:</p>
+<ol class="opts"><li>Kubernetes events</li><li data-correct>GPU driver error codes in the kernel log indicating faults such as memory errors or a GPU falling off the bus</li><li>Network packet IDs</li><li>Container exit codes</li></ol>
+<div class="explain">Health agents watch them to cordon and drain nodes.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-21" data-topic="§6.6 Multi-node">
+<p class="q">Why are multi-node replicas deployed as groups (e.g. LeaderWorkerSet) rather than independent pods?</p>
+<ol class="opts"><li>Groups use less memory</li><li data-correct>The pods must be placed, restarted and updated together; partial groups are useless or incompatible</li><li>Kubernetes forbids multi-node pods</li><li>Groups avoid NVLink</li></ol>
+<div class="explain">The group is the unit of scaling, failure and update.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-22" data-topic="§6.6 Multi-node">
+<p class="q">If each node fails at rate \(\lambda_f\), a replica that needs all of \(g\) nodes fails at rate:</p>
+<ol class="opts"><li>\(\lambda_f\)</li><li data-correct>\(g\lambda_f\)</li><li>\(\lambda_f^g\)</li><li>\(\lambda_f/g\)</li></ol>
+<div class="explain">Union of independent failure processes.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-23" data-topic="§6.7 Probes">
+<p class="q">What happens if an LLM server's startup probe allows only 60 seconds but loading sometimes takes five minutes?</p>
+<ol class="opts"><li>Nothing</li><li data-correct>The kubelet kills and restarts it mid-load, possibly forever</li><li>It is marked ready early</li><li>It runs on CPU</li></ol>
+<div class="explain">Startup windows must cover the worst realistic cold start.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-24" data-topic="§6.7 Probes">
+<p class="q">Why are liveness probes dangerous for busy LLM engines?</p>
+<ol class="opts"><li>They use GPU memory</li><li data-correct>If served by the busy inference loop they may time out under load, causing the kubelet to kill healthy replicas and worsen overload</li><li>They are never checked</li><li>They block rollouts</li></ol>
+<div class="explain">Serve them independently and make them lenient.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-25" data-topic="§6.7 Probes">
+<p class="q">A failing readiness probe causes Kubernetes to:</p>
+<ol class="opts"><li>Restart the container</li><li data-correct>Remove the pod from Service endpoints without killing it</li><li>Delete the node</li><li>Scale the Deployment</li></ol>
+<div class="explain">Liveness failures restart; readiness failures only stop traffic.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-26" data-topic="§6.7 Termination">
+<p class="q">Why do in-flight requests at shutdown tend to be longer than typical requests?</p>
+<ol class="opts"><li>Engines prioritise long requests</li><li data-correct>Length bias (inspection paradox): long requests occupy the engine longer, so they are over-represented at any instant</li><li>Shutdown slows generation</li><li>Short requests are rejected</li></ol>
+<div class="explain">The residual time has mean \(\mathbb E[S^2]/(2\mathbb E[S])\).</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-27" data-topic="§6.7 Termination">
+<p class="q">From Figure 6.5, with Kubernetes' default 30 s grace period, roughly what fraction of in-flight chat requests are cut off?</p>
+<ol class="opts"><li>About 1%</li><li data-correct>About 20%</li><li>About 50%</li><li>About 90%</li></ol>
+<div class="explain">For reasoning workloads, about 73%.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-28" data-topic="§6.7 Termination">
+<p class="q">Which practices reduce the harm of terminating LLM pods? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Grace periods sized from the residual-time distribution</li><li data-correct>Resumable streams via the gateway</li><li data-correct>Draining from the router before deletion</li><li>Shorter liveness timeouts</li></ol>
+<div class="explain">Short liveness timeouts cause extra kills.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-29" data-topic="§6.7 Rollouts">
+<p class="q">A rollout of 100 replicas in batches of 5 with 60 s drain and 15 min cold start takes about:</p>
+<ol class="opts"><li>16 minutes</li><li>80 minutes</li><li data-correct>320 minutes</li><li>1,600 minutes</li></ol>
+<div class="explain">20 batches × 16 minutes.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-30" data-topic="§6.7 Rollouts">
+<p class="q">Setting <code>maxUnavailable: 0</code> with a positive <code>maxSurge</code> means:</p>
+<ol class="opts"><li>No rollout can happen</li><li data-correct>New pods are created before old ones are removed, so capacity never drops below the desired count (if spare GPUs exist)</li><li>All pods are replaced at once</li><li>The rollout is paused</li></ol>
+<div class="explain">It needs spare capacity for the surge.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-31" data-topic="§6.8 Limits">
+<p class="q">Which needs does vanilla Kubernetes not meet for AI clusters? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Gang scheduling of multi-pod jobs</li><li data-correct>Fair sharing and quotas with borrowing among teams</li><li data-correct>Token-aware autoscaling and cache-aware routing</li><li>Restarting crashed containers</li></ol>
+<div class="explain">Restarts are core Kubernetes; the rest come from add-ons and platforms.</div>
+</div>
+
+<div class="mcq" data-id="ci06-mcq-32" data-topic="§6.1 Containers">
+<p class="q">When should untrusted tenants' containers be placed in VMs or microVM sandboxes rather than plain containers?</p>
+<ol class="opts"><li>Never; containers isolate fully</li><li data-correct>When isolation matters, because containers share the host kernel and a kernel exploit can escape</li><li>Only for CPU workloads</li><li>Only for training</li></ol>
+<div class="explain">gVisor, Firecracker or separate VMs add a boundary (Chapters 14 and 17).</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci06-qa-01">
+<summary><span class="lvl warm">Warm-up</span> What is a container, and how does it differ from a VM?</summary>
+<div class="answer">
+<p>A container is a process (or group) whose view of the system is restricted by kernel namespaces (mount, PID, network, UTS, IPC, user) and whose resources are capped by cgroups, with a root file system from an image of layered archives. It shares the host kernel, so it starts in milliseconds, has no second-kernel overhead and runs natively. A VM runs a full guest kernel on virtualised hardware via a hypervisor: slower to boot, more overhead, stronger isolation. Containers' shared kernel means a kernel exploit can escape; for untrusted multi-tenancy, put containers in VMs or sandboxes (gVisor, Firecracker).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-02">
+<summary><span class="lvl warm">Warm-up</span> How does a container get access to a GPU?</summary>
+<div class="answer">
+<p>The kernel-mode driver is loaded on the host. When the scheduler assigns GPUs to a pod (via the device plugin or DRA), the kubelet and container runtime expose the corresponding device files (<code>/dev/nvidia*</code>) into the container and, via the NVIDIA Container Toolkit hook, mount the user-mode driver libraries (libcuda etc.) that exactly match the host driver. The image supplies the CUDA toolkit, NCCL and the application. The host driver must support the image's CUDA version (newer drivers run older CUDA; not the reverse).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Describe Kubernetes' architecture and its reconciliation model.</summary>
+<div class="answer">
+<p>etcd (Raft-replicated key–value store) holds all state; the API server fronts it, validates, authorises and serves watches; controllers watch objects and act to make actual state match desired state (ReplicaSet controller creates or deletes pods); the scheduler binds unscheduled pods to nodes based on requests, constraints and scores; each node's kubelet starts bound pods via the container runtime, runs probes and reports status. Users declare desired state (Deployment with N replicas); controllers converge to it from any starting state, which makes the system self-healing. It is purely a control plane.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-04">
+<summary><span class="lvl core">Core</span> Write the key parts of a pod spec for an 8-GPU LLM replica and explain each.</summary>
+<div class="answer">
+<p>Image by digest (reproducibility, exact rollback); args for model path and TP size; resources: <code>nvidia.com/gpu: 8</code> (request = limit; forces one 8-GPU node), CPU and memory sized for engine CPU work and pinned buffers; <code>/dev/shm</code> as a memory-backed emptyDir of tens of GB (NCCL, IPC); node-local model cache mount (NVMe); node selector or DRA claim for GPU type; toleration for the GPU-node taint; topology spread across zones/racks; startup probe with a long window; readiness tied to weights loaded and warm-up; lenient, independent liveness; preStop hook and long terminationGracePeriodSeconds; environment for NCCL and network interfaces; security context. For multi-node replicas use LeaderWorkerSet.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-05">
+<summary><span class="lvl core">Core</span> Why was Dynamic Resource Allocation introduced, and what does it enable for inference?</summary>
+<div class="answer">
+<p>Device plugins advertise devices as integer counts, so the scheduler cannot see device attributes (model, memory, MIG profile), topology (NVLink domain, NIC/NUMA proximity), sharing, or devices that span nodes; workarounds used many resource names and labels. DRA (GA in Kubernetes 1.34) has drivers publish ResourceSlices with typed attributes; admins define DeviceClasses; workloads create ResourceClaims with selectors (e.g. two GPUs ≥ 80 GB on one NVLink domain) that can be shared; the scheduler allocates specific devices. For inference: mixed fleets (H100/H200/MIG/GB200) under one scheduler, topology-aware placement of TP groups and NICs, MIG partitions as allocatable devices, and multi-node NVLink domains (NVL72) for wide-EP replicas.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-06">
+<summary><span class="lvl core">Core</span> Our rollouts kill user requests mid-stream. Diagnose and fix.</summary>
+<div class="answer">
+<p>Likely: default 30 s terminationGracePeriodSeconds, no preStop drain, router still sending to terminating pods, and long or heavy-tailed generations. In-flight requests are length-biased (inspection paradox): their residual time distribution has mean \(\mathbb E[S^2]/(2\mathbb E[S])\), much longer than typical; with chat at 30 ms TPOT, 30 s cuts off about 20% of in-flight requests, with reasoning about 70%. Fix: preStop hook that fails readiness and waits for the router to deregister; grace period from the measured residual distribution (minutes; longer for reasoning); gateway-level resumable streams (resend prompt + generated tokens to another replica, cheap with prefix caching); drain via the router before deletion; surge-based rollouts so capacity does not drop; PodDisruptionBudgets.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-07">
+<summary><span class="lvl core">Core</span> How should startup, readiness and liveness probes be configured for an LLM server?</summary>
+<div class="answer">
+<p>Startup: generous window covering worst-case cold start (weights from object storage, cold compilation)—e.g. 10–15 minutes—so the kubelet does not kill a loading engine. Readiness: true only when weights are loaded, graphs captured and a warm-up request succeeds; false during drain; optionally false when saturated, though load-aware routing is better. Liveness: cheap endpoint on a separate thread that checks the engine is making progress (step counter advancing when work is queued), with long timeouts and several failures before restart; never tied to request latency, otherwise overload triggers restarts that worsen overload.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-08">
+<summary><span class="lvl core">Core</span> What is on a GPU node's software stack, and what usually breaks?</summary>
+<div class="answer">
+<p>Firmware (GPU, NVSwitch, NIC, BMC); host kernel with GPU kernel-mode driver, NIC drivers, GPUDirect RDMA module; Fabric Manager (NVSwitch systems, must match driver); container runtime and NVIDIA Container Toolkit; device plugin or DRA driver; DCGM and exporter; MIG manager; in the image, CUDA toolkit, NCCL, engine. Breakages: image CUDA newer than host driver; Fabric Manager mismatch after driver update; missing GPUDirect module (slow or failed RDMA); MIG configuration drift; DCGM not catching degraded GPUs; firmware inconsistencies across nodes. Mitigate with the GPU Operator or curated node images, declared versions tested together, staged upgrades (drivers before images), and health checks that cordon bad nodes.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Derive the grace period needed to finish 99% of in-flight requests, and explain why it exceeds the P99 request duration's intuition.</summary>
+<div class="answer">
+<p>Let generation time \(S\) have CDF \(F\). A request in flight at a random instant has length-biased total length and residual \(R\) with \(\Pr(R>x)=\frac{1}{\mathbb E[S]}\int_x^\infty(1-F(u))du\). Choose grace \(g\) with \(\Pr(R>g)\le0.01\). For heavy tails (lognormal with σ≈1, reasoning outputs), the integral decays slowly: the residual's mean \(\mathbb E[S^2]/(2\mathbb E[S])\) can exceed the mean of \(S\) many-fold. Numerically for lognormal chat (median 400 tokens, σ=0.9, 30 ms/token), \(\Pr(R>30\text{ s})\approx0.2\), \(\Pr(R>120)\approx0.014\), \(\Pr(R>180)\approx0.005\); reasoning (median 2,000, σ=1) needs about 10 minutes for 97%. Intuition from "most requests finish in 12 s" is wrong because sampling at an instant over-represents long requests.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How would you deploy DeepSeek-V3 across four 8-GPU nodes on Kubernetes?</summary>
+<div class="answer">
+<p>Use LeaderWorkerSet with group size 4: leader pod (API, scheduling, rank 0) plus three workers; each pod requests 8 GPUs and the back-end RDMA NICs (DRA claim or RDMA device plugin), large /dev/shm, host networking or a CNI that exposes RDMA devices; placement in the same network pod or rail group (affinity or DRA topology) to minimise hops; gang scheduling (Kueue/KAI or LWS with a gang-aware scheduler) so all four are placed together; group restart on any failure; group-level rolling updates; weights pre-cached on NVMe of the pool's nodes or broadcast from peers; startup probe window for multi-node init; router sees each group as one replica. Consider disaggregated prefill and decode groups as separate LWSs with a KV-transfer layer (NIXL). Size spares for \(g=4\) failure rate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why do multi-node replicas hurt availability, and how do you quantify and mitigate it?</summary>
+<div class="answer">
+<p>A replica needing all \(g\) nodes fails whenever any does: rate \(g\lambda_f\); unavailability ≈ \(g\lambda_ft_{\text{rec}}\), with \(t_{\text{rec}}\) also larger (more weights to reload, multi-node init). With node MTBF 60 days and 10-minute recovery, a 4-node replica is unavailable about 0.05% of the time; with 2-hour recovery about 0.55%. Model replicas down in a pool as Poisson and size spares to meet the target. Mitigate: shrink \(g\) (bigger-memory GPUs, FP8/FP4, NVL72 racks), speed recovery (cached weights, peer broadcast, snapshots, hot spare nodes), keep spare groups warm, isolate faults (restart only the engine, not reschedule, for transient errors), and spread groups across failure domains.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-12">
+<summary><span class="lvl design">Design</span> Design the Kubernetes setup for Atlas's three tiers across H100, H200 and GB200 nodes.</summary>
+<div class="answer">
+<p>Node pools per hardware type with taints; GPU Operator (or managed node images) with pinned driver/toolkit/DRA versions; DRA classes for H100, H200, MIG profiles and GB200 NVLink domains. 8B tier: Deployment per model with 1-GPU pods (or MIG claims for isolated tenants), spread across zones and racks. 70B tier: Deployments of 8-GPU pods on H100 (TP8) or 2–4-GPU pods on H200, image digests, NVMe model caches. DeepSeek-V3: LeaderWorkerSets on GB200 racks with domain-aware claims, disaggregated prefill/decode sets. Probes and grace periods per tier (reasoning needs long grace). Gang-aware batch scheduler (Kueue/KAI) for multi-node groups and for batch work in troughs at low priority. PodDisruptionBudgets; health agent cordoning on DCGM/Xid; cluster autoscaler with warm pools; serving platform on top for routing and autoscaling; multiple clusters per region for blast radius and control-plane scale.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-13">
+<summary><span class="lvl design">Design</span> How do you upgrade GPU drivers across a 2,000-node fleet without downtime?</summary>
+<div class="answer">
+<p>Test the new driver with current and next images, Fabric Manager, NCCL and engines on canary nodes of each hardware type, including performance and multi-node tests. Roll out by failure domain: cordon a small batch of nodes, drain pods gracefully (respecting PodDisruptionBudgets and long grace periods), upgrade driver and Fabric Manager (GPU Operator handles it as a declared version), validate with DCGM diagnostics and a smoke workload, uncordon. Keep spare capacity to absorb drained nodes; pace to the slowest of drain and cold start; pause automatically on error-rate or performance regressions. Only after drivers are upgraded fleet-wide, roll out images needing newer CUDA. Keep the previous driver available for rollback.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-14">
+<summary><span class="lvl core">Core</span> What are Kubernetes' limits for AI workloads, and what fills the gaps?</summary>
+<div class="answer">
+<p>Default scheduler: one pod at a time, no gang semantics, limited topology awareness, no fair-share with borrowing or controlled preemption among teams—filled by Kueue, Volcano, KAI scheduler, or Slurm. No model awareness: deployment of models and adapters, token-based autoscaling, cache-aware routing—filled by serving platforms (KServe, llm-d, Dynamo, AIBrix, Ray Serve). Control-plane scale (about 5,000 nodes officially tested; larger with provider tuning)—use many clusters with a fleet layer. Per-cluster, per-region scope—global traffic management and capacity across regions built above. Device allocation was coarse until DRA. Ray and Slurm serve batch and training patterns.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> How do cold-start time and batch size interact in rolling updates, and what is the safety argument for small batches?</summary>
+<div class="answer">
+<p>Rollout duration ≈ \(\lceil n_r/n_b\rceil(t_{\text{drain}}+t_{\text{cold}})\). With 15-minute cold starts, 2% batches of 100 replicas take about 13 hours, so teams use 20–25% batches—removing a quarter of capacity (or needing a quarter more surge) and exposing a quarter of traffic to a possibly bad version before detection. With 35-second cold starts, 2% batches take about 80 minutes. Smaller batches limit blast radius: if a regression is detected after the first batch, only 2% of traffic was affected, and statistical detection on canary metrics can happen before wider exposure. Thus investing in cold-start speed buys both capacity (less surge/headroom) and safety (progressive delivery).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci06-qa-16">
+<summary><span class="lvl warm">Warm-up</span> What is a PodDisruptionBudget and why does an inference tier need one?</summary>
+<div class="answer">
+<p>A PodDisruptionBudget limits how many pods of a labelled set can be voluntarily disrupted at once (by drains, node upgrades, cluster autoscaler scale-down), e.g. "at least 95% available" or "at most 5 unavailable". Without it, a node-maintenance operation could drain many replicas of a tier simultaneously, collapsing capacity. With long grace periods and slow cold starts, LLM pods take a long time to come back, so PDBs are essential to keep maintenance from becoming an outage. They do not protect against involuntary failures (node crashes), which spare capacity must absorb.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-borg">A. Verma et al. Large-scale cluster management at Google with Borg. <em>EuroSys</em>, 2015.</li>
+<li id="r-bok">B. Burns, B. Grant, D. Oppenheimer, E. Brewer, J. Wilkes. Borg, Omega, and Kubernetes. <em>ACM Queue</em> 14(1), 2016.</li>
+<li>M. Schwarzkopf et al. Omega: flexible, scalable schedulers for large compute clusters. <em>EuroSys</em>, 2013.</li>
+<li>D. Ongaro, J. Ousterhout. In Search of an Understandable Consensus Algorithm (Raft). <em>USENIX ATC</em>, 2014.</li>
+<li>Kubernetes Enhancement Proposals: KEP-3063 Dynamic Resource Allocation and KEP-4381 DRA with structured parameters; Kubernetes 1.34 release notes, 2025.</li>
+<li>Kubernetes SIG Apps. LeaderWorkerSet. 2024. <a href="https://github.com/kubernetes-sigs/lws">github.com/kubernetes-sigs/lws</a>.</li>
+<li>NVIDIA. GPU Operator, Container Toolkit, DCGM and Fabric Manager documentation; NVIDIA DRA driver for GPUs, 2024–2025.</li>
+<li>R. W. Wolff. <em>Stochastic Modeling and the Theory of Queues</em>. Prentice Hall, 1989 (residual life and the inspection paradox).</li>
+<li>A. Randal. The Ideal Versus the Real: Revisiting the History of Virtual Machines and Containers. <em>ACM Computing Surveys</em> 53(1), 2020. <a href="https://arxiv.org/abs/1904.12226">arXiv:1904.12226</a>.</li>
+<li>W. Kwon et al. Efficient Memory Management for LLM Serving with PagedAttention (vLLM). <em>SOSP</em>, 2023. <a href="https://arxiv.org/abs/2309.06180">arXiv:2309.06180</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

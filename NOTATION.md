@@ -254,3 +254,12 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(W_{\text{bytes}}\) | bytes of model weights, \(Nb_w\) (distinct from the time in system \(W\) of Little's law) |
 | \(n_{\text{conn}}\), \(\beta_{\text{conn}}\), \(\beta_{\text{NIC}}\), \(\beta_{\text{svc}}\) | concurrent storage requests; throughput of one; client NIC bandwidth; service-side limit |
 | \(c\) | chunk size of a pipelined transfer or broadcast (bytes) |
+
+## Orchestration (Vol. II Ch. 6–7)
+| Symbol | Meaning |
+|---|---|
+| \(\lambda_f\) | failure rate of one node (or device), per hour |
+| \(g\) | (Ch. 6–7 only, as a count) nodes in a multi-node replica group; elsewhere \(g\) is the GQA group size |
+| \(t_{\text{rec}}\) | recovery time of a failed replica |
+| \(S\), \(R\) | generation time of a request; residual (remaining) time of an in-flight request |
+| \(n_b\), \(t_{\text{drain}}\) | replicas replaced per rollout batch; time to drain a replica |

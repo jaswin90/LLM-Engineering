@@ -308,7 +308,7 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 3 | Accelerators as Cloud Products | ✅ v1 |
 | 4 | Datacenter Networks for AI | ✅ v1 |
 | 5 | Storage, Weights and Cold Starts | ✅ v1 |
-| 6 | Containers and Kubernetes for Accelerators | ⏳ |
+| 6 | Containers and Kubernetes for Accelerators | ✅ v1 |
 | 7 | Scheduling a GPU Cluster | ⏳ |
 | 8 | Serving Platforms and Control Planes | ⏳ |
 | 9 | Capacity, Procurement and Autoscaling | ⏳ |
