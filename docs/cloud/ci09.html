@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 9 · Capacity, Procurement and Autoscaling — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 9 of Cloud AI Infrastructure: capacity as the binding constraint for AI serving; on-demand, reserved, committed, capacity-block and spot purchase options; the optimal reserved capacity as a newsvendor problem; demand forecasting with quantiles; spot capacity and preemption mathematics; warm pools and fleet-level autoscaling; regional fallbacks and graceful degradation; and the capacity-planning process.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci09" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part III · Elasticity and Economics — Chapter 9</div>
+<h1 id="top">Capacity, Procurement and Autoscaling</h1>
+<p class="lede">The autoscaler of Chapter 8 can add a replica only if a GPU is available to run it, and in the cloud GPUs are bought on very different terms: by the hour with no guarantee, by the year at a discount, in blocks booked weeks ahead, or as spare capacity that the provider can reclaim with two minutes' notice. This chapter treats capacity as an economic and probabilistic problem: which terms exist, how much capacity to commit to, how to forecast demand, how to use preemptible capacity safely, how to size warm pools, and what to do when there is simply not enough.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>In classical cloud computing, capacity was an afterthought: a team asked for another virtual machine and got it within a minute, at a published price. GPU capacity in 2023–2026 did not work that way. The most useful accelerators were sold out for long periods, clouds rationed them through quotas, and the price of the same H100-hour varied by a factor of three or four depending on whether it was rented on demand, reserved for three years, booked as a block or taken as spot. For a serving organisation, the choice of purchasing terms moves the cost of every token as much as all of Volume I's engine optimisations combined, and the risk of being short of capacity at the daily peak is the risk of an outage.</p>
+<p>The questions are quantitative, and interviewers ask them that way: "our demand peaks at 2,500 GPUs and troughs at 1,150; how many should we reserve?", "can we serve production traffic on spot GPUs?", "how big should the warm pool be?", "we have a launch in six weeks; how do we make sure we have capacity?". Each has an answer derived from a demand model and a price list, and each answer depends on assumptions—about forecast error, about the availability of on-demand capacity, about what idle capacity can be used for—that must be stated.</p>
+<p>We begin with why capacity binds (§9.1) and the menu of purchase options (§9.2). We derive the optimal amount of committed capacity, which turns out to be a newsvendor problem (§9.3), and discuss how to forecast the demand it depends on (§9.4). We analyse spot capacity and preemption (§9.5), fleet-level autoscaling with warm pools (§9.6), what to do when capacity runs out (§9.7), and the planning process that ties it together (§9.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Explain why GPU capacity, unlike ordinary cloud capacity, must be planned and procured in advance.</li>
+<li>Compare on-demand, reserved and committed-use, capacity blocks, spot and neocloud contracts by price, commitment and availability.</li>
+<li>Derive the optimal reserved capacity for a demand curve (the critical-ratio condition) and adjust it for scarcity and for the value of lending idle capacity.</li>
+<li>Produce and use quantile forecasts of demand, and explain why planning to the mean fails.</li>
+<li>Compute the slowdown of preemptible jobs with and without checkpoints, and decide when spot capacity can carry serving traffic.</li>
+<li>Size warm pools, design fallbacks for capacity shortfalls, and describe a capacity-planning cycle.</li>
+</ol>
+<p class="small muted">Uses: Chapters 1, 3, 5, 7 and 8 of this volume; Vol. I §27.3 (autoscaling) and §27.7 (cost per token).</p>
+</div>
+
+<h2 id="s9-1">9.1 Capacity as the binding constraint</h2>
+<p>Ordinary cloud capacity behaves like a utility: there is so much of it, spread over so many customers, that any one customer's demand is a rounding error, and the provider can promise to supply whatever is asked for at a fixed price. This works because of statistical multiplexing—millions of customers' demands are nearly independent, so their total is smooth and predictable—and because CPU servers are cheap enough for providers to keep large buffers. GPU capacity in the 2020s broke both conditions. Demand was dominated by a few very large customers whose needs were correlated (everyone wanted the newest GPU at the same time), and the hardware was so expensive and supply-constrained that no provider could afford large idle buffers.</p>
+<p>The consequences shape every capacity decision. First, <em>lead time</em>: a large block of new GPUs takes months to obtain, whether by contract with a cloud or neocloud or by building (Chapter 2). Capacity for next quarter's peak must be committed this quarter. Second, <em>asymmetric risk</em>: being long (holding capacity that is not used) costs money, while being short (lacking capacity at the peak) causes latency violations, rejected requests and lost revenue, and possibly a public outage. Third, <em>quotas and availability</em>: on-demand GPU capacity may be listed but unobtainable, especially for large instances at peak hours in popular regions, so "we will just scale up on demand" is a plan that can fail exactly when it is needed. A capacity plan must therefore decide in advance how much capacity to secure on which terms, and what to do when demand exceeds it.</p>
+
+<h2 id="s9-2">9.2 The menu: how GPU capacity is sold</h2>
+<p>Clouds and neoclouds sell accelerator capacity on five broad kinds of terms, arranged in Figure 9.1 from most flexible to most committed. The exact names, discounts and rules differ between providers and change often; the structure is stable.</p>
+
+<figure class="diagram" id="fig-9-1">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="GPU purchase options by commitment and price">
+<line x1="60" y1="225" x2="700" y2="225" class="ln"/>
+<line x1="60" y1="225" x2="60" y2="25" class="ln"/>
+<text x="380" y="255" text-anchor="middle" class="t-xs">commitment (duration, take-or-pay) →</text>
+<text x="20" y="120" class="t-xs" transform="rotate(-90 20 120)">price per GPU-hour →</text>
+<rect x="75" y="40" width="130" height="50" rx="8" class="bx2"/><text x="140" y="60" text-anchor="middle" class="t-xs t-b">on-demand</text><text x="140" y="76" text-anchor="middle" class="t-xs">highest; may be unavailable</text>
+<rect x="75" y="165" width="130" height="50" rx="8" class="bx3"/><text x="140" y="185" text-anchor="middle" class="t-xs t-b">spot / preemptible</text><text x="140" y="201" text-anchor="middle" class="t-xs">lowest; reclaimable</text>
+<rect x="225" y="85" width="140" height="50" rx="8" class="bx4"/><text x="295" y="105" text-anchor="middle" class="t-xs t-b">capacity blocks</text><text x="295" y="121" text-anchor="middle" class="t-xs">days–weeks, booked ahead</text>
+<rect x="390" y="120" width="140" height="50" rx="8" class="bx"/><text x="460" y="140" text-anchor="middle" class="t-xs t-b">reserved / committed</text><text x="460" y="156" text-anchor="middle" class="t-xs">1–3 years, discounted</text>
+<rect x="555" y="150" width="140" height="50" rx="8" class="bx5"/><text x="625" y="170" text-anchor="middle" class="t-xs t-b">long-term contracts</text><text x="625" y="186" text-anchor="middle" class="t-xs">multi-year, dedicated clusters</text>
+<text x="380" y="40" class="t-xs">Moving right: lower price per hour, but paid whether used</text>
+<text x="380" y="55" class="t-xs">or not, and with guaranteed availability.</text>
+</svg>
+<figcaption><b>Figure 9.1 — The capacity menu.</b> Price falls with commitment; spot is the exception, cheap because it carries the risk of being taken away. Positions are schematic.</figcaption>
+</figure>
+
+<p><strong>On-demand</strong> capacity is rented by the hour or second with no commitment, at the list price. It is the most flexible and the most expensive, and for scarce GPUs its availability is not guaranteed: a request may fail for lack of capacity. AWS's on-demand price for an eight-H100 instance was about $98 per hour (about $12 per GPU-hour) at launch in 2023, and was cut by roughly 45% in mid-2025, illustrating both the premium and how fast prices move. <strong>Reserved instances and committed-use discounts</strong> trade a one- or three-year commitment, paid whether used or not, for discounts that for GPUs often reach 40–60% of on-demand, and—critically—for an assurance that the capacity exists. Savings plans are a variant that commits to a dollar amount of spending rather than to specific instances.</p>
+<p><strong>Capacity blocks</strong> are a newer product designed for GPUs: the customer books a fixed number of instances for a fixed period of days or weeks, starting at a future date, at a price set at booking. AWS introduced EC2 Capacity Blocks for ML in 2023, and Google's Dynamic Workload Scheduler offers comparable calendar-mode reservations and a "flex-start" mode that waits for capacity to become available. Blocks fit training runs, evaluation campaigns and launches. <strong>Spot</strong> (AWS, Azure) or <strong>preemptible</strong> and Spot VMs (Google) sell spare capacity at a large discount—up to 60–90% off on-demand—with the condition that the provider can reclaim it, after a short notice (two minutes on AWS, about 30 seconds on Google Cloud). For GPUs, spot capacity is often scarce precisely because the GPUs are fully used, so its availability fluctuates. Finally, <strong>long-term contracts</strong> with clouds and neoclouds—multi-year, take-or-pay agreements for dedicated clusters, often negotiated before the hardware is even installed—account for much of the frontier labs' capacity and offer the lowest effective price per GPU-hour at the cost of the largest commitment.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 9.1 — Purchase options for accelerators (representative; actual terms vary by provider and change often)</caption>
+<thead><tr><th>Option</th><th>Commitment</th><th>Price vs on-demand</th><th>Availability</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td>On-demand</td><td>none</td><td>1.0×</td><td>not guaranteed for scarce GPUs</td><td>bursts, experiments</td></tr>
+<tr><td>Spot / preemptible</td><td>none</td><td>≈ 0.1–0.4×</td><td>reclaimable with 30 s–2 min notice</td><td>batch, rollouts, fault-tolerant work</td></tr>
+<tr><td>Capacity block</td><td>days–weeks, booked ahead</td><td>≈ 0.5–0.9×</td><td>guaranteed for the window</td><td>training runs, launches, evals</td></tr>
+<tr><td>Reserved / committed (1–3 yr)</td><td>take-or-pay</td><td>≈ 0.4–0.6×</td><td>guaranteed</td><td>base load</td></tr>
+<tr><td>Long-term dedicated contract</td><td>multi-year, large</td><td>lowest effective</td><td>guaranteed, often dedicated</td><td>labs, very large providers</td></tr>
+</tbody></table></div>
+
+<p>The menu presents a portfolio problem. Committed capacity is cheap per hour but expensive when idle; on-demand capacity is expensive per hour and may not be there; spot is cheapest but unreliable. How much of each should a serving fleet hold?</p>
+
+<h2 id="s9-3">9.3 How much to commit: a newsvendor problem</h2>
+<p>Consider first a simplified version with two options. Demand for GPUs over a period of length \(T_{\text{per}}\) (a day, say, repeated for the life of the commitment) is a function \(D(\tau)\). We commit to \(R\) GPUs at price \(c_r\) per GPU-hour, paid for all of \(T_{\text{per}}\), and buy any excess, \(\max(D(\tau)-R,0)\), on demand at \(c_o>c_r\). The cost per period is</p>
+\[
+C(R)=c_rT_{\text{per}}R+c_o\int_0^{T_{\text{per}}}\max\bigl(D(\tau)-R,0\bigr)\,d\tau .
+\]
+
+<div class="box thm">
+<div class="box-title">Proposition 9.1 — The critical ratio for committed capacity</div>
+<p>If on-demand capacity is always available, \(C(R)\) is convex and is minimised at the level \(R^*\) for which the fraction of time that demand exceeds it equals the price ratio:</p>
+\[
+\frac{1}{T_{\text{per}}}\bigl|\{\tau:D(\tau)>R^*\}\bigr|=\frac{c_r}{c_o}.
+\]
+<p><em>Proof.</em> The integrand \(\max(D-R,0)\) is convex in \(R\), so \(C\) is convex. Its derivative is \(C'(R)=c_rT_{\text{per}}-c_o\,|\{\tau:D(\tau)>R\}|\), since increasing \(R\) by \(dR\) saves \(c_o\,dR\) for every instant at which demand exceeds \(R\). Setting \(C'(R^*)=0\) gives the condition. \(\square\)</p>
+</div>
+
+<p>Proposition 9.1 is the <em>newsvendor</em> result of operations research in a new guise: a newspaper seller who must order papers before knowing demand should order up to the quantile of demand at which the probability of selling the last paper equals the ratio of its cost to its price. Here the "probability" is the fraction of time, and the rule reads: commit to the level of demand that is exceeded a fraction \(c_r/c_o\) of the time. If committed capacity costs 40% of on-demand, commit to the level exceeded 40% of the day; if 25%, to the level exceeded a quarter of the day. Figure 9.2 shows the cost for Atlas's 70B tier, whose demand we model as \(D(\tau)=1825+675\cos(2\pi(\tau-13)/24)\) GPUs (peak 2,500 at 13:00, trough 1,150), with \(c_r=\$2.50\) and \(c_o=\$6.90\).</p>
+
+<figure class="chart" id="fig-9-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Daily cost of Atlas's 70B tier against committed capacity R (on-demand fills the rest)","height":330,
+ "x":{"label":"Committed GPUs R","min":0,"max":2600,"ticks":[0,500,1000,1500,2000,2500]},
+ "y":{"label":"Thousands of dollars per day","min":120,"max":320,"ticks":[150,200,250,300]},
+ "series":[
+  {"name":"Committed $2.50 + on-demand $6.90","color":"s1","points":[[0,302.2],[500,249.4],[1000,196.6],[1100,186.1],[1300,168.5],[1500,156.7],[1700,148.5],[1900,143.6],[2000,142.3],[2100,141.8],[2200,142.2],[2300,143.5],[2500,150.0]]}
+ ],
+ "vlines":[{"x":2108,"text":"R* ≈ 2,108"}]}
+</script>
+<figcaption><b>Figure 9.2 — The optimal commitment is high but below the peak.</b> Committing to nothing costs about $302,000 a day; committing to the peak, $150,000; the optimum, where demand exceeds \(R\) for \(c_r/c_o\approx36\%\) of the day, about $142,000. The curve is flat near the optimum.</figcaption>
+</figure>
+
+<p>Figure 9.2 carries three lessons. First, committing is worth a great deal: going from all on-demand to the optimum halves the cost. Second, the optimum is closer to the peak than to the mean, because on-demand capacity is so expensive: here about 2,100 GPUs, with on-demand covering the top five or six hours of each day. Third, the curve is flat near the optimum—committing to the full peak costs only about 6% more—so errors in the forecast matter less than they might seem, and the flatness is the right place to spend robustness.</p>
+<p>The simplified model ignores three features of GPU capacity, and each pushes the commitment upward. <em>On-demand may be unavailable</em>: if there is some probability that peak capacity cannot be bought, each GPU-hour of shortfall carries an additional penalty \(c_{\text{short}}\)—lost revenue, latency violations—and the critical ratio becomes \(c_r/(c_o+p_{\text{na}}c_{\text{short}})\) with \(p_{\text{na}}\) the probability of non-availability, which for scarce GPUs can push \(R^*\) to the peak or above it. <em>Idle committed capacity has value</em>: if troughs can be lent to batch inference, training or rollouts (§7.7), an idle committed GPU-hour is worth \(c_{\text{idle}}\) rather than nothing, so the effective cost of committing falls to \(c_r-c_{\text{idle}}\) during troughs, again pushing \(R^*\) up. <em>Demand grows and is uncertain</em>: a three-year commitment made against a forecast that may be wrong in either direction is a bet, and the condition of Proposition 9.1 must be applied to a distribution of future demand curves, not one. These considerations explain why serving organisations in 2023–2026 typically committed to most or all of their expected peak, kept on-demand and spot for bursts and batch, and used the troughs for other work.</p>
+
+<p>Figure 9.3 shows what the resulting portfolio looks like over one day. The committed base, here drawn at the peak-hugging level the scarcity analysis below recommends, covers nearly all of inference demand; the band between inference's curve and the commitment, wide at night, is lent to preemptible work; on-demand capacity covers any excursion above the commitment; and spot capacity runs batch work outside the commitment altogether, wherever it is cheap and available.</p>
+
+<figure class="diagram" id="fig-9-3">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="A capacity portfolio over one day">
+<line x1="60" y1="215" x2="690" y2="215" class="ln"/><line x1="60" y1="25" x2="60" y2="215" class="ln"/>
+<rect x="60" y="26" width="630" height="20" class="bx5"/><text x="375" y="40" text-anchor="middle" class="t-xs">spot: batch, evaluations, rollouts (outside the commitment)</text>
+<rect x="60" y="92" width="630" height="123" class="bx3"/>
+<path d="M60,175 C140,180 170,182 210,175 C260,160 290,85 335,72 C400,64 470,68 525,92 C575,120 615,160 690,175 L690,215 L60,215 Z" class="bx2"/>
+<line x1="60" y1="92" x2="690" y2="92" class="ln" stroke-dasharray="6 4"/>
+<text x="40" y="96" text-anchor="end" class="t-xs t-b">R</text>
+<text x="390" y="150" text-anchor="middle" class="t-xs t-b">inference demand</text>
+<text x="390" y="165" text-anchor="middle" class="t-xs">(served from committed capacity)</text>
+<text x="130" y="125" text-anchor="middle" class="t-xs t-b">committed, lent to</text>
+<text x="130" y="140" text-anchor="middle" class="t-xs t-b">preemptible work</text>
+<text x="610" y="66" text-anchor="middle" class="t-xs">on-demand: demand above R</text>
+<line x1="560" y1="70" x2="420" y2="78" class="ln"/>
+<g class="t-xs"><text x="60" y="232">00:00</text><text x="210" y="232">06:00</text><text x="365" y="232">12:00</text><text x="520" y="232">18:00</text><text x="660" y="232">24:00</text></g>
+<text x="375" y="252" text-anchor="middle" class="t-xs">Commitment R near the peak; troughs lent; on-demand for excursions; spot for work that tolerates reclaim.</text>
+</svg>
+<figcaption><b>Figure 9.3 — A capacity portfolio.</b> Committed capacity is sized near the peak and kept busy by lending its troughs; on-demand covers rare excursions above it; spot is used only for work whose cost of interruption is small.</figcaption>
+</figure>
+
+<div class="box example">
+<div class="box-title">Worked example — committing when on-demand is unreliable</div>
+<p><strong>Setup.</strong> As in Figure 9.2, but on-demand H100 capacity at the peak is unavailable with probability \(p_{\text{na}}=0.3\), and a GPU-hour of unserved peak demand costs \(c_{\text{short}}=\$20\) in lost revenue and SLO penalties. Troughs can be lent to batch work worth \(c_{\text{idle}}=\$1.25\) per GPU-hour.</p>
+<p><strong>Critical ratio.</strong> The marginal committed GPU-hour costs \(c_r=2.50\) when demand exceeds it and \(c_r-c_{\text{idle}}=1.25\) when it does not; the marginal on-demand alternative costs \(c_o+p_{\text{na}}c_{\text{short}}=6.90+6=12.90\). Balancing, the optimal \(R\) satisfies \(f\,(12.90-2.50)=(1-f)\times1.25\), where \(f\) is the fraction of time demand exceeds \(R\): \(f\approx0.107\).</p>
+<p><strong>Commitment.</strong> Demand exceeds \(R\) for 10.7% of the day when \(\cos\) exceeds \(\cos(0.107\pi)\approx0.944\), i.e. \(R\approx1825+0.944\times675\approx2{,}462\): within 2% of the peak.</p>
+<p><strong>Lesson.</strong> Once scarcity and the value of troughs are included, the rational commitment for a latency-critical tier is essentially the peak. The cost of holding the trough is then recovered by lending it, which is why capacity planning and the cluster sharing of Chapter 7 are one problem.</p>
+</div>
+
+<h2 id="s9-4">9.4 Forecasting demand</h2>
+<p>Every capacity decision rests on a forecast, and the forecast must answer two questions at different horizons. For procurement, months ahead: what will the peak be next quarter and next year, and how uncertain is it? For autoscaling, minutes to hours ahead: how much will demand rise over the next ten minutes, the cold-start horizon of Chapter 5? Both are time-series forecasts with the same ingredients, and LLM traffic has a recognisable structure. It has strong <em>daily seasonality</em> (the working day of the customers' time zones), <em>weekly seasonality</em> (weekdays above weekends), a <em>trend</em> (growth of the product, often tens of percent per quarter), and <em>events</em>—launches, marketing campaigns, a new model version, a viral application built on the API, an outage at a competitor—that produce step changes and spikes.</p>
+<p>Simple methods go a long way. A <em>seasonal naive</em> forecast ("same time last week, scaled by recent growth") is hard to beat for short horizons; exponential smoothing with trend and seasonality (Holt–Winters) and decomposition models such as Prophet handle several seasonalities and holidays; gradient-boosted or neural models add covariates such as planned launches. More important than the method is the <em>form</em> of the output. A capacity plan needs not a single number but <strong>quantiles</strong>: the level that demand will exceed with probability 50%, 10%, 1%. Planning to the median forecast leaves the fleet short half the time; planning to the 99th percentile of a wide distribution wastes money. The right quantile follows from the same critical-ratio reasoning as Proposition 9.1: provision committed capacity to the quantile of forecast demand whose exceedance probability equals the ratio of the cost of excess to the cost of shortage.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — quantile forecasts and the pinball loss</div>
+<p>A forecast of the \(q\)-quantile of a random demand \(D\) is the minimiser of the expected <em>pinball loss</em> \(\mathbb E[\ell_q(D-\hat d)]\), where \(\ell_q(x)=qx\) for \(x\ge0\) and \((q-1)x\) for \(x<0\). Differentiating, the optimum satisfies \(\Pr(D\le\hat d)=q\). The loss weighs under-forecasts by \(q\) and over-forecasts by \(1-q\), which is exactly the asymmetry of capacity: under-provisioning costs \(c_{\text{short}}\) per unit, over-provisioning costs \(c_{\text{over}}\), and the optimal provision is the quantile \(q=c_{\text{short}}/(c_{\text{short}}+c_{\text{over}})\). Training forecasting models with the pinball loss at the business-relevant quantile, rather than with squared error (which targets the mean), aligns the model with the decision. Evaluation should check <em>calibration</em>: demand should exceed the 90% forecast about 10% of the time.</p>
+</div>
+
+<p>For LLM services, one feature makes forecasting harder than for most web traffic: the <em>unit of demand changes</em>. A forecast of requests per second is not enough, because the GPUs needed per request depend on input and output lengths, cache-hit rates and the model mix, all of which drift: a new reasoning mode doubles output lengths (Drill 1.1), a prompt-template change destroys cache hits (Vol. I Drill 27.3), a customer migrates from the 8B to the 70B tier. Capacity forecasts should therefore be made in the units that map to GPUs—prefill and decode tokens per second per model, after cache hits—and product changes that alter those units should pass through capacity review like any other launch.</p>
+
+<details class="drill">
+<summary>Drill 9.1 — Which quantile to plan for?</summary>
+<p>Next quarter's peak demand for Atlas's 70B tier is forecast with median 2,900 GPUs and a standard deviation of 300 (approximately normal). Committed capacity costs $2.50 per GPU-hour; a GPU-hour of shortfall at the peak costs about $13 (on-demand at $6.90 when available, lost revenue when not). At what quantile, and to what level, should committed capacity be set, ignoring the value of troughs?</p>
+<p><em>Solution.</em> Over-provisioning costs \(c_{\text{over}}=2.50\) per unused GPU-hour; under-provisioning costs \(c_{\text{short}}-c_r\approx10.5\) net per GPU-hour short (we would have paid \(c_r\) anyway). \(q=10.5/(10.5+2.5)\approx0.81\). The 81st percentile of \(N(2900,300^2)\) is \(2900+0.88\times300\approx3{,}160\) GPUs. Planning to the median would leave the tier short of capacity at the peak on almost half of the days.</p>
+</details>
+
+<h2 id="s9-5">9.5 Spot capacity and preemption</h2>
+<p>Spot capacity is the cheapest GPU time available, and for some workloads it is ideal. Its defining property is that it can be taken away: when the provider needs the capacity for on-demand or reserved customers, it sends a short notice and terminates the instance. Whether a workload can use spot depends on what an interruption costs it, and that can be computed.</p>
+<p>Consider first a batch job that needs \(L\) hours of uninterrupted work and makes no checkpoints, on capacity that is reclaimed as a Poisson process with rate \(\lambda_p\) per hour. Each interruption loses all progress and forces a restart. The expected total time to completion is a classical result:</p>
+\[
+\mathbb E[T_{\text{done}}]=\frac{e^{\lambda_pL}-1}{\lambda_p},
+\]
+<p>so the slowdown factor \((e^{\lambda_pL}-1)/(\lambda_pL)\) grows exponentially with the expected number of interruptions during one attempt, \(\lambda_pL\). A job expected to see one interruption per attempt takes 1.7 times its ideal time; three interruptions, more than six times. With checkpoints every \(\tau_c\) hours (and negligible checkpoint cost), the job is a sequence of short jobs of length \(\tau_c\), each with slowdown \((e^{\lambda_p\tau_c}-1)/(\lambda_p\tau_c)\approx1+\lambda_p\tau_c/2\), so frequent checkpoints make the exponent disappear. Figure 9.4 compares the two.</p>
+
+<figure class="chart" id="fig-9-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Slowdown of a job on preemptible capacity, against expected interruptions per job","height":320,
+ "x":{"label":"Expected interruptions during the job, λ_p L","min":0,"max":3.1,"ticks":[0,0.5,1,1.5,2,2.5,3]},
+ "y":{"label":"Completion time / ideal time","min":1,"max":6.5,"ticks":[1,2,3,4,5,6]},
+ "series":[
+  {"name":"No checkpoints: (e^x − 1)/x","color":"s2","points":[[0.1,1.052],[0.25,1.136],[0.5,1.297],[1,1.718],[1.5,2.32],[2,3.19],[2.5,4.47],[3,6.36]]},
+  {"name":"Checkpoint every L/10","color":"s3","points":[[0.1,1.005],[0.25,1.013],[0.5,1.025],[1,1.052],[1.5,1.079],[2,1.107],[2.5,1.136],[3,1.166]]}
+ ]}
+</script>
+<figcaption><b>Figure 9.4 — Checkpoints make spot capacity usable.</b> Without checkpoints, the expected completion time grows exponentially with the number of interruptions per attempt; with ten checkpoints per job, the slowdown stays below 20% even at three interruptions per job's length.</figcaption>
+</figure>
+
+<p>For batch inference, the "checkpoint" is simply the set of completed items: a job that processes a billion prompts writes each result as it finishes, so an interruption loses only the items in flight, and spot capacity is nearly perfect for it (Chapter 19). For reinforcement-learning rollouts, which are also inference, the same holds. For training, asynchronous checkpoints make spot viable when interruptions are not too frequent (§7.6), though large synchronous jobs suffer because any one node's interruption stops all of them.</p>
+<p>Online serving is the hard case. A serving replica on spot capacity can be reclaimed at any moment, taking its in-flight requests and its prefix cache with it, and its replacement needs a cold start. Spot can still carry serving traffic if three conditions hold. The fleet must tolerate the loss of a spot replica, which means the replicas are a minority of capacity or have spare capacity behind them. The two-minute notice must be enough to drain: stop admitting requests, let short requests finish, and hand long ones to other replicas by resumable streams (§6.7). And spot interruptions must not be strongly correlated: if the provider reclaims a whole pool of instances at once, as happens when a region's demand spikes, many spot replicas disappear together, and the fleet must survive that correlated event. The usual answer is <em>diversification</em>: spread spot capacity over several instance types, zones and even regions, whose reclamations are less correlated, and treat spot as an overlay on top of committed capacity that covers the SLO on its own.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — can Atlas-Small run partly on spot?</div>
+<p><strong>Setup.</strong> At peak, Atlas-Small needs 427 GPUs at its target utilisation (Chapter 1). Committed H100s cost $2.50 per GPU-hour, spot $1.00. Spot is reclaimed at an average rate of one interruption per instance per 20 hours, but in bad hours a pool can lose 50% of its spot instances at once.</p>
+<p><strong>Design.</strong> Hold committed capacity sufficient to meet the SLO at a degraded utilisation of 90% if all spot disappears: \(427\times0.75/0.9\approx356\) committed GPUs. Add 71 spot GPUs, spread over three instance types and two zones, to bring normal utilisation back to the 75% target.</p>
+<p><strong>Saving.</strong> \(71\times(2.50-1.00)\times24\approx\$2{,}560\) per day, about $0.9 million a year—about 17% of the tier's GPU cost—at the price of running hotter (worse tail latency) whenever spot is lost. With 1-GPU replicas, 30-second cold starts from local caches and resumable streams, each interruption costs a few seconds of extra latency for the affected requests.</p>
+<p><strong>When not to.</strong> For the 70B tier, each spot interruption removes an 8-GPU replica and its cache, and a correlated reclaim of 50% would remove dozens of replicas at once; the committed base must then be larger and the saving smaller. For DeepSeek-V3's multi-node replicas, a single instance's reclaim takes down a whole group, so spot is rarely worth it.</p>
+</div>
+
+<h2 id="s9-6">9.6 Fleet-level autoscaling and warm pools</h2>
+<p>Chapter 8 developed the replica autoscaler, which decides how many replicas each pool should run. Underneath it, the <em>fleet</em> must supply GPUs for those replicas, and at that level two time constants matter: the time to start a replica on an existing node (\(t_{\text{cold}}\) without \(t_{\text{node}}\), seconds to a minute when optimised) and the time to obtain a new node from the cloud (\(t_{\text{node}}\), minutes when available, never when not). A fleet whose replica autoscaler can act in thirty seconds but whose nodes take five minutes to appear behaves like a five-minute system during ramps, unless it holds a <strong>warm pool</strong>: nodes that are provisioned, booted, joined to the cluster, with images pulled and weights cached, but not running replicas.</p>
+<p>The warm pool's size follows from the same reasoning as headroom (§5.8): it must cover the demand growth that can occur during one node-provisioning time. If demand can rise at \(\dot\lambda\) GPUs per minute, the pool needs at least \(w=\dot\lambda\,t_{\text{node}}\) GPUs to bridge the gap while new nodes are requested, plus enough to absorb the failure of the largest failure domain (Chapter 13). Its cost is \(w\,c_{\text{gpu}}\) per hour, unless—as in §7.7—the warm nodes run preemptible work that can be evicted in seconds, in which case they are "warm" in the sense that a replica can start there quickly, and their cost is largely recovered. In a fleet built on committed capacity, the "warm pool" is simply the portion of committed capacity lent to borrowers, and fleet autoscaling becomes reclamation.</p>
+<p>Fleet-level autoscaling has a second job: moving capacity <em>between</em> models and tiers. Atlas's three tiers peak at slightly different times (enterprise traffic for the 70B tier peaks during business hours, consumer traffic for the 8B tier peaks in the evening), and a fleet that can reassign GPUs between tiers needs less total capacity than one with fixed partitions—the statistical multiplexing that ordinary clouds enjoy, regained within one organisation. The enablers are the same as before: fast cold starts, nodes that can host any tier's replicas (weights for all tiers cached locally), and a scheduler that treats tiers as priority classes over a shared pool rather than as separate clusters.</p>
+
+<details class="drill">
+<summary>Drill 9.2 — Sizing a warm pool</summary>
+<p>During the morning ramp, Atlas's 70B tier grows by about 15 GPUs per minute (1.9 replicas of eight). New nodes take 6 minutes to provision when available. Replica cold starts on warm nodes take 35 s. How large a warm pool is needed to keep up with the ramp, and what does it cost per day if held for 4 hours and idle?</p>
+<p><em>Solution.</em> \(w=15\times6=90\) GPUs (about 12 nodes), plus the 35 s cold start's worth of growth (about 9 GPUs) as replica-level headroom: about 100 GPUs. Idle for 4 hours at $2.50 per GPU-hour: \(100\times4\times2.5=\$1{,}000\) per day. If instead those nodes run batch work that can be preempted in under a minute, the warm pool costs only the lost batch progress. If node provisioning can fail outright at peak (scarce on-demand), the warm pool must be committed capacity, and its size is set by the forecast quantile of §9.4 rather than by the ramp rate.</p>
+</details>
+
+<h2 id="s9-7">9.7 When capacity runs out</h2>
+<p>However carefully capacity is planned, there will be moments when demand exceeds it: a forecast miss, a viral launch, the loss of a zone, a provider that cannot deliver on-demand capacity. A well-designed service degrades gracefully instead of failing, and the options form a ladder from invisible to visible. First, <em>use other capacity</em>: spill traffic to other regions that have headroom, if latency and data-residency rules allow (Chapter 12), or to another cloud or neocloud where the service is deployed. Second, <em>run hotter</em>: raise target utilisation and batch sizes, accepting higher latency within the SLO's slack (Vol. I §11.8 shows how steeply queueing delay rises, so this buys only a little). Third, <em>shed deferrable work</em>: pause batch jobs, evaluations and rollouts that share the fleet, and reclaim their capacity. Fourth, <em>degrade quality gracefully</em>: route some traffic from a large model to a smaller one (a cascade, Vol. I §27.6), shorten maximum output lengths, disable expensive features such as long reasoning modes for free-tier users. Fifth, <em>prioritise</em>: admit paying and high-priority tenants and reject or queue others with clear errors and retry-after headers (Chapter 11). Each rung should be a pre-planned, tested switch, not an improvisation during an incident.</p>
+
+<figure class="diagram" id="fig-9-5">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="The ladder of responses to a capacity shortfall">
+<rect x="20" y="200" width="250" height="34" rx="6" class="bx3"/><text x="145" y="221" text-anchor="middle" class="t-xs t-b">1 · spill to other regions / clouds</text>
+<rect x="70" y="160" width="250" height="34" rx="6" class="bx3"/><text x="195" y="181" text-anchor="middle" class="t-xs t-b">2 · run hotter (within SLO slack)</text>
+<rect x="120" y="120" width="250" height="34" rx="6" class="bx4"/><text x="245" y="141" text-anchor="middle" class="t-xs t-b">3 · shed batch, evals, rollouts</text>
+<rect x="170" y="80" width="250" height="34" rx="6" class="bx2"/><text x="295" y="101" text-anchor="middle" class="t-xs t-b">4 · degrade: smaller model, shorter outputs</text>
+<rect x="220" y="40" width="250" height="34" rx="6" class="bx2"/><text x="345" y="61" text-anchor="middle" class="t-xs t-b">5 · prioritise tenants, reject with retry-after</text>
+<text x="500" y="70" class="t-xs">more visible to users</text>
+<text x="500" y="86" class="t-xs">↑</text>
+<text x="500" y="200" class="t-xs">↓</text>
+<text x="500" y="216" class="t-xs">invisible to users</text>
+<text x="500" y="130" class="t-xs">each rung: a tested switch with</text>
+<text x="500" y="146" class="t-xs">an owner and a trigger metric</text>
+</svg>
+<figcaption><b>Figure 9.5 — Degrading gracefully when capacity runs short.</b> Responses are ordered by user impact. The lower rungs should be automatic; the upper ones are business decisions encoded in advance.</figcaption>
+</figure>
+
+<p>Figure 9.5 also shows why capacity planning cannot be separated from product decisions. Whether free-tier users may be moved to a smaller model under load, which tenants have contractual priority, and how long a queue is acceptable are product and commercial choices. The infrastructure's job is to make each rung available, measurable and fast to switch on.</p>
+
+<h2 id="s9-8">9.8 The capacity-planning process</h2>
+<p>Large serving organisations run capacity planning as a recurring process, typically quarterly with monthly updates, and its structure is worth knowing because interviews for infrastructure leads ask about it. The process starts with a <strong>demand plan</strong>: forecasts of tokens per second by model, tier and region, with quantiles, combining statistical forecasts with known launches and customer commitments. It converts demand into a <strong>supply requirement</strong> using measured per-replica throughput for each hardware type and engine configuration (the Atlas calculation of Chapter 1, at the chosen forecast quantile), plus spare capacity for failures and rollouts (Chapter 13) and headroom for cold starts. It compares the requirement with <strong>current and contracted supply</strong> and decides what to procure on which terms, considering lead times: long-term contracts and reservations for the base, capacity blocks for planned events, on-demand and spot for bursts. And it feeds back <strong>efficiency targets</strong>: if the supply cannot be obtained, engineering work that raises per-replica throughput (a new quantisation, speculative decoding, a better router) is valued in GPUs saved and scheduled accordingly.</p>
+<p>Figure 9.6 lays the process out as a cycle. Two practices distinguish good processes from poor ones. They <em>measure forecast accuracy</em>—how often actual peaks exceeded each forecast quantile—and correct the forecasts' calibration, because a process that is consistently surprised in one direction wastes money or causes outages. And they make the conversion factors <em>explicit and owned</em>: tokens per second per GPU for each model and configuration is a number that someone measures, publishes and is responsible for, because a 20% error in it is a 20% error in a purchase worth tens of millions of dollars.</p>
+
+<figure class="diagram" id="fig-9-6">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="The capacity planning cycle">
+<defs><marker id="a95" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="30" y="30" width="190" height="64" rx="8" class="bx4"/><text x="125" y="54" text-anchor="middle" class="t-xs t-b">demand plan</text><text x="125" y="70" text-anchor="middle" class="t-xs">tokens/s by model, tier,</text><text x="125" y="84" text-anchor="middle" class="t-xs">region; quantiles; launches</text>
+<rect x="265" y="30" width="190" height="64" rx="8" class="bx"/><text x="360" y="54" text-anchor="middle" class="t-xs t-b">supply requirement</text><text x="360" y="70" text-anchor="middle" class="t-xs">measured Φ per GPU type;</text><text x="360" y="84" text-anchor="middle" class="t-xs">spares, headroom</text>
+<rect x="500" y="30" width="190" height="64" rx="8" class="bx2"/><text x="595" y="54" text-anchor="middle" class="t-xs t-b">procurement</text><text x="595" y="70" text-anchor="middle" class="t-xs">contracts, reservations,</text><text x="595" y="84" text-anchor="middle" class="t-xs">blocks, on-demand, spot</text>
+<rect x="500" y="160" width="190" height="64" rx="8" class="bx3"/><text x="595" y="184" text-anchor="middle" class="t-xs t-b">operate</text><text x="595" y="200" text-anchor="middle" class="t-xs">autoscale, lend troughs,</text><text x="595" y="214" text-anchor="middle" class="t-xs">degrade gracefully</text>
+<rect x="265" y="160" width="190" height="64" rx="8" class="bx5"/><text x="360" y="184" text-anchor="middle" class="t-xs t-b">measure</text><text x="360" y="200" text-anchor="middle" class="t-xs">forecast calibration,</text><text x="360" y="214" text-anchor="middle" class="t-xs">utilisation, cost per token</text>
+<rect x="30" y="160" width="190" height="64" rx="8" class="bx"/><text x="125" y="184" text-anchor="middle" class="t-xs t-b">efficiency targets</text><text x="125" y="200" text-anchor="middle" class="t-xs">engine and routing work</text><text x="125" y="214" text-anchor="middle" class="t-xs">valued in GPUs saved</text>
+<line x1="220" y1="62" x2="263" y2="62" class="ln" marker-end="url(#a95)"/>
+<line x1="455" y1="62" x2="498" y2="62" class="ln" marker-end="url(#a95)"/>
+<line x1="595" y1="94" x2="595" y2="158" class="ln" marker-end="url(#a95)"/>
+<line x1="500" y1="192" x2="457" y2="192" class="ln" marker-end="url(#a95)"/>
+<line x1="265" y1="192" x2="222" y2="192" class="ln" marker-end="url(#a95)"/>
+<line x1="125" y1="160" x2="125" y2="96" class="ln" marker-end="url(#a95)"/>
+<text x="360" y="250" text-anchor="middle" class="t-xs">Quarterly, with monthly updates; lead times decide how far ahead each procurement decision must be made.</text>
+</svg>
+<figcaption><b>Figure 9.6 — Capacity planning as a cycle.</b> Demand is converted to supply through measured throughput, procured on a portfolio of terms, operated with autoscaling and lending, and measured; measurements correct the forecasts and set efficiency targets.</figcaption>
+</figure>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We now know how to decide how much capacity to hold and on which terms, how to forecast the demand that drives it, when preemptible capacity is safe, how to size warm pools and what to do when capacity runs out. Throughout, we took prices as given: $2.50 for a committed GPU-hour, $6.90 on demand, $1.00 spot. Where do those numbers come from, and what would it cost to own the GPUs instead? How should the cost of a fleet be turned into a price per million tokens, what do providers charge and why are input, cached input and output tokens priced differently, and how does an organisation attribute GPU costs to the teams and customers that cause them? Chapter 10 answers these questions of inference economics.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>GPU capacity must be planned: lead times are months, demand is correlated across customers, on-demand availability is not guaranteed, and being short is far costlier than being long.</li>
+<li>Purchase options: on-demand (1.0×, may be unavailable), spot/preemptible (≈ 0.1–0.4×, reclaimable with 30 s–2 min notice), capacity blocks (booked windows), reserved/committed (≈ 0.4–0.6×, 1–3 years), long-term dedicated contracts.</li>
+<li>Optimal committed capacity (Proposition 9.1): commit to the level demand exceeds a fraction \(c_r/c_o\) of the time. Scarcity of on-demand and the value of lending troughs push the commitment to near the peak.</li>
+<li>Forecast in GPU-relevant units (prefill and decode tokens per model after cache hits) and in quantiles; provision at the quantile \(c_{\text{short}}/(c_{\text{short}}+c_{\text{over}})\) (the pinball-loss optimum); check calibration.</li>
+<li>Without checkpoints, preemptible jobs slow down as \((e^{\lambda_pL}-1)/(\lambda_pL)\); with frequent checkpoints the slowdown is about \(1+\lambda_p\tau_c/2\). Batch inference and rollouts suit spot; online serving can use spot as a diversified overlay on a committed base.</li>
+<li>Warm pools bridge node provisioning: \(w\ge\dot\lambda t_{\text{node}}\) plus failure-domain spare; lending warm capacity to preemptible work recovers its cost; sharing capacity across tiers regains multiplexing.</li>
+<li>When short: spill to other regions, run hotter, shed deferrable work, degrade model or features, prioritise tenants—each a tested switch.</li>
+<li>Capacity planning is a quarterly cycle: demand plan → supply requirement (measured throughput) → procurement → operation → measurement → efficiency targets.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci09-mcq-01" data-topic="§9.1 Capacity">
+<p class="q">Why does statistical multiplexing work poorly for GPU capacity in the 2020s?</p>
+<ol class="opts"><li>GPUs are cheap</li><li data-correct>Demand is dominated by a few large, correlated customers and providers cannot afford large idle buffers</li><li>GPUs cannot be virtualised</li><li>Demand is perfectly flat</li></ol>
+<div class="explain">Multiplexing needs many small independent demands and spare buffers.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-02" data-topic="§9.1 Capacity">
+<p class="q">Which statement best describes the risk asymmetry of GPU capacity?</p>
+<ol class="opts"><li>Being long and being short cost the same</li><li data-correct>Being short at peak causes outages and lost revenue, usually far more costly than holding idle capacity</li><li>Being long is worse</li><li>There is no risk with on-demand</li></ol>
+<div class="explain">Hence commitments near the peak.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-03" data-topic="§9.2 Menu">
+<p class="q">Which option offers the lowest price per hour but can be reclaimed with short notice?</p>
+<ol class="opts"><li>Reserved</li><li>Capacity blocks</li><li data-correct>Spot / preemptible</li><li>On-demand</li></ol>
+<div class="explain">Two minutes' notice on AWS, about 30 s on Google Cloud.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-04" data-topic="§9.2 Menu">
+<p class="q">Capacity blocks are best suited to:</p>
+<ol class="opts"><li>Steady base load for three years</li><li data-correct>A training run, evaluation campaign or launch needing guaranteed GPUs for days or weeks</li><li>Fault-tolerant batch only</li><li>Small CPU services</li></ol>
+<div class="explain">Booked ahead at a price set at booking.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-05" data-topic="§9.2 Menu">
+<p class="q">Besides a discount, what does a reservation provide that matters especially for scarce GPUs?</p>
+<ol class="opts"><li>Faster GPUs</li><li data-correct>Assurance that the capacity exists when needed</li><li>Free networking</li><li>Spot pricing at night</li></ol>
+<div class="explain">On-demand GPU requests can fail for lack of capacity.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-06" data-topic="§9.3 Commitment">
+<p class="q">By Proposition 9.1, with \(c_r/c_o=0.4\), commit to the level of demand that is exceeded:</p>
+<ol class="opts"><li>Never</li><li data-correct>40% of the time</li><li>60% of the time</li><li>All the time</li></ol>
+<div class="explain">The critical ratio.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-07" data-topic="§9.3 Commitment">
+<p class="q">Proposition 9.1 is an instance of which classical problem?</p>
+<ol class="opts"><li>Travelling salesman</li><li data-correct>The newsvendor problem</li><li>Knapsack</li><li>Shortest path</li></ol>
+<div class="explain">Order up to the quantile set by the cost ratio.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-08" data-topic="§9.3 Commitment">
+<p class="q">In Figure 9.2, what is the approximate saving of the optimal commitment versus all on-demand?</p>
+<ol class="opts"><li>5%</li><li>20%</li><li data-correct>About half</li><li>90%</li></ol>
+<div class="explain">About $142k versus $302k per day.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-09" data-topic="§9.3 Commitment">
+<p class="q">Which factors push the optimal commitment towards the peak? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>On-demand capacity may be unavailable at the peak</li><li data-correct>Idle committed capacity can be lent to batch work</li><li data-correct>A high penalty for shortfall</li><li>On-demand prices falling to the reserved price</li></ol>
+<div class="explain">If on-demand cost equalled reserved cost, committing would bring no benefit.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-10" data-topic="§9.3 Commitment">
+<p class="q">Why is the cost curve's flatness near the optimum useful?</p>
+<ol class="opts"><li>It means commitments are free</li><li data-correct>Forecast errors near the optimum cost little, so one can lean towards robustness</li><li>It proves the forecast is right</li><li>It removes the need for on-demand</li></ol>
+<div class="explain">Committing to the full peak costs only about 6% more here.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-11" data-topic="§9.4 Forecasting">
+<p class="q">Why should capacity be planned from forecast quantiles rather than the mean?</p>
+<ol class="opts"><li>Means are hard to compute</li><li data-correct>Provisioning to the median leaves the fleet short about half the time; the right quantile depends on shortage and excess costs</li><li>Quantiles are always lower</li><li>Regulators require it</li></ol>
+<div class="explain">The pinball-loss optimum is the cost-ratio quantile.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-12" data-topic="§9.4 Forecasting">
+<p class="q">Minimising the expected pinball loss \(\ell_q\) gives a forecast \(\hat d\) with:</p>
+<ol class="opts"><li>\(\hat d=\mathbb E[D]\)</li><li data-correct>\(\Pr(D\le\hat d)=q\)</li><li>\(\hat d=0\)</li><li>\(\hat d=\max D\)</li></ol>
+<div class="explain">It is the \(q\)-quantile.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-13" data-topic="§9.4 Forecasting">
+<p class="q">Why are request-rate forecasts insufficient for LLM capacity?</p>
+<ol class="opts"><li>Requests are not countable</li><li data-correct>GPUs per request depend on input/output lengths, cache hits and model mix, which drift</li><li>Request rates are constant</li><li>GPUs are billed per request</li></ol>
+<div class="explain">Forecast prefill and decode tokens per model after cache hits.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-14" data-topic="§9.4 Forecasting">
+<p class="q">In Drill 9.1, the optimal planning quantile was about:</p>
+<ol class="opts"><li>50%</li><li data-correct>81%</li><li>95%</li><li>99.9%</li></ol>
+<div class="explain">\(10.5/(10.5+2.5)\).</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-15" data-topic="§9.4 Forecasting">
+<p class="q">A well-calibrated 90% forecast should be exceeded by actual demand about:</p>
+<ol class="opts"><li>Never</li><li data-correct>10% of the time</li><li>50% of the time</li><li>90% of the time</li></ol>
+<div class="explain">Calibration checks are part of the planning cycle.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-16" data-topic="§9.5 Spot">
+<p class="q">A job of length \(L\) with no checkpoints on capacity reclaimed at rate \(\lambda_p\) has expected completion time:</p>
+<ol class="opts"><li>\(L\)</li><li>\(L(1+\lambda_p)\)</li><li data-correct>\((e^{\lambda_pL}-1)/\lambda_p\)</li><li>\(L/\lambda_p\)</li></ol>
+<div class="explain">Slowdown grows exponentially in \(\lambda_pL\).</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-17" data-topic="§9.5 Spot">
+<p class="q">At one expected interruption per job length and no checkpoints, the slowdown is about:</p>
+<ol class="opts"><li>1.05×</li><li data-correct>1.7×</li><li>3.2×</li><li>6.4×</li></ol>
+<div class="explain">\(e-1\approx1.72\).</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-18" data-topic="§9.5 Spot">
+<p class="q">Why is batch inference nearly ideal for spot capacity?</p>
+<ol class="opts"><li>It needs no GPUs</li><li data-correct>Completed items act as checkpoints; an interruption loses only in-flight items</li><li>It cannot be interrupted</li><li>It runs on CPUs</li></ol>
+<div class="explain">Rollouts share this property.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-19" data-topic="§9.5 Spot">
+<p class="q">What conditions make spot usable for online serving? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Committed capacity can meet the SLO if spot disappears</li><li data-correct>Replicas can drain or hand off streams within the notice</li><li data-correct>Spot is diversified across instance types and zones to reduce correlated reclaims</li><li>Spot replicas are multi-node</li></ol>
+<div class="explain">Multi-node replicas make spot worse, not better.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-20" data-topic="§9.5 Spot">
+<p class="q">Why is spot rarely worth it for DeepSeek-V3 multi-node replicas?</p>
+<ol class="opts"><li>MoE cannot run on spot</li><li data-correct>Reclaiming any one instance takes down the whole group, and correlated reclaims remove many groups</li><li>Spot GPUs lack HBM</li><li>Spot prices are higher</li></ol>
+<div class="explain">Failure rate scales with group size.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-21" data-topic="§9.6 Warm pools">
+<p class="q">A warm pool must at least cover:</p>
+<ol class="opts"><li>The whole peak</li><li data-correct>Demand growth during one node-provisioning time, plus failure-domain spare</li><li>One GPU</li><li>The trough</li></ol>
+<div class="explain">\(w\ge\dot\lambda\,t_{\text{node}}\).</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-22" data-topic="§9.6 Warm pools">
+<p class="q">With growth of 15 GPUs/min and 6-minute node provisioning, the warm pool needs at least about:</p>
+<ol class="opts"><li>15 GPUs</li><li data-correct>90 GPUs</li><li>600 GPUs</li><li>2,500 GPUs</li></ol>
+<div class="explain">\(15\times6\).</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-23" data-topic="§9.6 Warm pools">
+<p class="q">How can a warm pool's cost be largely recovered?</p>
+<ol class="opts"><li>By turning the nodes off</li><li data-correct>By running preemptible work on it that can be evicted in seconds</li><li>By selling the GPUs</li><li>By lowering the SLO</li></ol>
+<div class="explain">Warm then means "a replica can start here quickly".</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-24" data-topic="§9.6 Warm pools">
+<p class="q">Why does sharing capacity across tiers that peak at different times reduce total capacity?</p>
+<ol class="opts"><li>Tiers use less memory together</li><li data-correct>The peak of the sum is lower than the sum of the peaks (statistical multiplexing)</li><li>It avoids cold starts</li><li>It removes spares</li></ol>
+<div class="explain">Requires nodes that can host any tier quickly.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-25" data-topic="§9.7 Shortfall">
+<p class="q">Which response to a capacity shortfall is least visible to users?</p>
+<ol class="opts"><li>Rejecting requests with retry-after</li><li>Routing to a smaller model</li><li data-correct>Spilling traffic to another region with headroom</li><li>Shortening outputs</li></ol>
+<div class="explain">If latency and residency rules allow.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-26" data-topic="§9.7 Shortfall">
+<p class="q">Why does "running hotter" buy only a little capacity?</p>
+<ol class="opts"><li>GPUs cannot exceed 50% utilisation</li><li data-correct>Queueing delay rises steeply as utilisation approaches one</li><li>It increases power</li><li>It requires new hardware</li></ol>
+<div class="explain">See Vol. I §11.8.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-27" data-topic="§9.7 Shortfall">
+<p class="q">Which graceful-degradation decisions are business rather than purely technical choices? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Which tenants get priority</li><li data-correct>Whether free-tier users may be moved to a smaller model</li><li data-correct>How long a queue is acceptable</li><li>Whether the GPU driver supports CUDA 12</li></ol>
+<div class="explain">Infrastructure makes the switches; the business sets the policy.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-28" data-topic="§9.8 Process">
+<p class="q">In the capacity-planning cycle, demand is converted into a supply requirement using:</p>
+<ol class="opts"><li>Request counts</li><li data-correct>Measured per-replica throughput for each hardware type and configuration</li><li>Vendor peak FLOP/s</li><li>Last year's invoice</li></ol>
+<div class="explain">A 20% error in this factor is a 20% error in the purchase.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-29" data-topic="§9.8 Process">
+<p class="q">How should efficiency work (e.g. a new quantisation) be valued in capacity planning?</p>
+<ol class="opts"><li>It should not</li><li data-correct>In GPUs saved at the planned demand, compared with the cost of procuring them</li><li>In lines of code</li><li>By benchmark rank</li></ol>
+<div class="explain">Especially when supply cannot be obtained.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-30" data-topic="§9.3 Commitment">
+<p class="q">In the worked example with \(p_{\text{na}}=0.3\), \(c_{\text{short}}=\$20\) and trough value \$1.25, the optimal commitment was about:</p>
+<ol class="opts"><li>1,825 GPUs</li><li>2,108 GPUs</li><li data-correct>2,460 GPUs</li><li>3,000 GPUs</li></ol>
+<div class="explain">Within 2% of the 2,500 peak.</div>
+</div>
+
+<div class="mcq" data-id="ci09-mcq-31" data-topic="§9.5 Spot">
+<p class="q">With checkpoints every \(\tau_c\) and negligible checkpoint cost, the slowdown on preemptible capacity is approximately:</p>
+<ol class="opts"><li>\(e^{\lambda_p\tau_c}\)</li><li data-correct>\(1+\lambda_p\tau_c/2\)</li><li>\(\lambda_p\tau_c\)</li><li>\(1/\lambda_p\)</li></ol>
+<div class="explain">Each segment loses on average half an interval per interruption.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci09-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Compare the main ways of buying cloud GPU capacity.</summary>
+<div class="answer">
+<p>On-demand: no commitment, list price, availability not guaranteed for scarce GPUs. Spot/preemptible: 60–90% discounts, reclaimable with 30 s–2 min notice, availability fluctuates. Capacity blocks (EC2 Capacity Blocks, GCP Dynamic Workload Scheduler calendar mode): guaranteed instances for days–weeks booked ahead. Reserved/committed-use and savings plans: 1–3 year take-or-pay, often 40–60% off, capacity assured. Long-term dedicated contracts with clouds or neoclouds: multi-year, large, lowest effective price. Typical portfolio: committed base, blocks for events, on-demand and spot for bursts and batch.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Why can't a GPU serving fleet just "scale on demand" like a web service?</summary>
+<div class="answer">
+<p>On-demand GPU capacity is often unavailable for large instances in popular regions, especially at peak hours when everyone needs it; quotas limit what an account can launch; node provisioning takes minutes and replica cold starts more; and on-demand is several times the price of committed capacity. So the base load and most of the peak must be secured in advance (reservations, contracts), with on-demand and spot as supplements and warm pools to bridge provisioning delays.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-03">
+<summary><span class="lvl core">Core</span> Demand peaks at 2,500 GPUs and troughs at 1,150. Reserved costs $2.50/GPU-h, on-demand $6.90. How many should we reserve?</summary>
+<div class="answer">
+<p>Cost \(C(R)=c_rTR+c_o\int\max(D-R,0)\) is convex; optimum where demand exceeds \(R\) a fraction \(c_r/c_o=0.36\) of the time. With sinusoidal demand (mean 1,825, amplitude 675), \(R^*\approx1825+675\cos(0.362\pi)\approx2{,}108\) GPUs; daily cost about $142k versus $150k reserving the peak and $302k all on-demand. But adjust: if on-demand may be unavailable at peak (scarcity penalty) or troughs can be lent to batch work, the optimum moves to about the peak (≈ 2,460 in the worked example). Also consider growth and forecast uncertainty over the commitment term, and the flatness of the curve near the optimum.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-04">
+<summary><span class="lvl core">Core</span> Can we serve production traffic on spot GPUs? How?</summary>
+<div class="answer">
+<p>Yes, as an overlay, with care. Keep committed capacity that meets the SLO (at a degraded utilisation) if all spot disappears; add spot replicas for normal-load efficiency. Diversify spot across instance types, zones and regions to reduce correlated reclaims. Handle the notice: on interruption signal, fail readiness, stop admitting, finish short requests, resume long streams elsewhere (prefix cache makes resends cheap), and have fast cold starts for replacements. Prefer small (1-GPU) replicas; avoid spot for multi-node replicas whose failure probability multiplies. Quantify: e.g. 71 of 427 GPUs on spot saved about 17% of a tier's cost. Batch inference and rollouts are the natural spot workloads.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-05">
+<summary><span class="lvl core">Core</span> How would you forecast LLM serving demand for capacity planning?</summary>
+<div class="answer">
+<p>Forecast in GPU-relevant units: uncached prefill tokens/s and decode tokens/s per model, tier and region. Components: daily and weekly seasonality, trend, holidays and known events (launches, customer onboardings, model changes); methods from seasonal naive and Holt–Winters to Prophet or gradient boosting with covariates. Produce quantiles (train with pinball loss), check calibration against actuals, and plan at the quantile set by shortage versus excess costs. Translate through measured per-replica throughput; maintain a change-review process so product changes that alter token units (longer outputs, cache-breaking prompts) update the forecast.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-06">
+<summary><span class="lvl core">Core</span> Derive the expected completion time of a job on preemptible capacity without checkpoints.</summary>
+<div class="answer">
+<p>Let \(E\) be the expected time to complete \(L\) hours of uninterrupted work, interruptions Poisson with rate \(\lambda\). Condition on the first interruption time \(X\sim\text{Exp}(\lambda)\): if \(X\ge L\) we finish at \(L\); otherwise we lose \(X\) and restart, so \(E=\mathbb E[\min(X,L)]+\Pr(X<L)E\). \(\mathbb E[\min(X,L)]=(1-e^{-\lambda L})/\lambda\), \(\Pr(X<L)=1-e^{-\lambda L}\). So \(E\,e^{-\lambda L}=(1-e^{-\lambda L})/\lambda\), giving \(E=(e^{\lambda L}-1)/\lambda\). Slowdown \((e^x-1)/x\) with \(x=\lambda L\): 1.3× at 0.5, 1.7× at 1, 6.4× at 3. With checkpoints every \(\tau\), apply per segment: \(\approx1+\lambda\tau/2\). Lesson: checkpoint frequently relative to the interruption rate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-07">
+<summary><span class="lvl core">Core</span> How big should a warm pool be, and how do you make it affordable?</summary>
+<div class="answer">
+<p>It must cover demand growth during node provisioning: \(w\ge\dot\lambda t_{\text{node}}\) (e.g. 15 GPUs/min × 6 min = 90 GPUs), plus replica-level headroom for cold start and spare for the largest failure domain. If node provisioning can fail (no on-demand capacity), the pool must be committed capacity sized by forecast quantiles. Make it affordable by keeping images and weights pre-cached (so a replica starts in seconds) while running preemptible batch, evaluation or rollout work on it, evictable within the replica cold-start budget; then warm capacity costs only lost batch progress.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> Extend the newsvendor analysis to include on-demand unavailability and the value of idle capacity.</summary>
+<div class="answer">
+<p>Marginal analysis: increasing \(R\) by one GPU costs \(c_r\) per hour; when demand exceeds \(R\) (fraction \(f\) of time) it saves the alternative's cost \(c_o+p_{\text{na}}c_{\text{short}}\) (on-demand price plus expected shortfall penalty when on-demand is unavailable); when demand is below \(R\), an idle committed GPU can be lent for value \(c_{\text{idle}}\), offsetting cost. Optimal \(f\) satisfies \(f(c_o+p_{\text{na}}c_{\text{short}}-c_r)=(1-f)(c_r-c_{\text{idle}})\), i.e. \(f^*=(c_r-c_{\text{idle}})/(c_o+p_{\text{na}}c_{\text{short}}-c_{\text{idle}})\). With 2.50, 1.25, 6.90, 0.3, 20: \(f^*\approx0.107\) → commitment ≈ 2,460 of a 2,500 peak. With uncertain future demand curves, take expectations over scenarios, which also favours robustness near the flat optimum.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Your quarterly capacity plan was 25% short at peak. What went wrong, and how do you fix the process?</summary>
+<div class="answer">
+<p>Possible causes: forecast miss (growth or launch underestimated; forecast in requests rather than tokens; reasoning or long-context features raising tokens per request); conversion error (measured per-replica throughput optimistic—different traffic mix, lower cache hits, engine regression); spare and headroom underestimated (more failures, slower cold starts); procurement shortfall (on-demand unavailable, delayed contracts). Fix: post-mortem decomposing the miss into demand units, conversion factors and supply; forecast in token units with quantiles and calibration tracking; capacity review for product changes; owned, continuously measured throughput factors per model and hardware; plan to a quantile with explicit risk appetite; pre-negotiated burst options (capacity blocks, second provider); graceful-degradation switches tested before peaks.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How do correlated spot reclaims affect how much spot a serving fleet can use?</summary>
+<div class="answer">
+<p>If reclaims were independent, the number lost at once would be binomial and small relative to the pool, so a little spare would cover it. In practice reclaims correlate: when a region's demand spikes, the provider reclaims many instances of a type at once. Model the loss as a mixture: with probability \(p_b\) a "bad event" removes a fraction \(\phi_b\) of a pool. The committed base must meet the SLO after losing \(\phi_b\) of the spot capacity in the largest correlated pool. Diversification across instance types, zones and regions (weakly correlated pools) reduces the worst-case loss fraction. Measure historical reclaim correlation per pool; cap spot share per pool; treat spot as an efficiency overlay, never as SLO-critical capacity.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-11">
+<summary><span class="lvl design">Design</span> Design the capacity strategy for a new LLM API launching in three months with uncertain demand.</summary>
+<div class="answer">
+<p>Scenario forecasts (low/median/high) in tokens per model; minimum footprint per region for availability. Before launch: book capacity blocks covering the launch window at the high scenario (guaranteed, short commitment), plus modest reservations for the low scenario as base; qualify two hardware types and two regions/providers for flexibility; prepare spot and serverless overflow for batch and burst. Engineering: fast cold starts, warm pools, autoscaling on token signals, graceful degradation ladder (smaller model, queueing, prioritise paying tiers), rate limits for free tier. After launch: measure actual demand and per-replica throughput, convert blocks into reservations sized by the critical ratio as uncertainty narrows, and lend troughs to internal batch work.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-12">
+<summary><span class="lvl design">Design</span> How would you run a capacity-planning process for a fleet of 50,000 GPUs?</summary>
+<div class="answer">
+<p>Quarterly cycle with monthly updates. Inputs: demand plans by product, model, tier and region in token units with quantiles; known launches and contracts; owned conversion factors (tokens/s per replica per hardware and configuration) measured continuously. Compute supply requirement including spares (failure rates, domain sizes), rollout surge, cold-start headroom. Compare with current and contracted supply; decide procurement by term and lead time (long-term contracts and reservations for base, blocks for events, on-demand/spot for burst), with power and datacenter constraints for owned capacity. Governance: risk appetite (planning quantile), approvals, budgets. Feedback: forecast calibration, utilisation by class, cost per token, efficiency roadmap valued in GPUs. Publish dashboards and decisions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-13">
+<summary><span class="lvl core">Core</span> What is the right planning quantile for peak capacity, and how do you derive it?</summary>
+<div class="answer">
+<p>Treat committed capacity as a newsvendor decision under forecast uncertainty: if a unit of capacity left unused costs \(c_{\text{over}}\) and a unit of shortfall costs \(c_{\text{short}}\) (net of what committing would have cost), plan at quantile \(q=c_{\text{short}}/(c_{\text{short}}+c_{\text{over}})\). E.g. over-cost $2.50, net shortfall $10.50 → \(q\approx0.81\); for a normal forecast \(N(2900,300^2)\) that is about 3,160 GPUs. Higher shortfall costs (SLA penalties, reputational damage) push towards the 95th–99th percentile. Ensure forecasts are calibrated so the quantile means what it says.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-14">
+<summary><span class="lvl deep">Deep-dive</span> Explain the interaction between capacity commitment and cluster sharing.</summary>
+<div class="answer">
+<p>If committed capacity is idle in troughs, its effective cost per useful hour is high, which argues for committing below the peak and buying peak capacity on demand. But if troughs can be lent to preemptible work worth \(c_{\text{idle}}\) per GPU-hour (batch inference, training, rollouts, evaluations), the effective cost of committing falls and the optimal commitment rises towards the peak. Meanwhile on-demand GPUs are scarce, adding a shortfall risk. Together these mean: commit close to the peak, run a shared cluster where inference has priority and reclaims from borrowers, and invest in reclamation speed (preemption notice, cold starts). Capacity planning, cluster scheduling and cold-start engineering are one optimisation.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-15">
+<summary><span class="lvl core">Core</span> List the rungs of a graceful-degradation ladder for a capacity shortfall and how you would trigger them.</summary>
+<div class="answer">
+<p>(1) Spill to other regions or providers with headroom (automatic, subject to latency and residency); (2) raise utilisation targets within SLO slack (automatic, bounded); (3) pause batch, evaluation and rollout work on shared capacity (automatic reclaim); (4) degrade: route free tier or non-critical traffic to smaller models, cap output length, disable expensive modes (policy-driven); (5) prioritise tenants and reject the rest with 429/503 and retry-after (policy-driven). Trigger by SLO-based metrics (TTFT percentiles, queue depth, KV pressure) with hysteresis; each rung has an owner, a runbook, and is exercised in game days.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci09-qa-16">
+<summary><span class="lvl warm">Warm-up</span> Why does the unit of LLM demand make forecasting harder than for web traffic?</summary>
+<div class="answer">
+<p>Web capacity scales roughly with request rate. LLM capacity scales with prefill and decode tokens per model after cache hits, which depend on prompt and output lengths, conversation depth, cache-hit rate and model mix—quantities that change with product decisions (reasoning modes, new templates, model tier migrations) independently of request counts. A flat request forecast can hide a doubling of GPU demand. Forecast token units, track the conversion drivers explicitly, and put product changes through capacity review.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li>K. J. Arrow, T. Harris, J. Marschak. Optimal Inventory Policy. <em>Econometrica</em> 19(3), 1951 (the newsvendor model).</li>
+<li>R. Koenker, G. Bassett. Regression Quantiles. <em>Econometrica</em> 46(1), 1978.</li>
+<li>R. J. Hyndman, G. Athanasopoulos. <em>Forecasting: Principles and Practice</em>, 3rd ed. OTexts, 2021.</li>
+<li>S. J. Taylor, B. Letham. Forecasting at Scale (Prophet). <em>The American Statistician</em> 72(1), 2018.</li>
+<li>Amazon Web Services. EC2 Capacity Blocks for ML; Spot Instance interruption notices; pricing announcements for P5 instances, 2023–2025.</li>
+<li>Google Cloud. Dynamic Workload Scheduler (calendar and flex-start modes); Spot VMs documentation, 2023–2025.</li>
+<li>P. Sharma et al. SpotCheck: Designing a Derivative IaaS Cloud on the Spot Market. <em>EuroSys</em>, 2015.</li>
+<li>Z. Yang et al. SkyPilot: An Intercloud Broker for Sky Computing. <em>NSDI</em>, 2023.</li>
+<li>J. Duan et al. SpotServe: Serving Generative Large Language Models on Preemptible Instances. <em>ASPLOS</em>, 2024. <a href="https://arxiv.org/abs/2311.15566">arXiv:2311.15566</a>.</li>
+<li>J. W. Young. A first order approximation to the optimum checkpoint interval. <em>Communications of the ACM</em> 17(9), 1974.</li>
+<li>B. Beyer et al. (eds.). <em>Site Reliability Engineering</em>, chapter on capacity planning. O'Reilly, 2016.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

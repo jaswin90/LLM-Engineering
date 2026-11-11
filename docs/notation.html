@@ -266,6 +266,15 @@
 <tr><td>\(m\), \(m^{*}\)</td><td>autoscaling metric per replica and its target</td></tr>
 <tr><td>\(c_{\text{ded}}\), \(c_{\text{sls}}\), \(o\)</td><td>dedicated price per GPU-hour; serverless price per busy GPU-hour; cold-start overhead fraction</td></tr>
 </tbody></table></div>
+<h2>Capacity and procurement (Vol. II Ch. 9)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(D(\tau)\), \(T_{\text{per}}\)</td><td>GPU demand at time of day \(\tau\); length of the planning period</td></tr>
+<tr><td>\(R\), \(c_r\), \(c_o\)</td><td>committed capacity (GPUs); committed and on-demand prices per GPU-hour</td></tr>
+<tr><td>\(p_{\text{na}}\), \(c_{\text{short}}\), \(c_{\text{idle}}\), \(c_{\text{over}}\)</td><td>probability on-demand is unavailable; cost of a GPU-hour of shortfall; value of lending an idle GPU-hour; cost of an unused GPU-hour</td></tr>
+<tr><td>\(\ell_q\), \(q\)</td><td>pinball loss; forecast quantile</td></tr>
+<tr><td>\(\lambda_p\), \(L\) (as a job length, Ch. 9 only)</td><td>preemption rate per hour; uninterrupted work a job needs (elsewhere \(L\) is layers)</td></tr>
+<tr><td>\(w\), \(t_{\text{node}}\), \(\dot\lambda\)</td><td>warm-pool size (GPUs; elsewhere \(w\) is the attention window); node provisioning time; demand growth rate</td></tr>
+</tbody></table></div>
 </div>
 </body>
 </html>

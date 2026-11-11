@@ -274,3 +274,13 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(u^{\text{kv}}_j\), \(t_{\text{kv}}\), \(t_{\text{lora}}\) | KV-cache utilisation of replica \(j\); time penalties for KV pressure and adapter loading |
 | \(m\), \(m^{*}\) | autoscaling metric per replica and its target |
 | \(c_{\text{ded}}\), \(c_{\text{sls}}\), \(o\) | dedicated price per GPU-hour; serverless price per busy GPU-hour; cold-start overhead fraction |
+
+## Capacity and procurement (Vol. II Ch. 9)
+| Symbol | Meaning |
+|---|---|
+| \(D(\tau)\), \(T_{\text{per}}\) | GPU demand at time of day \(\tau\); length of the planning period |
+| \(R\), \(c_r\), \(c_o\) | committed capacity (GPUs); committed and on-demand prices per GPU-hour |
+| \(p_{\text{na}}\), \(c_{\text{short}}\), \(c_{\text{idle}}\), \(c_{\text{over}}\) | probability on-demand is unavailable; cost of a GPU-hour of shortfall; value of lending an idle GPU-hour; cost of an unused GPU-hour |
+| \(\ell_q\), \(q\) | pinball loss; forecast quantile |
+| \(\lambda_p\), \(L\) (as a job length, Ch. 9 only) | preemption rate per hour; uninterrupted work a job needs (elsewhere \(L\) is layers) |
+| \(w\), \(t_{\text{node}}\), \(\dot\lambda\) | warm-pool size (GPUs; elsewhere \(w\) is the attention window); node provisioning time; demand growth rate |
