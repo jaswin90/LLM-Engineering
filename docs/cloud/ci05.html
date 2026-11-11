@@ -156,7 +156,7 @@ t_{\text{cold}}=t_{\text{node}}+t_{\text{sched}}+t_{\text{image}}+t_{\text{weigh
 
 <div class="box bridge">
 <div class="box-title">For the mathematician — pipelining turns a sum into a maximum</div>
-<p>Let a transfer of \(W\) bytes pass through \(n_s\) stages with bandwidths \(\beta_1,\dots,\beta_{n_s}\). Done stage by stage, the time is \(\sum_jW/\beta_j\). Split the data into chunks of \(c\) bytes and let each stage work on chunk \(i+1\) while the next stage works on chunk \(i\). Chunk \(i\) leaves the last stage at time \(\sum_jc/\beta_j+(i-1)\max_jc/\beta_j\), so all \(W/c\) chunks are done at \(\sum_jc/\beta_j+(W/c-1)\max_jc/\beta_j\approx W/\min_j\beta_j\) when \(c\ll W\). The pipeline's throughput is the bottleneck stage's bandwidth, and the other stages cost only a fill-and-drain latency proportional to \(c\). This is the same algebra as the pipeline-parallel bubble of Vol. I §18.4, and it reappears in the chain broadcast of §5.5.</p>
+<p>Let a transfer of \(W_{\text{bytes}}\) bytes pass through \(n_s\) stages with bandwidths \(\beta_1,\dots,\beta_{n_s}\). Done stage by stage, the time is \(\sum_jW_{\text{bytes}}/\beta_j\). Split the data into chunks of \(c\) bytes and let each stage work on chunk \(i+1\) while the next stage works on chunk \(i\). Chunk \(i\) leaves the last stage at time \(\sum_jc/\beta_j+(i-1)\max_jc/\beta_j\), so all \(W_{\text{bytes}}/c\) chunks are done at \(\sum_jc/\beta_j+(W_{\text{bytes}}/c-1)\max_jc/\beta_j\approx W_{\text{bytes}}/\min_j\beta_j\) when \(c\ll W_{\text{bytes}}\). The pipeline's throughput is the bottleneck stage's bandwidth, and the other stages cost only a fill-and-drain latency proportional to \(c\). This is the same algebra as the pipeline-parallel bubble of Vol. I §18.4, and it reappears in the chain broadcast of §5.5.</p>
 </div>
 
 <p>Several open-source loaders implement streaming for LLM weights. The Run:ai Model Streamer reads safetensors files from object storage or file systems with many concurrent range requests and copies tensors into GPU memory as they arrive, without first writing them to disk; vLLM integrates it as a load format. CoreWeave's Tensorizer serialises models into a format designed for streaming over HTTP or from S3. Other loaders read safetensors directly from NVMe into GPU memory with parallel I/O. All exploit the same two ideas: many concurrent reads to saturate the source, and overlap of reading and copying so that the slowest link sets the pace.</p>
@@ -183,35 +183,35 @@ t_{\text{cold}}=t_{\text{node}}+t_{\text{sched}}+t_{\text{image}}+t_{\text{weigh
 <rect x="80" y="40" width="60" height="32" rx="5" class="bx4"/><text x="110" y="60" text-anchor="middle" class="t-xs">store</text>
 <g><circle cx="40" cy="150" r="16" class="bx"/><circle cx="85" cy="170" r="16" class="bx"/><circle cx="135" cy="170" r="16" class="bx"/><circle cx="180" cy="150" r="16" class="bx"/></g>
 <line x1="100" y1="72" x2="44" y2="134" class="ln" marker-end="url(#a55)"/><line x1="105" y1="72" x2="87" y2="153" class="ln" marker-end="url(#a55)"/><line x1="115" y1="72" x2="133" y2="153" class="ln" marker-end="url(#a55)"/><line x1="120" y1="72" x2="176" y2="134" class="ln" marker-end="url(#a55)"/>
-<text x="110" y="215" text-anchor="middle" class="t-xs">time ≈ n·W / β_svc</text>
+<text x="110" y="215" text-anchor="middle" class="t-xs">time ≈ n·W_bytes / β_svc</text>
 <text x="360" y="24" text-anchor="middle" class="t-sm t-b">Swarm (peer-to-peer chunks)</text>
 <rect x="330" y="40" width="60" height="32" rx="5" class="bx4"/><text x="360" y="60" text-anchor="middle" class="t-xs">seed</text>
 <g><circle cx="290" cy="120" r="16" class="bx"/><circle cx="430" cy="120" r="16" class="bx"/><circle cx="310" cy="180" r="16" class="bx"/><circle cx="410" cy="180" r="16" class="bx"/></g>
 <line x1="345" y1="72" x2="300" y2="106" class="ln" marker-end="url(#a55)"/><line x1="375" y1="72" x2="420" y2="106" class="ln" marker-end="url(#a55)"/>
 <line x1="306" y1="120" x2="412" y2="120" class="ln ln-s3"/><line x1="296" y1="136" x2="306" y2="163" class="ln ln-s3"/><line x1="424" y1="136" x2="414" y2="163" class="ln ln-s3"/><line x1="326" y1="180" x2="394" y2="180" class="ln ln-s3"/><line x1="302" y1="132" x2="398" y2="170" class="ln ln-s3"/>
-<text x="360" y="215" text-anchor="middle" class="t-xs">time ≈ W/β + O(log n) chunk times</text>
+<text x="360" y="215" text-anchor="middle" class="t-xs">time ≈ W_bytes/β + O(log n) chunks</text>
 <text x="600" y="24" text-anchor="middle" class="t-sm t-b">Pipelined chain (RDMA)</text>
 <rect x="490" y="105" width="44" height="32" rx="5" class="bx4"/><text x="512" y="125" text-anchor="middle" class="t-xs">src</text>
 <g><circle cx="565" cy="121" r="16" class="bx"/><circle cx="615" cy="121" r="16" class="bx"/><circle cx="665" cy="121" r="16" class="bx"/><circle cx="705" cy="121" r="10" class="bx"/></g>
 <line x1="534" y1="121" x2="547" y2="121" class="ln ln-s2" marker-end="url(#a55)"/><line x1="581" y1="121" x2="597" y2="121" class="ln ln-s2" marker-end="url(#a55)"/><line x1="631" y1="121" x2="647" y2="121" class="ln ln-s2" marker-end="url(#a55)"/><line x1="681" y1="121" x2="693" y2="121" class="ln ln-s2" marker-end="url(#a55)"/>
 <text x="600" y="170" text-anchor="middle" class="t-xs">each node forwards chunk i</text>
 <text x="600" y="185" text-anchor="middle" class="t-xs">while receiving chunk i+1</text>
-<text x="600" y="215" text-anchor="middle" class="t-xs">time ≈ (W + (n−1)c) / β</text>
+<text x="600" y="215" text-anchor="middle" class="t-xs">time ≈ (W_bytes + (n−1)c) / β</text>
 </svg>
 <figcaption><b>Figure 5.5 — Three ways to deliver one model to \(n\) servers.</b> The star is limited by the store's aggregate throughput; the swarm adds every server's upload capacity; the pipelined chain over the back-end delivers the whole model to every server in roughly the time one server needs.</figcaption>
 </figure>
 
 <div class="box thm">
 <div class="box-title">Proposition 5.1 — Pipelined chain broadcast</div>
-<p>A source holds \(W\) bytes and \(n\) receivers are arranged in a chain, each link having bandwidth \(\beta\) and per-chunk latency \(\alpha\). If the data are sent in chunks of \(c\) bytes and each receiver forwards a chunk as soon as it has received it, the last receiver finishes at</p>
+<p>A source holds \(W_{\text{bytes}}\) bytes and \(n\) receivers are arranged in a chain, each link having bandwidth \(\beta\) and per-chunk latency \(\alpha\). If the data are sent in chunks of \(c\) bytes and each receiver forwards a chunk as soon as it has received it, the last receiver finishes at</p>
 \[
 t_{\text{chain}}(c)=\Bigl(\frac{W}{c}+n-1\Bigr)\Bigl(\alpha+\frac{c}{\beta}\Bigr),
 \]
 <p>which is minimised at \(c^*=\sqrt{W\alpha\beta/(n-1)}\), giving \(t^*_{\text{chain}}=\bigl(\sqrt{W/\beta}+\sqrt{(n-1)\alpha}\bigr)^2\).</p>
-<p><em>Proof.</em> Each chunk takes \(\alpha+c/\beta\) per hop. The last chunk leaves the source after \(W/c\) chunk times and needs \(n-1\) further hops to reach the last receiver, giving the product. Writing \(f(c)=(W/c+n-1)(\alpha+c/\beta)\), \(f'(c)=-W\alpha/c^2+(n-1)/\beta\), which vanishes at \(c^*\). Substituting, \(f(c^*)=W/\beta+(n-1)\alpha+2\sqrt{W\alpha(n-1)/\beta}=(\sqrt{W/\beta}+\sqrt{(n-1)\alpha})^2\). \(\square\)</p>
+<p><em>Proof.</em> Each chunk takes \(\alpha+c/\beta\) per hop. The last chunk leaves the source after \(W_{\text{bytes}}/c\) chunk times and needs \(n-1\) further hops to reach the last receiver, giving the product. Writing \(f(c)=(W_{\text{bytes}}/c+n-1)(\alpha+c/\beta)\), \(f'(c)=-W_{\text{bytes}}\alpha/c^2+(n-1)/\beta\), which vanishes at \(c^*\). Substituting, \(f(c^*)=W_{\text{bytes}}/\beta+(n-1)\alpha+2\sqrt{W\alpha(n-1)/\beta}=(\sqrt{W/\beta}+\sqrt{(n-1)\alpha})^2\). \(\square\)</p>
 </div>
 
-<p>Proposition 5.1 is the same trade-off as Vol. I's α–β analysis of collectives: small chunks fill the pipeline quickly but pay the per-chunk latency many times; large chunks pay it rarely but leave the pipeline empty for longer. For realistic numbers the second term is tiny. With \(W=70\) GB, \(\beta=300\) GB/s per server over eight RDMA NICs, \(\alpha=50\) µs and \(n=255\) receivers, \(c^*\approx\sqrt{70\times10^9\times5\times10^{-5}\times3\times10^{11}/254}\approx64\) MB and \(t^*\approx(0.483+0.113)^2\approx0.36\) s. Every one of 255 servers receives the full 70 GB in about a third of a second—the time to deliver it to one server, plus a few milliseconds. Figure 5.6 compares the three patterns as the number of new replicas grows.</p>
+<p>Proposition 5.1 is the same trade-off as Vol. I's α–β analysis of collectives: small chunks fill the pipeline quickly but pay the per-chunk latency many times; large chunks pay it rarely but leave the pipeline empty for longer. For realistic numbers the second term is tiny. With \(W_{\text{bytes}}=70\) GB, \(\beta=300\) GB/s per server over eight RDMA NICs, \(\alpha=50\) µs and \(n=255\) receivers, \(c^*\approx\sqrt{70\times10^9\times5\times10^{-5}\times3\times10^{11}/254}\approx64\) MB and \(t^*\approx(0.483+0.113)^2\approx0.36\) s. Every one of 255 servers receives the full 70 GB in about a third of a second—the time to deliver it to one server, plus a few milliseconds. Figure 5.6 compares the three patterns as the number of new replicas grows.</p>
 
 <figure class="chart" id="fig-5-6">
 <div class="chart-root"></div>
@@ -291,7 +291,7 @@ t_{\text{chain}}(c)=\Bigl(\frac{W}{c}+n-1\Bigr)\Bigl(\alpha+\frac{c}{\beta}\Bigr
 <li>Weights live canonically in object storage, whose throughput is \(\min(n_{\text{conn}}\beta_{\text{conn}},\beta_{\text{NIC}},\beta_{\text{svc}})\): parallel range reads are essential. Faster tiers: shared file systems, local NVMe (25–50 GB/s per server), host DRAM, and peer HBM over RDMA.</li>
 <li>Pickle checkpoints can execute arbitrary code on load; safetensors (JSON header plus raw aligned bytes) is safe, memory-mappable and supports selective reads. Pre-sharding for the serving layout cuts per-rank I/O by \(n_{\text{TP}}\).</li>
 <li>Streaming loaders pipeline storage, network, PCIe and HBM so time approaches size divided by the slowest link; PCIe (≈ 50 GB/s per GPU) rarely binds; GPUDirect Storage removes the host bounce buffer.</li>
-<li>Many simultaneous loads contend for a central store; swarms add every server's upload; pipelined chain broadcast takes \((W/c+n-1)(\alpha+c/\beta)\), optimal \(c^*=\sqrt{W\alpha\beta/(n-1)}\), nearly independent of \(n\).</li>
+<li>Many simultaneous loads contend for a central store; swarms add every server's upload; pipelined chain broadcast takes \((W_{\text{bytes}}/c+n-1)(\alpha+c/\beta)\), optimal \(c^*=\sqrt{W\alpha\beta/(n-1)}\), nearly independent of \(n\).</li>
 <li>Container images are 10–20 GB but only a few percent is read at start-up: lazy pulling, pre-pulling and layer discipline remove most of \(t_{\text{image}}\); keep weights out of images.</li>
 <li>Engine initialisation (communicators, compilation, autotuning, CUDA graphs) is cut by persistent compilation caches, limited graph capture, sleep modes and process snapshots.</li>
 <li>Optimised cold starts are about 20 s (8B), 35 s (70B) and 75 s (DeepSeek-V3) on warm nodes; faster cold starts reduce autoscaling headroom and recovery capacity in proportion.</li>
@@ -334,7 +334,7 @@ t_{\text{chain}}(c)=\Bigl(\frac{W}{c}+n-1\Bigr)\Bigl(\alpha+\frac{c}{\beta}\Bigr
 <div class="mcq" data-id="ci05-mcq-06" data-topic="§5.2 Tiers">
 <p class="q">Why can rare loads from the slowest tier dominate the expected load time?</p>
 <ol class="opts"><li>They are always first</li><li data-correct>Tier bandwidths differ by orders of magnitude, so a small probability times a very long time is large</li><li>They use more GPUs</li><li>They are retried</li></ol>
-<div class="explain">\(\mathbb E[t]=\sum_ip_iW/\beta_i\).</div>
+<div class="explain">\(\mathbb E[t]=\sum_ip_iW_{\text{bytes}}/\beta_i\).</div>
 </div>
 
 <div class="mcq" data-id="ci05-mcq-07" data-topic="§5.3 Formats">
@@ -399,13 +399,13 @@ t_{\text{chain}}(c)=\Bigl(\frac{W}{c}+n-1\Bigr)\Bigl(\alpha+\frac{c}{\beta}\Bigr
 
 <div class="mcq" data-id="ci05-mcq-17" data-topic="§5.5 Distribution">
 <p class="q">In a pipelined chain broadcast, the completion time is approximately:</p>
-<ol class="opts"><li>\(nW/\beta\)</li><li data-correct>\((W+(n-1)c)/\beta\) ignoring per-chunk latency</li><li>\(W\log n/\beta\)</li><li>\(W/(n\beta)\)</li></ol>
+<ol class="opts"><li>\(nW_{\text{bytes}}/\beta\)</li><li data-correct>\((W_{\text{bytes}}+(n-1)c)/\beta\) ignoring per-chunk latency</li><li>\(W_{\text{bytes}}\log n/\beta\)</li><li>\(W_{\text{bytes}}/(n\beta)\)</li></ol>
 <div class="explain">Each node forwards a chunk while receiving the next.</div>
 </div>
 
 <div class="mcq" data-id="ci05-mcq-18" data-topic="§5.5 Distribution">
 <p class="q">The optimal chunk size in Proposition 5.1 is:</p>
-<ol class="opts"><li>\(W/n\)</li><li data-correct>\(\sqrt{W\alpha\beta/(n-1)}\)</li><li>\(\alpha\beta\)</li><li>\(W\)</li></ol>
+<ol class="opts"><li>\(W_{\text{bytes}}/n\)</li><li data-correct>\(\sqrt{W\alpha\beta/(n-1)}\)</li><li>\(\alpha\beta\)</li><li>\(W_{\text{bytes}}\)</li></ol>
 <div class="explain">It balances pipeline fill against per-chunk latency.</div>
 </div>
 
@@ -530,7 +530,7 @@ t_{\text{chain}}(c)=\Bigl(\frac{W}{c}+n-1\Bigr)\Bigl(\alpha+\frac{c}{\beta}\Bigr
 <details class="qa" data-id="ci05-qa-06">
 <summary><span class="lvl core">Core</span> Derive the completion time of a pipelined chain broadcast and its optimal chunk size.</summary>
 <div class="answer">
-<p>\(n\) receivers in a chain, per-hop chunk time \(\alpha+c/\beta\). The last of \(W/c\) chunks leaves the source after \(W/c\) chunk times and needs \(n-1\) more hops: \(T(c)=(W/c+n-1)(\alpha+c/\beta)\). Setting \(dT/dc=-W\alpha/c^2+(n-1)/\beta=0\) gives \(c^*=\sqrt{W\alpha\beta/(n-1)}\) and \(T^*=(\sqrt{W/\beta}+\sqrt{(n-1)\alpha})^2\). For \(W=70\) GB, \(\beta=300\) GB/s, \(\alpha=50\) µs, \(n=255\): \(c^*\approx64\) MB, \(T^*\approx0.36\) s—close to the one-receiver time \(W/\beta=0.23\) s. Same structure as α–β collectives and pipeline bubbles: small chunks fill fast but pay α often.</p>
+<p>\(n\) receivers in a chain, per-hop chunk time \(\alpha+c/\beta\). The last of \(W_{\text{bytes}}/c\) chunks leaves the source after \(W_{\text{bytes}}/c\) chunk times and needs \(n-1\) more hops: \(T(c)=(W_{\text{bytes}}/c+n-1)(\alpha+c/\beta)\). Setting \(dT/dc=-W_{\text{bytes}}\alpha/c^2+(n-1)/\beta=0\) gives \(c^*=\sqrt{W\alpha\beta/(n-1)}\) and \(T^*=(\sqrt{W/\beta}+\sqrt{(n-1)\alpha})^2\). For \(W_{\text{bytes}}=70\) GB, \(\beta=300\) GB/s, \(\alpha=50\) µs, \(n=255\): \(c^*\approx64\) MB, \(T^*\approx0.36\) s—close to the one-receiver time \(W_{\text{bytes}}/\beta=0.23\) s. Same structure as α–β collectives and pipeline bubbles: small chunks fill fast but pay α often.</p>
 </div>
 </details>
 
@@ -558,7 +558,7 @@ t_{\text{chain}}(c)=\Bigl(\frac{W}{c}+n-1\Bigr)\Bigl(\alpha+\frac{c}{\beta}\Bigr
 <details class="qa" data-id="ci05-qa-10">
 <summary><span class="lvl deep">Deep-dive</span> Compare star, swarm and chain distribution for model weights. When would you use each?</summary>
 <div class="answer">
-<p>Star: every node fetches from the central store; simple, robust; time ≈ max(W/β_client, nW/β_svc), linear in n once the store's aggregate limit binds—fine for few nodes or small models. Swarm (BitTorrent-like, Kraken, Dragonfly): chunks exchanged among nodes over the front-end; every node's upload adds supply; time ≈ W/β + O(log n) chunk times; tolerates churn and heterogeneous networks; needs a tracker or coordinator. Chain/tree broadcast over back-end RDMA from running replicas: time ≈ (W + (n−1)c)/β with β of hundreds of GB/s; fastest, but requires shared fabric, a coordinator to build chains, and a live source; fragile if a node in the chain fails (use trees or re-routing). Use star for small scale, swarm as the general mechanism, chain for large models and bursty scale-ups within a fabric.</p>
+<p>Star: every node fetches from the central store; simple, robust; time ≈ max(W/β_client, nW/β_svc), linear in n once the store's aggregate limit binds—fine for few nodes or small models. Swarm (BitTorrent-like, Kraken, Dragonfly): chunks exchanged among nodes over the front-end; every node's upload adds supply; time ≈ W_bytes/β + O(log n) chunks; tolerates churn and heterogeneous networks; needs a tracker or coordinator. Chain/tree broadcast over back-end RDMA from running replicas: time ≈ (W + (n−1)c)/β with β of hundreds of GB/s; fastest, but requires shared fabric, a coordinator to build chains, and a live source; fragile if a node in the chain fails (use trees or re-routing). Use star for small scale, swarm as the general mechanism, chain for large models and bursty scale-ups within a fabric.</p>
 </div>
 </details>
 

@@ -251,6 +251,6 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | Symbol | Meaning |
 |---|---|
 | \(t_{\text{cold}}\) | cold-start time of a replica \(=t_{\text{node}}+t_{\text{sched}}+t_{\text{image}}+t_{\text{weights}}+t_{\text{init}}+t_{\text{warm}}\) |
-| \(W_{\text{bytes}}\) | bytes of model weights, \(Nb_w\) (\(W\) alone in Ch. 5 propositions; never the waiting time \(W\) when ambiguous) |
+| \(W_{\text{bytes}}\) | bytes of model weights, \(Nb_w\) (distinct from the time in system \(W\) of Little's law) |
 | \(n_{\text{conn}}\), \(\beta_{\text{conn}}\), \(\beta_{\text{NIC}}\), \(\beta_{\text{svc}}\) | concurrent storage requests; throughput of one; client NIC bandwidth; service-side limit |
 | \(c\) | chunk size of a pipelined transfer or broadcast (bytes) |
