@@ -39,16 +39,18 @@ document.addEventListener('book:ready', function () {
   var B = window.Book;
   function paint() {
     var rows = '', rev = '';
-    B.CHAPTERS.filter(function (c) { return c.ready; }).forEach(function (c) {
+    var lastBook = null;
+    B.ALL_CHAPTERS.filter(function (c) { return c.ready; }).forEach(function (c) {
       var s = B.chapterStats(c.id), ch = B.store.chapter(c.id);
+      if (c.book !== lastBook) { lastBook = c.book; rows += '<tr><th colspan="6">' + B.BOOKS[c.book].vol + ' · ' + B.BOOKS[c.book].name + '</th></tr>'; }
       rows += '<tr><td><a href="' + c.file + '">' + c.n + '. ' + c.title + '</a></td><td class="num">' + s.mcqDone + '/' + (ch.totalMcq || '–') + '</td><td class="num">' + s.mcqOk + '</td><td class="num">' + s.qaGot + '/' + (ch.totalQa || '–') + '</td><td class="num">' + s.qaRev + '</td><td>' + (ch.complete ? '✓ completed' : (ch.visited ? 'in progress' : 'not started')) + '</td></tr>';
     });
     var items = B.store.data.items;
     Object.keys(items).sort().forEach(function (id) {
       var r = items[id]; if (!r) return;
-      var c = B.CHAPTERS.find(function (x) { return x.id === r.ch; }); if (!c) return;
+      var c = B.ALL_CHAPTERS.find(function (x) { return x.id === r.ch; }); if (!c) return;
       if ((r.t === 'mcq' && !r.ok) || (r.t === 'qa' && r.rating === 'review'))
-        rev += '<li><a href="' + c.file + '#' + id + '">' + (r.t === 'mcq' ? 'MCQ' : 'Interview') + ' · Ch ' + c.n + '</a> — ' + (r.title || id).replace(/[<>&]/g, '') + '</li>';
+        rev += '<li><a href="' + c.file + '#' + id + '">' + (r.t === 'mcq' ? 'MCQ' : 'Interview') + ' · ' + (c.book === 'cloud' ? 'Vol II ' : '') + 'Ch ' + c.n + '</a> — ' + (r.title || id).replace(/[<>&]/g, '') + '</li>';
     });
     document.getElementById('rows').innerHTML = rows;
     document.getElementById('review').innerHTML = rev || '<li class="muted">Nothing to review yet.</li>';

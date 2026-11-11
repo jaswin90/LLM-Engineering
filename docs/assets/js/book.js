@@ -42,6 +42,39 @@
   ];
   const PARTS = { I: 'Foundations: What We Run and Why It Is Expensive', II: 'The Machine: Hardware for Mathematicians', III: 'Attention and Memory', IV: 'Serving Systems', V: 'Making Models Smaller and Adapting Them', VI: 'Distributed Inference', VII: 'Faster Decoding and Longer Contexts', VIII: 'Post-Training: Reinforcement Learning, Alignment and Reasoning', IX: 'Production' };
 
+
+  /* Volume II: Cloud AI Infrastructure. Ids use the prefix "ci" so that saved progress never collides with Volume I. */
+  const CLOUD_CHAPTERS = [
+    { id: 'ci01', n: 1, part: 'I', title: 'Why Serving Became a Cloud Problem', sub: 'The stack from silicon to region, capacity as the scarce resource, and the map of this volume', file: 'cloud/ci01.html', ready: true },
+    { id: 'ci02', n: 2, part: 'I', title: 'The AI Datacenter: Power, Cooling and Space', sub: 'Watts per token, PUE, liquid cooling, rack density and the grid', file: 'cloud/ci02.html', ready: false },
+    { id: 'ci03', n: 3, part: 'I', title: 'Accelerators as Cloud Products', sub: 'Instance families, GPU sharing (MIG, MPS), TPUs and Trainium, price–performance', file: 'cloud/ci03.html', ready: false },
+    { id: 'ci04', n: 4, part: 'I', title: 'Datacenter Networks for AI', sub: 'Front-end and back-end fabrics, fat trees, rail-optimised designs, RDMA, congestion', file: 'cloud/ci04.html', ready: false },
+    { id: 'ci05', n: 5, part: 'I', title: 'Storage, Weights and Cold Starts', sub: 'Object storage, safetensors, weight streaming, caching tiers, peer-to-peer distribution', file: 'cloud/ci05.html', ready: false },
+    { id: 'ci06', n: 6, part: 'II', title: 'Containers and Kubernetes for Accelerators', sub: 'Processes, cgroups, pods, device plugins, DRA, the GPU operator', file: 'cloud/ci06.html', ready: false },
+    { id: 'ci07', n: 7, part: 'II', title: 'Scheduling a GPU Cluster', sub: 'Bin packing, gang and topology-aware scheduling, quotas, preemption, fragmentation', file: 'cloud/ci07.html', ready: false },
+    { id: 'ci08', n: 8, part: 'II', title: 'Serving Platforms and Control Planes', sub: 'KServe, Ray Serve, Triton, Dynamo, llm-d, managed endpoints and serverless GPUs', file: 'cloud/ci08.html', ready: false },
+    { id: 'ci09', n: 9, part: 'III', title: 'Capacity, Procurement and Autoscaling', sub: 'Reserved, on-demand and spot capacity, forecasting, capacity mix as an optimisation', file: 'cloud/ci09.html', ready: false },
+    { id: 'ci10', n: 10, part: 'III', title: 'The Economics of Inference', sub: 'TCO, build versus buy, pricing tokens, FinOps and cost attribution', file: 'cloud/ci10.html', ready: false },
+    { id: 'ci11', n: 11, part: 'IV', title: 'The Front Door: Gateways, Streaming and Rate Limits', sub: 'HTTP/2, SSE, gRPC, WebSockets, distributed rate limiting, admission control', file: 'cloud/ci11.html', ready: false },
+    { id: 'ci12', n: 12, part: 'IV', title: 'Multi-Region Serving and Disaster Recovery', sub: 'Global load balancing, data residency, failover, capacity across regions', file: 'cloud/ci12.html', ready: false },
+    { id: 'ci13', n: 13, part: 'IV', title: 'Reliability Engineering for AI Services', sub: 'SLOs and error budgets, GPU failure modes, MTBF at scale, safe rollouts, incidents', file: 'cloud/ci13.html', ready: false },
+    { id: 'ci14', n: 14, part: 'IV', title: 'Security, Isolation and Multi-Tenancy', sub: 'Threat models, confidential computing, cache side channels, weight protection, supply chain', file: 'cloud/ci14.html', ready: false },
+    { id: 'ci15', n: 15, part: 'V', title: 'Serving Multimodal Models', sub: 'Vision encoders, image tokens, encoder caching, speech and real-time audio, video', file: 'cloud/ci15.html', ready: false },
+    { id: 'ci16', n: 16, part: 'V', title: 'Embeddings, Retrieval and Vector Search at Scale', sub: 'Embedding serving, HNSW, IVF-PQ, sharded indexes, RAG latency budgets', file: 'cloud/ci16.html', ready: false },
+    { id: 'ci17', n: 17, part: 'V', title: 'Agents and Compound AI Systems', sub: 'Tool calls, MCP, code sandboxes, session state, program-aware scheduling', file: 'cloud/ci17.html', ready: false },
+    { id: 'ci18', n: 18, part: 'V', title: 'Guardrails and Moderation Infrastructure', sub: 'Safety classifiers, streaming moderation, guard-model placement, audit', file: 'cloud/ci18.html', ready: false },
+    { id: 'ci19', n: 19, part: 'V', title: 'Batch, Offline and Rollout Inference', sub: 'Batch APIs, throughput-optimal pipelines, spot-tolerant jobs, RL rollouts', file: 'cloud/ci19.html', ready: false },
+    { id: 'ci20', n: 20, part: 'VI', title: 'The Cloud Infrastructure Design Interview', sub: 'Worked case studies, estimation drills and rubrics', file: 'cloud/ci20.html', ready: false }
+  ];
+  const CLOUD_PARTS = { I: 'The Physical Cloud', II: 'Orchestration', III: 'Elasticity and Economics', IV: 'The Global Request Path', V: 'Beyond Chat: Workloads Volume I Left Open', VI: 'The Interview' };
+  const BOOKS = {
+    llm: { key: 'llm', vol: 'Volume I', brand: 'Introduction to <span>LLM Engineering</span>', name: 'Introduction to LLM Engineering', index: 'index.html', chapters: CHAPTERS, parts: PARTS },
+    cloud: { key: 'cloud', vol: 'Volume II', brand: 'Cloud AI <span>Infrastructure</span>', name: 'Cloud AI Infrastructure', index: 'cloud/index.html', chapters: CLOUD_CHAPTERS, parts: CLOUD_PARTS }
+  };
+  const ALL_CHAPTERS = CHAPTERS.map(c => Object.assign({ book: 'llm' }, c)).concat(CLOUD_CHAPTERS.map(c => Object.assign({ book: 'cloud' }, c)));
+  const bookKey = () => (document.body && document.body.getAttribute('data-book')) || 'llm';
+  const BOOK = () => BOOKS[bookKey()] || BOOKS.llm;
+
   /* ------------------------------------------------------------------ store */
   const KEY = 'llmeng-progress-v1';
   function safeGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -122,13 +155,13 @@
 
   /* ------------------------------------------------------------------ header */
   function buildHeader() {
-    const r = root();
+    const r = root(), bk = BOOK(), other = bk.key === 'llm' ? BOOKS.cloud : BOOKS.llm;
     const bar = el('header', { class: 'topbar' });
     bar.innerHTML =
       '<button class="btn icon-btn" id="toc-toggle" aria-label="Contents">☰</button>' +
-      '<a class="brand" href="' + r + 'index.html">Introduction to <span>LLM Engineering</span></a>' +
+      '<a class="brand" href="' + r + bk.index + '">' + bk.brand + '</a>' +
       '<span class="spacer"></span>' +
-      '<nav><a href="' + r + 'index.html#contents">Contents</a><a href="' + r + 'notation.html">Notation</a><a href="' + r + 'progress.html">My progress</a><a href="' + r + 'references.html">Bibliography</a></nav>' +
+      '<nav><a href="' + r + bk.index + '#contents">Contents</a><a href="' + r + other.index + '" title="' + other.name + '">' + other.vol + '</a><a href="' + r + 'notation.html">Notation</a><a href="' + r + 'progress.html">My progress</a><a href="' + r + 'references.html">Bibliography</a></nav>' +
       '<button class="btn icon-btn" id="theme-btn" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>' +
       '<span id="auth-slot"><button class="btn" id="auth-btn" title="Sign in to sync your progress">Sign in</button></span>';
     document.body.insertBefore(bar, document.body.firstChild);
@@ -184,7 +217,7 @@
   const mcqs = [];
   function initMcqs() {
     const ch = chapterId();
-    const chN = (CHAPTERS.find(c => c.id === ch) || {}).n || '';
+    const chN = (BOOK().chapters.find(c => c.id === ch) || {}).n || '';
     $$('.mcq').forEach((box, i) => {
       const id = box.getAttribute('data-id') || (ch + '-mcq-' + (i + 1));
       box.setAttribute('data-id', id); if (!box.id) box.id = id;
@@ -263,7 +296,7 @@
   const qas = [];
   function initQas() {
     const ch = chapterId();
-    const chN = (CHAPTERS.find(c => c.id === ch) || {}).n || '';
+    const chN = (BOOK().chapters.find(c => c.id === ch) || {}).n || '';
     $$('details.qa').forEach((d, i) => {
       const id = d.getAttribute('data-id') || (ch + '-qa-' + (i + 1));
       d.setAttribute('data-id', id); if (!d.id) d.id = id;
@@ -326,11 +359,12 @@
   }
   function buildChapNav() {
     const art = $('article'); const ch = chapterId(); if (!art || !ch || $('.chap-nav', art)) return;
-    const i = CHAPTERS.findIndex(c => c.id === ch); const r = root();
+    const list = BOOK().chapters, idx = BOOK().index;
+    const i = list.findIndex(c => c.id === ch); const r = root();
     const nav = el('nav', { class: 'chap-nav' });
-    const prev = CHAPTERS[i - 1], next = CHAPTERS[i + 1];
-    nav.innerHTML = (prev && prev.ready ? '<a href="' + r + prev.file + '"><small>← Previous</small>' + prev.n + '. ' + prev.title + '</a>' : '<a href="' + r + 'index.html"><small>← Back</small>Contents</a>') +
-      (next && next.ready ? '<a class="next" href="' + r + next.file + '"><small>Next →</small>' + next.n + '. ' + next.title + '</a>' : '<a class="next" href="' + r + 'index.html#contents"><small>Coming next</small>' + (next ? next.n + '. ' + next.title : 'Contents') + '</a>');
+    const prev = list[i - 1], next = list[i + 1];
+    nav.innerHTML = (prev && prev.ready ? '<a href="' + r + prev.file + '"><small>← Previous</small>' + prev.n + '. ' + prev.title + '</a>' : '<a href="' + r + idx + '"><small>← Back</small>Contents</a>') +
+      (next && next.ready ? '<a class="next" href="' + r + next.file + '"><small>Next →</small>' + next.n + '. ' + next.title + '</a>' : '<a class="next" href="' + r + idx + '#contents"><small>Coming next</small>' + (next ? next.n + '. ' + next.title : 'Contents') + '</a>');
     art.appendChild(nav);
   }
 
@@ -357,6 +391,6 @@
     store.onChange(ev => { if (ev.kind === 'reload') { mcqs.forEach(restore); qas.forEach(paintQa); } });
     document.dispatchEvent(new CustomEvent('book:ready'));
   }
-  window.Book = { CHAPTERS, PARTS, store, toast, renderAuth, chapterStats, renderMath, el };
+  window.Book = { get CHAPTERS() { return BOOK().chapters; }, get PARTS() { return BOOK().parts; }, ALL_CHAPTERS, BOOKS, get BOOK() { return BOOK(); }, store, toast, renderAuth, chapterStats, renderMath, el };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();

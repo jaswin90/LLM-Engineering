@@ -213,6 +213,18 @@
 <p>• Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.</p>
 <p>• FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.</p>
 <p>• "Dense" throughput figures never include the 2× structured-sparsity marketing factor.</p>
+<p>---</p>
+<p>Volume II uses every symbol above with the same meaning and adds the following. Where a Volume I letter is reused, it carries a subscript that keeps it distinct (for example \(P_{\text{IT}}\) is a power, never the attention-probability matrix \(P\)).</p>
+<h2>Capacity, power and cost (Vol. II Ch. 1–2, 9–10)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\lambda_{\text{pk}}\), \(\bar\lambda\)</td><td>peak and daily-mean arrival rates; \(\lambda_{\text{pk}}/\bar\lambda\) is the peak-to-mean ratio</td></tr>
+<tr><td>\(r_{\text{hit}}\)</td><td>prefix-cache hit rate: fraction of input tokens served from cache</td></tr>
+<tr><td>\(\Phi_P\), \(\Phi_D\)</td><td>prefill and decode tokens per second a replica sustains at its operating point</td></tr>
+<tr><td>\(n_{\text{gpu}}\)</td><td>number of accelerators in a fleet</td></tr>
+<tr><td>\(s_{\text{spare}}\)</td><td>spare-capacity fraction (failures, draining, cold-start headroom, canaries)</td></tr>
+<tr><td>\(P_{\text{gpu}}\)</td><td>all-in IT power per accelerator (its share of server, network and storage), kW</td></tr>
+<tr><td>\(P_{\text{IT}}\), \(P_{\text{fac}}\)</td><td>IT power; total facility power. \(\text{PUE}=P_{\text{fac}}/P_{\text{IT}}\)</td></tr>
+</tbody></table></div>
 </div>
 </body>
 </html>

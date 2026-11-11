@@ -218,3 +218,108 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 28 | Benchmarking, Observability and Evaluation | ✅ v2 |
 | 29 | On-Device and Edge Inference | ✅ v2 |
 | 30 | The ML-Systems Design Interview | ✅ v2 |
+
+---
+
+# Volume II — Cloud AI Infrastructure: Serving Large Models at Datacenter Scale
+
+> **Same reader, same rules.** Everything in `CLAUDE.md` applies (prose first, the motivation → idea → mathematics → worked example → consequences → bridge arc, 30+ MCQs, 15+ interview questions, ≥ 4 SVG diagrams and 2 charts, British spelling). Files live in `docs/cloud/ciNN.html`, use `<body data-book="cloud" data-chapter="ciNN" data-root="../">`, and are registered in `CLOUD_CHAPTERS` in `docs/assets/js/book.js`. Question ids use the prefix `ciNN-` so saved progress never collides with Volume I. Cite Volume I as "Vol. I §11.8".
+> **Why a second volume.** Volume I ends at the boundary of the fleet (Chapter 27 of Vol. I). Interviews for infrastructure, ML-platform and inference roles probe everything beyond that boundary — power, instances, networks, storage, Kubernetes, capacity, money, global routing, reliability, security — and several workload families Volume I left open.
+
+## Gaps in Volume I that Volume II closes
+| Gap in Volume I | Where Volume II covers it |
+|---|---|
+| Physical datacenter: power, cooling, rack density, energy per token | Ch 2 |
+| Cloud instance types, GPU sharing (MIG, MPS, time-slicing), non-NVIDIA cloud accelerators as products | Ch 3 |
+| Datacenter fabric design (front-end vs back-end, fat trees, rail-optimised, congestion control) — Vol. I Ch 17 covers collectives only | Ch 4 |
+| Weight storage, file formats, image pulls and the anatomy of a cold start | Ch 5 |
+| Containers, Kubernetes, device plugins, DRA; cluster scheduling | Ch 6–7 |
+| Serving platforms and managed endpoints (KServe, Ray Serve, Triton, Dynamo, llm-d, Bedrock/Vertex/SageMaker, serverless GPUs) | Ch 8 |
+| Procurement (reserved / on-demand / spot), TCO, pricing tokens, FinOps | Ch 9–10 |
+| Streaming protocols, gateways, distributed rate limiting | Ch 11 |
+| Multi-region serving, data residency, disaster recovery | Ch 12 |
+| SLOs and error budgets, GPU failure modes, MTBF at scale | Ch 13 |
+| Security: threat models, confidential computing, prompt-cache side channels, weight theft, model supply chain | Ch 14 |
+| **Multimodal serving** (vision encoders, image tokens, audio, real-time speech) | Ch 15 |
+| **Embeddings, vector search and RAG infrastructure** | Ch 16 |
+| **Agents and compound AI** (tool calls, MCP, sandboxes, session state) | Ch 17 |
+| **Guardrails and moderation infrastructure** | Ch 18 |
+| **Batch / offline inference and RL rollouts as a cloud workload** | Ch 19 |
+| Infrastructure system-design interview | Ch 20 |
+
+## Part I — The Physical Cloud
+### Chapter 1 — Why Serving Became a Cloud Problem
+**Motivating question.** One H100 can serve Llama 3 8B. Why does serving a popular model take a building, a power contract and a global network?
+**Arc.** From one request to a planet of requests → the stack (silicon, server, rack, pod, hall, campus, region) → three scarce resources: power, accelerators, people → who builds what: hyperscalers, neoclouds, model labs, enterprises → the running service ("Atlas") and its demand model → orders of magnitude: tokens/day → GPUs → megawatts → dollars → the control plane / data plane split → map of the volume.
+### Chapter 2 — The AI Datacenter: Power, Cooling and Space
+**Arc.** Watts per GPU and per server → rack density from 10 kW to 120 kW+ → PUE and where the overhead goes → heat removal: air, rear-door, direct-to-chip liquid, immersion → power delivery and redundancy (N, N+1, 2N) → energy per token derived → the grid, interconnection queues and siting → stranded power and oversubscription → water.
+### Chapter 3 — Accelerators as Cloud Products
+**Arc.** What an "instance" is (VM, bare metal, virtualisation) → instance families on AWS, GCP, Azure, OCI and neoclouds → GPU sharing: time-slicing, MPS, MIG, vGPU, with the mathematics of interference → TPUs, Trainium/Inferentia, MI300X/MI355X as products → price–performance per token as the selection criterion → a hardware-selection procedure.
+### Chapter 4 — Datacenter Networks for AI
+**Arc.** Two networks (front-end and back-end) → Clos and fat-tree topology mathematics (radix, tiers, bisection, oversubscription) → rail-optimised designs → InfiniBand vs RoCE vs cloud fabrics (EFA/SRD) → congestion, ECMP collisions and load balancing → scale-up domains (NVL72) vs scale-out → what inference needs from the network (KV transfer, EP all-to-all, weight loading).
+### Chapter 5 — Storage, Weights and Cold Starts
+**Arc.** Anatomy of a cold start → object storage throughput model → file formats (pickle → safetensors → GGUF) → parallel range reads, streaming into GPU memory, GPUDirect Storage → caching tiers and peer-to-peer distribution → container images and lazy pulling → snapshotting engine state → cold-start budget for 8B, 70B, 671B.
+
+## Part II — Orchestration
+### Chapter 6 — Containers and Kubernetes for Accelerators
+**Arc.** Processes, isolation and the container → the Kubernetes model (desired state, controllers, reconciliation) → pods, deployments, services → exposing GPUs: device plugins → DRA → GPU operator, drivers, DCGM → multi-node serving: LeaderWorkerSet → health, probes and lifecycles for LLM servers.
+### Chapter 7 — Scheduling a GPU Cluster
+**Arc.** Scheduling as constrained bin packing → fragmentation and its measurement → gang scheduling → topology-aware placement → quotas, fair share and borrowing (Kueue, KAI, Volcano, Slurm) → preemption and priorities → inference and training sharing one cluster.
+### Chapter 8 — Serving Platforms and Control Planes
+**Arc.** What a platform adds to an engine → Triton, KServe, Ray Serve, BentoML → LLM-native control planes: Dynamo, llm-d, AIBrix, the Gateway API inference extension → managed endpoints (SageMaker, Vertex, Azure, Bedrock) and token APIs → serverless GPUs and scale to zero → model lifecycle: registry, rollout, shadowing.
+
+## Part III — Elasticity and Economics
+### Chapter 9 — Capacity, Procurement and Autoscaling
+**Arc.** Capacity as the binding constraint → purchase options (reserved, committed, on-demand, capacity blocks, spot) → the capacity mix as a newsvendor / linear programme → forecasting demand → spot and preemption mathematics → autoscaling signals and control → regional capacity and fallbacks.
+### Chapter 10 — The Economics of Inference
+**Arc.** TCO from first principles (capex, power, space, network, people) → cost per GPU-hour → cost per million tokens across hardware and models → pricing tokens (input vs output, cached input, batch, priority tiers) → build vs buy vs API → FinOps: attribution, chargeback, utilisation metrics that lie.
+
+## Part IV — The Global Request Path
+### Chapter 11 — The Front Door: Gateways, Streaming and Rate Limits
+**Arc.** A request's journey (DNS, TLS, LB, gateway) → HTTP/1.1, HTTP/2, SSE, WebSockets, gRPC for token streaming → long-lived connections and load balancers → distributed rate limiting (token bucket, sliding window, GCRA) → admission control and load shedding → API design for LLMs.
+### Chapter 12 — Multi-Region Serving and Disaster Recovery
+**Arc.** Why multiple regions → global load balancing (DNS, anycast, GSLB) → latency vs capacity routing as an optimisation → data residency and sovereignty → state that must follow users (prefix caches, sessions, files) → failover and DR (RTO, RPO) → capacity across regions.
+### Chapter 13 — Reliability Engineering for AI Services
+**Arc.** SLIs, SLOs, error budgets → availability mathematics (series, parallel, k-of-n) → GPU failure modes (Xid, ECC, NVLink, thermal) and MTBF at scale → health checking and quarantine → safe change: canaries, progressive rollout, model-version rollbacks → overload and graceful degradation → incident response and postmortems.
+### Chapter 14 — Security, Isolation and Multi-Tenancy
+**Arc.** Threat models for model APIs → isolation layers (process, container, VM, MIG, confidential computing) → side channels in shared serving (prompt-cache timing, KV sharing) → protecting weights (SL1–SL5) → model supply chain (pickle, signing, provenance) → data protection, retention and logging → prompt injection as an infrastructure problem.
+
+## Part V — Beyond Chat: Workloads Volume I Left Open
+### Chapter 15 — Serving Multimodal Models
+**Arc.** How images become tokens (ViT, patching, dynamic resolution) → the cost of the encoder and of image tokens → encoder caching and EPD disaggregation → audio: ASR, TTS and real-time speech-to-speech → video and long multimodal contexts → image generation (diffusion) serving in brief.
+### Chapter 16 — Embeddings, Retrieval and Vector Search at Scale
+**Arc.** Why retrieval → embedding models and their serving profile → exact search cost → ANN: IVF, PQ (mathematics of quantisation error), HNSW, DiskANN → recall–latency–memory trade-offs → sharding and replication of indexes → rerankers → RAG latency and cost budgets.
+### Chapter 17 — Agents and Compound AI Systems
+**Arc.** From one call to a program of calls → tool calling and MCP → sandboxes for code execution (containers, gVisor, Firecracker) → session state and KV retention across tool calls → program-aware scheduling (Parrot, Autellix) → cost and latency of agent loops → reliability of multi-step workflows.
+### Chapter 18 — Guardrails and Moderation Infrastructure
+**Arc.** Why guardrails are infrastructure → classifier families (Llama Guard, ShieldGemma, constitutional classifiers) → placement: before, during (streaming), after → latency and cost budgets of guards → precision, recall and base rates → audit, appeals and policy as configuration.
+### Chapter 19 — Batch, Offline and Rollout Inference
+**Arc.** Throughput-optimal serving → batch APIs and their pricing → pipelines on spot capacity with checkpointed progress → synthetic-data generation and evaluation sweeps → RL rollouts as an inference workload → scheduling batch alongside online.
+
+## Part VI — The Interview
+### Chapter 20 — The Cloud Infrastructure Design Interview
+**Arc.** What infrastructure interviews assess → estimation toolkit (power, GPUs, network, storage, dollars) → case studies: a global LLM API; a serverless GPU platform; a GPU cluster scheduler; a model-rollout system; an embedding and retrieval service; an agent sandbox fleet → rubrics and failure modes.
+
+## Volume II writing status
+| Ch | Title | Status |
+|---|---|---|
+| 1 | Why Serving Became a Cloud Problem | ⏳ |
+| 2 | The AI Datacenter: Power, Cooling and Space | ⏳ |
+| 3 | Accelerators as Cloud Products | ⏳ |
+| 4 | Datacenter Networks for AI | ⏳ |
+| 5 | Storage, Weights and Cold Starts | ⏳ |
+| 6 | Containers and Kubernetes for Accelerators | ⏳ |
+| 7 | Scheduling a GPU Cluster | ⏳ |
+| 8 | Serving Platforms and Control Planes | ⏳ |
+| 9 | Capacity, Procurement and Autoscaling | ⏳ |
+| 10 | The Economics of Inference | ⏳ |
+| 11 | The Front Door: Gateways, Streaming and Rate Limits | ⏳ |
+| 12 | Multi-Region Serving and Disaster Recovery | ⏳ |
+| 13 | Reliability Engineering for AI Services | ⏳ |
+| 14 | Security, Isolation and Multi-Tenancy | ⏳ |
+| 15 | Serving Multimodal Models | ⏳ |
+| 16 | Embeddings, Retrieval and Vector Search at Scale | ⏳ |
+| 17 | Agents and Compound AI Systems | ⏳ |
+| 18 | Guardrails and Moderation Infrastructure | ⏳ |
+| 19 | Batch, Offline and Rollout Inference | ⏳ |
+| 20 | The Cloud Infrastructure Design Interview | ⏳ |

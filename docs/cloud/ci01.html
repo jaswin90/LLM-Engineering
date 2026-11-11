@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 1 · Why Serving Became a Cloud Problem — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 1 of Cloud AI Infrastructure (Volume II of Introduction to LLM Engineering): the infrastructure stack from silicon to region, the three scarce resources of AI serving, who builds the AI cloud, the Atlas running example and its demand model, the chain from tokens to GPUs to megawatts to dollars, control and data planes, and what Volume I left open.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci01" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part I · The Physical Cloud — Chapter 1</div>
+<h1 id="top">Why Serving Became a Cloud Problem</h1>
+<p class="lede">A single H100 can serve Llama 3 8B to a few hundred people at once. Serving a popular model to tens of millions of people takes thousands of accelerators, a building with its own substation, a network that spans continents, and a team that keeps all of it running through failures, price changes and traffic spikes. This chapter explains why, and turns the jump from one GPU to a fleet into numbers that every later chapter refines.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Volume I of this book followed a request inside one inference engine. We derived how long a decode step takes from the bytes it reads (Vol. I §3.7), how continuous batching keeps the GPU busy (Vol. I Chapter 11), how the KV cache is paged and shared (Vol. I Chapter 10), and how a model too large for one GPU is split across many (Vol. I Chapter 18). By the end of that volume we could design a replica—an engine on one GPU or one parallel group—and predict its throughput and latency. Vol. I Chapter 27 then took one step outward, to the fleet of replicas behind a router, and stopped there.</p>
+<p>This volume starts at that boundary and asks what lies beyond it. A replica needs a machine, and the machine needs a rack, power, cooling and a network. Machines must be bought or rented, in a market where accelerators have been scarce for years, and the choice between owning, reserving and renting by the hour changes the cost of a token by a factor of three. The software that runs on those machines has to be deployed, scheduled, restarted, upgraded and secured. Requests come from every continent, and some of them must legally be answered within a particular country. Hardware fails, at a rate that becomes a daily event once a fleet has thousands of GPUs. Each of these is an engineering discipline with its own quantitative core, and each is examined in infrastructure interviews at FAANG companies and AI labs.</p>
+<p>The question of this chapter is how big the problem is, and what shape it has. We first see how the scale of demand for language models grew from a research curiosity to quadrillions of tokens a month (§1.1). We then describe the physical and logical stack that serves those tokens, from the silicon to the region (§1.2), and the three resources that limit it: power, accelerators and people (§1.3). We meet the organisations that build this infrastructure and how their roles evolved (§1.4). We introduce Atlas, the fictional but realistic service that serves as this volume's running example (§1.5), and we follow a chain of estimates from its token demand to GPUs, megawatts and dollars (§1.6). We separate the parts of the system that decide from the parts that do (§1.7). Finally we list the topics Volume I left open (§1.8) and draw the map of this volume (§1.9).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Describe the layers of AI serving infrastructure—accelerator, server, rack, cluster, data hall, campus, region—and give their typical sizes in GPUs and power.</li>
+<li>Explain why power, accelerators and skilled operators are the scarce resources, and how each constrains capacity.</li>
+<li>Distinguish hyperscalers, neoclouds, model labs and enterprises as builders and users of AI infrastructure, and explain the shared-responsibility split between a cloud provider and its customers.</li>
+<li>Turn a demand model (requests, input and output tokens, cache hits, peak-to-mean ratio) into accelerators, megawatts and annual cost, and say which inputs dominate.</li>
+<li>Separate control-plane from data-plane concerns and explain why they are engineered differently.</li>
+<li>Name the workload families and infrastructure topics beyond a single engine that this volume covers.</li>
+</ol>
+<p class="small muted">Uses from Volume I: the decode and prefill latency models (Vol. I §3.7–3.9), continuous batching (Vol. I Chapter 11), parallelism (Vol. I Chapter 18) and the cost-per-token formula (Vol. I §27.7). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s1-1">1.1 From one request to a planet of requests</h2>
+<p>Consider first what one GPU can do, because everything that follows is a multiple of it. In Vol. I §27.9 we measured Llama 3 8B in FP8 on a single H100 producing about 9,000 output tokens per second at a batch of 128 while keeping the time per output token under 25 ms. If a typical chat response is 350 tokens and a user waits about 15 seconds while it streams, the GPU is serving about 128 people at any instant, and it completes roughly 25 responses per second. Over a day, at full use, that is two million responses and nearly a billion output tokens from a device that fits in a hand. For a research demonstration or a small internal tool, one GPU is enough, and the infrastructure question is trivial: rent a machine, start an engine, and point users at it.</p>
+<p>Demand for language models did not stay at that scale. When ChatGPT launched in November 2022 it reached a hundred million users within about two months, and the providers that followed—Google's Gemini, Anthropic's Claude, Meta's Llama-based assistants and many API platforms—grew to comparable or larger audiences. The clearest public measurement of the resulting volume comes from Google, which reported processing about 9.7 trillion tokens per month across its products and APIs in April 2024, about 480 trillion in April 2025, and more than 1.3 quadrillion (\(1.3\times10^{15}\)) per month by October 2025<span class="cite"><a href="#r-google-tokens">[1]</a></span>. That is a fifty-fold increase in a year and then a near tripling in six months. One quadrillion tokens a month is about \(3.9\times10^{8}\) tokens per second, averaged over the day.</p>
+<p>Divide that rate by what one GPU can do and the scale of the infrastructure appears. If every token were an output token from an 8B model at 9,000 tokens per second per GPU, we would need about 43,000 GPUs running flat out. But production traffic is not all small models, and it is not served at full utilisation. Frontier models are ten to a hundred times more expensive per token than an 8B model; reasoning models generate thousands of hidden tokens per answer (Vol. I Chapter 26); traffic peaks at roughly twice its daily mean; and fleets hold spare capacity for failures and growth. Each of these factors multiplies the count, and the realistic answer for a provider at this scale is hundreds of thousands to millions of accelerators. Public announcements of single AI campuses in 2025 and 2026 speak of a gigawatt or more of power, enough for roughly half a million to a million of today's accelerators.</p>
+<p>Three features of LLM serving make this scale harder than earlier waves of web infrastructure. First, the work per request is enormous and variable. A web search touches a few milliseconds of CPU on many machines; an LLM request occupies a slice of a 700-watt accelerator for seconds or minutes, and one request can be a thousand times more expensive than the next. Second, the hardware is specialised and scarce. A web service can run on almost any server in any region, but a model that needs eight H100s connected by NVLink can run only where such machines exist, and for most of 2023 and 2024 they were sold out months in advance. Third, the hardware is power-dense. A rack of web servers draws 5 to 15 kilowatts; a rack of Blackwell GPUs draws more than 120 kilowatts, which existing buildings cannot supply or cool.</p>
+<p>The consequence is that "serving a model" in production is no longer only a question about kernels and batching. It is a question about where the machines are, how they were obtained, how they are powered and connected, how the software reaches them, and how the whole system behaves when part of it fails. Those are the questions of cloud infrastructure, and to answer them we first need a picture of the layers involved.</p>
+
+<h2 id="s1-2">1.2 The stack, from silicon to region</h2>
+<p>When engineers talk about "the infrastructure" they mean a nested hierarchy of physical containers, each with its own capacity, failure behaviour and cost. Figure 1.1 shows the hierarchy for a modern GPU fleet, with typical sizes at each level. The numbers are representative of 2025–2026 H100, H200 and Blackwell deployments; later chapters derive them.</p>
+
+<figure class="diagram" id="fig-1-1">
+<svg class="dg" viewBox="0 0 720 330" role="img" aria-label="The infrastructure hierarchy from accelerator to region">
+<rect x="20" y="20" width="680" height="295" rx="12" class="bx"/>
+<text x="36" y="42" class="t-sm t-b">Region (several campuses or availability zones, 100 MW – several GW)</text>
+<rect x="40" y="55" width="640" height="248" rx="10" class="bx4"/>
+<text x="56" y="76" class="t-sm t-b">Campus / availability zone (one or more buildings, 50 MW – 1 GW+)</text>
+<rect x="60" y="88" width="600" height="203" rx="10" class="bx2"/>
+<text x="76" y="108" class="t-sm t-b">Data hall (≈ 5–30 MW; a few thousand to tens of thousands of GPUs)</text>
+<rect x="80" y="120" width="560" height="160" rx="10" class="bx3"/>
+<text x="96" y="140" class="t-sm t-b">Cluster / pod (one back-end network; 1,000 – 100,000 GPUs)</text>
+<rect x="100" y="152" width="250" height="116" rx="8" class="bx5"/>
+<text x="114" y="171" class="t-sm t-b">Rack (≈ 40–130 kW)</text>
+<text x="114" y="187" class="t-xs">4 × 8-GPU servers (H100) or</text>
+<text x="114" y="201" class="t-xs">72 GPUs in one NVLink domain (GB200)</text>
+<rect x="114" y="212" width="222" height="48" rx="6" class="bx"/>
+<text x="126" y="230" class="t-xs t-b">Server / node (≈ 10–14 kW)</text>
+<text x="126" y="246" class="t-xs">8 GPUs + 2 CPUs + NICs + local NVMe</text>
+<rect x="370" y="152" width="250" height="116" rx="8" class="bx5"/>
+<text x="384" y="171" class="t-sm t-b">Accelerator (≈ 0.7–1.4 kW)</text>
+<text x="384" y="189" class="t-xs">H100: 80 GB HBM, 3.35 TB/s, 989 TFLOP/s</text>
+<text x="384" y="205" class="t-xs">B200: 192 GB HBM, 8 TB/s, ≈ 2.25 PFLOP/s</text>
+<text x="384" y="221" class="t-xs">one NIC per GPU, 400–800 Gb/s</text>
+<text x="384" y="245" class="t-xs">failure unit for most faults</text>
+</svg>
+<figcaption><b>Figure 1.1 — The infrastructure hierarchy.</b> Each level contains many copies of the level inside it. Power grows by roughly an order of magnitude per level, and each level is a distinct failure domain: a GPU, a server, a rack's power feed, a network pod, a building or a region can each fail as a unit.</figcaption>
+</figure>
+
+<p>Start at the innermost box of Figure 1.1. The <strong>accelerator</strong> is the GPU or TPU of Vol. I Chapter 5: a package of compute dies and high-bandwidth memory drawing 700 watts (H100 SXM) to about 1,200 watts (B300). Accelerators are almost never sold or rented singly. They come in a <strong>server</strong>, also called a <strong>node</strong>: a chassis with eight GPUs on an NVLink baseboard (NVIDIA calls it HGX), two host CPUs, between one and two terabytes of ordinary DRAM, several local NVMe solid-state drives, and one network interface card (NIC) per GPU plus one or two more for general traffic. An eight-GPU H100 server is specified at about 10.2 kW at maximum load. The server is the unit an operating system boots, and therefore the unit that a cloud rents as an "instance" (Chapter 3).</p>
+<p>Servers are mounted in <strong>racks</strong>, steel frames about 60 cm wide and two metres tall that share power distribution and, increasingly, liquid cooling. A traditional air-cooled rack can dissipate about 30–40 kW, so it holds three or four H100 servers. NVIDIA's GB200 NVL72 changes the unit: 72 Blackwell GPUs and 36 Grace CPUs in a single liquid-cooled rack drawing about 120–132 kW, with all 72 GPUs joined by one NVLink domain so that they behave, for communication purposes, like one very large server. Chapter 2 explains why rack power density went up twelve-fold in five years and what that did to buildings.</p>
+<p>Racks are connected by networks. A <strong>cluster</strong> or <strong>pod</strong> is a set of racks joined by one high-bandwidth "back-end" network, the fabric that carries GPU-to-GPU traffic such as collectives, KV-cache transfers and expert-parallel all-to-alls (Chapter 4). Clusters range from a thousand GPUs to more than a hundred thousand. Clusters sit in a <strong>data hall</strong>, a room with its own power and cooling plant, and halls sit in buildings grouped into a <strong>campus</strong>. Cloud providers expose campuses, or groups of nearby buildings with independent power and networking, as <strong>availability zones</strong>, and group nearby zones into a <strong>region</strong> such as <code>us-east-1</code> or <code>europe-west4</code>. Zones in a region are a few kilometres to tens of kilometres apart, close enough for millisecond latency between them, far enough that a fire or a power failure in one should not affect another.</p>
+<p>Two properties of this hierarchy recur throughout the volume. The first is that <em>each level is a failure domain</em>: a component whose failure takes down everything inside it. A GPU's memory error kills one replica; a server's power supply takes down eight GPUs; a rack's power feed or top-of-rack switch takes down 32 to 72; a cooling failure can take down a hall; a regional network event can take down a region. Reliability engineering (Chapter 13) is largely the art of placing replicas so that no single failure domain holds too many of them. The second property is that <em>bandwidth falls and latency rises as we move outward</em>. Within a GPU, HBM delivers 3.35 TB/s; between GPUs in a server, NVLink delivers 450 GB/s per direction; between servers, the back-end network delivers 50 GB/s per GPU; between zones, perhaps a few terabits per second shared by everything; and between regions, latencies are tens of milliseconds. Volume I exploited the first two levels. This volume is about the outer ones.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — the hierarchy as a capacitated tree</div>
+<p>It is useful to model the physical infrastructure as a rooted tree. Each node \(v\) is a container (region, campus, hall, rack, server, GPU); its children are the containers inside it. Each node carries capacities: a power budget \(P(v)\) that must be at least the sum of its children's draws, a cooling capacity, and the bandwidth of the links that join its children to each other and to the rest of the tree. A failure of node \(v\) removes the whole subtree rooted at \(v\). Placing a workload is then a constrained assignment of replicas to leaves: each replica needs a set of leaves (GPUs) that share a sufficiently fast ancestor (a server for tensor parallelism, a cluster for disaggregation), and reliability requires that no internal node's subtree contains more than a given fraction of the replicas of a service. Much of Part II is about solving versions of this assignment problem quickly and well.</p>
+</div>
+
+<p>The stack also has logical layers above the physical ones. On each server runs an operating system, a GPU driver, a container runtime and an agent that reports health. Above the servers, a cluster manager—usually Kubernetes (Chapter 6) or Slurm—decides which containers run where (Chapter 7). Above the cluster manager, a serving platform deploys models, scales them and routes requests to them (Chapter 8). Above the platform sits the front door: DNS, load balancers, an API gateway that authenticates and rate-limits (Chapter 11), and a global traffic manager that decides which region answers (Chapter 12). Observability, security and billing cut across all of these layers. A request from a user's phone traverses every one of them before the first token appears, and every layer adds latency, cost and failure modes. That raises the question of which of these resources are actually scarce, because those are the ones that shape the design.</p>
+
+<h2 id="s1-3">1.3 Three scarce resources: power, accelerators and people</h2>
+<p>Most infrastructure resources can be bought at a predictable price with a short lead time: servers without GPUs, storage, ordinary networking, software licences. Three resources could not, for most of 2023–2026, and they set the pace of every AI build-out.</p>
+<p>The first is <strong>power</strong>. A datacenter is ultimately a device for converting electricity into computation and heat, and its capacity is quoted in megawatts of IT load rather than square metres. In the United States, datacenters consumed about 76 TWh of electricity in 2018, 1.9% of national consumption, and about 176 TWh in 2023, 4.4%; a report for the US Department of Energy by Lawrence Berkeley National Laboratory projected 325 to 580 TWh by 2028, between 6.7% and 12% of national demand, with accelerated servers for AI the main cause of the growth<span class="cite"><a href="#r-lbnl">[2]</a></span>. Figure 1.2 plots these numbers. Adding hundreds of megawatts to a grid requires new generation, new transmission lines and new substations, which take years to permit and build. In several markets in 2024–2025, the wait to connect a large new load to the grid exceeded three years, so the scarce input to a new AI campus was not the building or the GPUs but the interconnection agreement with a utility. Chapter 2 develops the power model.</p>
+
+<figure class="chart" id="fig-1-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"US datacenter electricity consumption (LBNL, 2024), with the 2028 projection range","height":320,
+ "x":{"label":"Year","min":2013,"max":2029,"fmt":"year","ticks":[2014,2016,2018,2020,2022,2024,2026,2028]},
+ "y":{"label":"Electricity (TWh per year)","min":0,"max":620,"ticks":[0,100,200,300,400,500,600]},
+ "series":[
+  {"name":"Estimated consumption","color":"s1","points":[[2014,60],[2016,60],[2018,76],[2023,176]]},
+  {"name":"2028 projection, low","color":"s3","dash":true,"points":[[2023,176],[2028,325]]},
+  {"name":"2028 projection, high","color":"s2","dash":true,"points":[[2023,176],[2028,580]]}
+ ],
+ "notes":[{"x":2023,"y":205,"text":"4.4% of US electricity","anchor":"end"},{"x":2028,"y":600,"text":"12%","anchor":"end"},{"x":2027.7,"y":345,"text":"6.7%","anchor":"end"}]}
+</script>
+<figcaption><b>Figure 1.2 — Datacenter electricity in the United States.</b> Consumption was nearly flat from 2014 to 2018 because efficiency gains (better PUE, virtualisation, hyperscale consolidation) offset growth, then rose steeply as GPU servers were deployed. The 2028 projections span a factor of almost two because they depend on how many accelerators are shipped and how heavily they are used. The report puts 2014–2016 at about 60 TWh; 2018, 2023 and the 2028 range are as published; the line between published points is drawn straight and does not represent annual data<span class="cite"><a href="#r-lbnl">[2]</a></span>.</figcaption>
+</figure>
+
+<p>Figure 1.2 is worth reading closely, because it shows a regime change. From 2014 to 2018, US datacenter energy barely grew even though the amount of computing it delivered grew many times over: efficiency improvements in cooling and power distribution and the migration from small on-premise server rooms to efficient hyperscale facilities absorbed the growth. After 2020 the curve bends upward, and the cause is visible in its slope: an H100 server draws about 10 kW, against about 0.5–1 kW for a conventional two-socket server, and these servers are run near full utilisation for years. The width of the 2028 band reflects genuine uncertainty about demand for AI and the efficiency of future accelerators. For an infrastructure engineer the lesson is that electricity is no longer a line item that can be ignored; it is a capacity constraint, and a design that uses 20% less power per token can mean 20% more capacity in a power-limited building.</p>
+<p>The second scarce resource is <strong>accelerators</strong>. NVIDIA's data-center GPUs were supply-constrained from early 2023, when ChatGPT's success triggered orders far beyond production capacity, through at least 2025. The bottleneck was not the GPU dies themselves but advanced packaging (TSMC's CoWoS process, which places the compute die and HBM stacks on a silicon interposer) and HBM supply, both of which take years to expand. Lead times for H100 servers in mid-2023 were reported at six to twelve months. Scarcity shaped the market: cloud providers rationed GPU instances, sold them as reserved capacity measured in years rather than hours, and introduced short-term "capacity blocks" that could be booked in advance (Chapter 9). New providers, the so-called neoclouds, appeared to arbitrage the gap. Even when supply loosens for one generation, the newest generation is scarce again, so a serving design must always ask what hardware will actually be obtainable, not only what hardware is best.</p>
+<p>The third scarce resource is <strong>people</strong>, and in particular engineers who understand both the model and the machine. Operating a GPU fleet requires knowledge that rarely sits in one person: kernel and engine performance, distributed systems, networking, cluster scheduling, reliability engineering, security, and the economics of capacity. This is the reason infrastructure interviews range so widely, and the reason this volume exists. A team that can raise per-GPU throughput by 30% or cut cold-start time from ten minutes to one has created capacity worth millions of dollars a year, which is why such people are hired at the salaries of senior software engineers at the most selective companies.</p>
+<p>These three scarcities interact. A power-limited site wants the most tokens per joule, which favours the newest, most efficient accelerators—which are the scarcest. An accelerator-limited fleet wants the highest utilisation, which demands sophisticated scheduling and routing—which requires scarce people. And because all three are scarce, the organisations that can assemble them have become a distinct industry, which is the subject of the next section.</p>
+
+<h2 id="s1-4">1.4 Who builds the AI cloud</h2>
+<p>The infrastructure of Figure 1.1 is built and operated by four kinds of organisation, and an engineer interviewing at any of them should know how the others work, because they buy from, sell to and compete with each other. Their roles are easiest to understand historically, as a sequence of responses to bottlenecks.</p>
+<p>The <strong>hyperscalers</strong>—Amazon Web Services, Microsoft Azure, Google Cloud and, at a smaller scale, Oracle Cloud Infrastructure—invented the public cloud. AWS launched its Elastic Compute Cloud (EC2) in 2006, renting virtual machines by the hour so that a company no longer had to buy servers months before it needed them. The first GPU instances followed in 2010 (with NVIDIA Tesla M2050 cards), aimed at scientific computing. For a decade GPUs were a niche product line; the growth of deep learning made them a significant one, through the V100 instances of 2017 and the A100 instances of 2020. Google took a different path, designing its own accelerator, the Tensor Processing Unit, first deployed internally in 2015 and offered to cloud customers from 2018 (Vol. I §5.8). Amazon followed with its own inference and training chips, Inferentia (2019) and Trainium (2021). The hyperscalers' advantage is breadth: they offer storage, databases, identity, networking and compliance in hundreds of datacenters worldwide, and a customer can put a model next to its data.</p>
+<p>The demand shock of 2023 revealed the hyperscalers' disadvantage: they are large, cautious organisations whose datacenters were designed for 10 kW racks and whose GPU allocation went first to their largest customers and their own products. Into that gap came the <strong>neoclouds</strong>, providers that specialise in GPU capacity. CoreWeave, which began around 2017 mining cryptocurrency on GPUs, pivoted to renting them and grew into one of the largest GPU operators in the world, going public in 2025; Lambda, Crusoe, Nebius, Together AI and many others followed. Neoclouds sell bare-metal or lightly virtualised GPU servers, often with Kubernetes or Slurm on top, at prices well below the hyperscalers' on-demand rates, and they compete on speed of deployment, network quality and price rather than breadth of services. A related group, the <strong>inference platforms</strong> (Fireworks, Together, Baseten, Groq, Cerebras and others), sells not machines but tokens: an API endpoint for an open-weight model, priced per million tokens.</p>
+<p>The <strong>model labs</strong>—OpenAI, Anthropic, Google DeepMind, Meta, xAI, Mistral, DeepSeek and others—consume infrastructure at a scale that has turned some of them into builders. OpenAI's models were trained and served on Microsoft Azure, which in 2020 built a dedicated supercomputer for it with 10,000 V100 GPUs, and later on capacity from Oracle, CoreWeave and Google as well; in January 2025 OpenAI and partners announced the Stargate project, with a first campus in Abilene, Texas planned at more than a gigawatt. Anthropic trains and serves on AWS Trainium (including the "Project Rainier" cluster) and Google TPUs as well as NVIDIA GPUs. Meta operates its own datacenters and has described 24,576-GPU H100 clusters (2024) and gigawatt-scale campuses under construction. xAI built its Colossus cluster in Memphis with 100,000 H100s in a reported 122 days in 2024. For these organisations infrastructure is not a service they buy but a core competence and their largest expense.</p>
+<p>Finally, <strong>enterprises</strong> use models, either through token APIs, through managed model endpoints on a hyperscaler (Amazon Bedrock, Google Vertex AI, Azure AI Foundry), or by deploying open-weight models on rented GPUs. Their constraints are often not cost per token but data governance, residency and integration: a bank may require that prompts never leave a particular region, or that the model run inside its own virtual private cloud (Chapters 12 and 14).</p>
+<p>Which layers a customer operates depends on how it consumes the infrastructure, and Figure 1.3 makes this explicit as a <strong>shared-responsibility</strong> table. A customer renting bare-metal GPU servers is responsible for everything from the operating system upward; a customer of a managed Kubernetes service hands the cluster control plane to the provider; a customer of a managed model endpoint operates only its application and configuration; a customer of a token API operates only its prompts. Moving down the table trades control for convenience, and the cost per token typically rises because each layer of the provider's work carries a margin. The skills an infrastructure engineer needs, and the questions an interviewer asks, depend on where in this table the employer sits.</p>
+
+<figure class="diagram" id="fig-1-3">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Shared responsibility across consumption models">
+<text x="150" y="26" text-anchor="middle" class="t-sm t-b">Layer</text>
+<text x="330" y="26" text-anchor="middle" class="t-xs t-b">Bare-metal GPUs</text>
+<text x="450" y="26" text-anchor="middle" class="t-xs t-b">Managed Kubernetes</text>
+<text x="570" y="26" text-anchor="middle" class="t-xs t-b">Managed endpoint</text>
+<text x="675" y="26" text-anchor="middle" class="t-xs t-b">Token API</text>
+<g class="t-xs">
+<text x="20" y="58">Prompts, application, evaluation</text>
+<text x="20" y="92">Model choice, weights, fine-tunes</text>
+<text x="20" y="126">Inference engine and its configuration</text>
+<text x="20" y="160">Serving platform, autoscaling, routing</text>
+<text x="20" y="194">Cluster manager (Kubernetes, Slurm)</text>
+<text x="20" y="228">OS, drivers, health checks</text>
+<text x="20" y="262">Hardware, network, power, building</text>
+</g>
+<g>
+<rect x="275" y="42" width="110" height="26" rx="4" class="bx2"/><rect x="395" y="42" width="110" height="26" rx="4" class="bx2"/><rect x="515" y="42" width="110" height="26" rx="4" class="bx2"/><rect x="635" y="42" width="80" height="26" rx="4" class="bx2"/>
+<rect x="275" y="76" width="110" height="26" rx="4" class="bx2"/><rect x="395" y="76" width="110" height="26" rx="4" class="bx2"/><rect x="515" y="76" width="110" height="26" rx="4" class="bx2"/><rect x="635" y="76" width="80" height="26" rx="4" class="bx3"/>
+<rect x="275" y="110" width="110" height="26" rx="4" class="bx2"/><rect x="395" y="110" width="110" height="26" rx="4" class="bx2"/><rect x="515" y="110" width="110" height="26" rx="4" class="bx3"/><rect x="635" y="110" width="80" height="26" rx="4" class="bx3"/>
+<rect x="275" y="144" width="110" height="26" rx="4" class="bx2"/><rect x="395" y="144" width="110" height="26" rx="4" class="bx2"/><rect x="515" y="144" width="110" height="26" rx="4" class="bx3"/><rect x="635" y="144" width="80" height="26" rx="4" class="bx3"/>
+<rect x="275" y="178" width="110" height="26" rx="4" class="bx2"/><rect x="395" y="178" width="110" height="26" rx="4" class="bx3"/><rect x="515" y="178" width="110" height="26" rx="4" class="bx3"/><rect x="635" y="178" width="80" height="26" rx="4" class="bx3"/>
+<rect x="275" y="212" width="110" height="26" rx="4" class="bx2"/><rect x="395" y="212" width="110" height="26" rx="4" class="bx3"/><rect x="515" y="212" width="110" height="26" rx="4" class="bx3"/><rect x="635" y="212" width="80" height="26" rx="4" class="bx3"/>
+<rect x="275" y="246" width="110" height="26" rx="4" class="bx3"/><rect x="395" y="246" width="110" height="26" rx="4" class="bx3"/><rect x="515" y="246" width="110" height="26" rx="4" class="bx3"/><rect x="635" y="246" width="80" height="26" rx="4" class="bx3"/>
+</g>
+<rect x="275" y="282" width="14" height="12" class="bx2"/><text x="295" y="292" class="t-xs">customer operates</text>
+<rect x="420" y="282" width="14" height="12" class="bx3"/><text x="440" y="292" class="t-xs">provider operates</text>
+</svg>
+<figcaption><b>Figure 1.3 — Who operates which layer.</b> Moving right hands more layers to the provider. The customer always owns the application; with a token API it owns nothing else. Bare-metal neocloud contracts often include provider-run health checks and hardware replacement, so the boundary at the OS layer is blurred in practice.</figcaption>
+</figure>
+
+<div class="box timeline">
+<div class="box-title">Timeline — GPUs in the cloud</div>
+<ul>
+<li><b>2006</b> AWS EC2 rents virtual machines by the hour.</li>
+<li><b>2010</b> First cloud GPU instances (NVIDIA Tesla M2050), for scientific computing.</li>
+<li><b>2015–2018</b> Google deploys TPU v1 internally (2015) and offers Cloud TPUs (2018).</li>
+<li><b>2017</b> V100 instances; deep-learning training moves to the cloud.</li>
+<li><b>2020</b> A100 instances; Microsoft builds a 10,000-GPU supercomputer for OpenAI.</li>
+<li><b>Nov 2022</b> ChatGPT launches; demand for inference capacity explodes.</li>
+<li><b>2023</b> H100 instances; GPU shortage; neoclouds grow; capacity sold in multi-year reservations.</li>
+<li><b>2024</b> 100,000-GPU clusters (xAI Colossus); Blackwell announced; inference begins to dominate fleet growth.</li>
+<li><b>2025</b> GB200 NVL72 racks deployed at scale; gigawatt campuses announced (Stargate); open-source LLM control planes (NVIDIA Dynamo, llm-d).</li>
+<li><b>2026</b> GB300 and the first Rubin systems; power, not chips, becomes the main constraint on new capacity.</li>
+</ul>
+</div>
+
+<p>The pattern across the timeline is that each bottleneck created a new kind of organisation. When owning servers was too slow, the public cloud appeared; when the public cloud could not supply GPUs fast enough, neoclouds appeared; when running models was too hard for most companies, token APIs appeared; and when grid capacity became the limit, model labs began contracting directly for power plants. With the players in view we can now build a concrete service and size it.</p>
+
+<h2 id="s1-5">1.5 Atlas: the running example</h2>
+<p>Volume I used three running models so that numbers accumulated from chapter to chapter. This volume adds a running <em>service</em>, which we call <strong>Atlas</strong>. Atlas is fictional, but every parameter is typical of a mid-sized commercial LLM API in 2025–2026, and we shall size it, power it, buy capacity for it, route its traffic across regions, secure it and keep it running in later chapters.</p>
+<p>Atlas sells three model tiers through one API. <em>Atlas-Small</em> is Llama 3 8B, served in FP8, for cheap and fast tasks. <em>Atlas</em> is Llama 3 70B in FP8, the default. <em>Atlas-Max</em> is DeepSeek-V3, a 671B-parameter mixture-of-experts model with 37B active parameters, used for hard tasks and reasoning. Traffic is described by a <strong>demand model</strong>: for each tier, the arrival rate of requests over the day and the distribution of input and output lengths. Table 1.1 gives Atlas's demand at its daily peak.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 1.1 — Atlas demand at the daily peak (13:00 UTC on a weekday)</caption>
+<thead><tr><th>Tier</th><th>Model</th><th class="num">Requests/s</th><th class="num">Input tokens</th><th class="num">Cached share</th><th class="num">Output tokens</th></tr></thead>
+<tbody>
+<tr><td>Atlas-Small</td><td>Llama 3 8B, FP8</td><td class="num">6,000</td><td class="num">2,000</td><td class="num">60%</td><td class="num">400</td></tr>
+<tr><td>Atlas</td><td>Llama 3 70B, FP8</td><td class="num">3,500</td><td class="num">2,000</td><td class="num">60%</td><td class="num">400</td></tr>
+<tr><td>Atlas-Max</td><td>DeepSeek-V3, FP8</td><td class="num">500</td><td class="num">2,000</td><td class="num">60%</td><td class="num">1,500</td></tr>
+<tr><td><b>Total</b></td><td></td><td class="num"><b>10,000</b></td><td></td><td></td><td></td></tr>
+</tbody></table></div>
+
+<p>Three features of Table 1.1 matter for everything that follows. The <em>input tokens dominate</em>: each request carries 2,000 tokens of system prompt, conversation history or retrieved documents, five times its output. Most of that input is the same from turn to turn, so a <strong>prefix-cache hit rate</strong> \(r_{\text{hit}}=0.6\) means that only 800 tokens per request must actually be prefilled (Vol. I §10.4). The <em>tiers are very different in cost per request</em>: an Atlas-Max request produces almost four times the output tokens of the others, on a model whose 671B parameters need dozens of GPUs per replica even though only 37B are active for each token. And <em>the peak is not the mean</em>: traffic follows the working day of Atlas's customers, with a ratio of peak to daily-mean arrival rate \(\lambda_{\text{pk}}/\bar\lambda\approx1.8\). Capacity must be provisioned for the peak, but revenue is earned on the mean.</p>
+<p>To turn demand into hardware we need, for each tier, a measured <strong>replica operating point</strong>: how many GPUs one replica uses (\(n_g\)), and how many prefill and decode tokens per second it sustains within the latency targets (Vol. I §27.7). For Atlas we take the following, all consistent with Volume I's measurements and models. Atlas-Small runs on one H100 per replica and sustains 9,000 decode tokens/s plus about 15,000 chunked-prefill tokens/s at a 25 ms TPOT target, as in Vol. I §27.9. Atlas runs on eight H100s with tensor parallelism of eight and sustains about 6,000 decode tokens/s plus about 25,000 prefill tokens/s at a 40 ms TPOT target. Atlas-Max runs disaggregated (Vol. I Chapter 13) in a large expert-parallel deployment of the kind DeepSeek has described (Vol. I §19.6), where decode GPUs sustain about 1,800 output tokens/s each and prefill GPUs about 4,000 uncached prompt tokens/s each.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — how many GPUs does Atlas need at peak?</div>
+<p><strong>Atlas-Small.</strong> Decode work is \(6000\times400=2.4\times10^{6}\) tokens/s, which needs \(2.4\times10^{6}/9000\approx267\) replicas. Uncached prefill is \(6000\times2000\times(1-0.6)=4.8\times10^{6}\) tokens/s, which needs \(4.8\times10^{6}/15{,}000=320\) replicas. Because each replica does both at once with chunked prefill, the binding resource is prefill: 320 single-GPU replicas at full use.</p>
+<p><strong>Atlas.</strong> Decode: \(3500\times400=1.4\times10^{6}\) tokens/s, needing \(1.4\times10^{6}/6000\approx233\) replicas. Prefill: \(3500\times800=2.8\times10^{6}\) tokens/s, needing \(2.8\times10^{6}/25{,}000=112\) replicas. Decode binds: 233 replicas of eight GPUs, 1,864 GPUs at full use.</p>
+<p><strong>Atlas-Max.</strong> Decode: \(500\times1500=7.5\times10^{5}\) tokens/s at 1,800 per GPU is 417 GPUs. Prefill: \(500\times800=4\times10^{5}\) tokens/s at 4,000 per GPU is 100 GPUs. The pools are separate, so they add: 517 GPUs.</p>
+<p><strong>Utilisation and spares.</strong> No fleet runs at 100% of its measured capacity, because queues explode as utilisation approaches one (Vol. I §11.8) and because demand fluctuates within the peak hour. With a target utilisation \(u=0.75\) at peak, the three tiers need \(320/0.75\approx427\), \(1864/0.75\approx2485\) and \(517/0.75\approx689\) GPUs, about 3,600 in total. Adding about 10% for failed or draining machines, cold-start headroom and canaries gives roughly <strong>4,000 H100s</strong>.</p>
+<p><strong>What dominates.</strong> The 70B tier is two-thirds of the fleet although it carries a third of the requests. The 8B tier, with the most requests, is the smallest. And within the 8B tier, prefill rather than decode binds: if the cache-hit rate fell from 60% to 30%, that tier would need 75% more GPUs.</p>
+</div>
+
+
+<details class="drill">
+<summary>Drill 1.1 — Reasoning traffic doubles</summary>
+<p>Atlas-Max launches a "deep think" mode, and its mean output length rises from 1,500 to 3,000 tokens while its request rate stays at 500 per second at peak. How many GPUs does the tier need at \(u=0.75\), and what happens to the whole fleet?</p>
+<p><em>Solution.</em> Decode work doubles to \(1.5\times10^{6}\) tokens/s, which at 1,800 tokens/s per GPU needs about 833 decode GPUs; prefill is unchanged at 100. The disaggregated pools add to 933 GPUs at full use, or about 1,244 at \(u=0.75\), up from 689. The fleet grows from about 3,600 to about 4,160 GPUs before spares, by 15%, although only 5% of requests changed. In practice the effect is larger, because longer outputs hold KV cache longer, which reduces the decode batch that fits in memory and so lowers the 1,800 tokens/s per GPU itself (Vol. I §26.6). Reasoning modes are a capacity event and must be priced and planned as one.</p>
+</details>
+
+<p>The worked example shows the general form of a capacity calculation. For each tier \(j\) with peak arrival rate \(\lambda_{\text{pk},j}\), input length \(n_{\text{in},j}\), output length \(n_{\text{out},j}\), and a replica of \(n_{g,j}\) GPUs sustaining \(\Phi_{P,j}\) prefill and \(\Phi_{D,j}\) decode tokens per second simultaneously, the GPU count at target utilisation \(u\) is</p>
+\[
+n_{\text{gpu}}=\frac{1+s_{\text{spare}}}{u}\sum_j n_{g,j}\,\max\!\left(\frac{\lambda_{\text{pk},j}\,n_{\text{in},j}\,(1-r_{\text{hit}})}{\Phi_{P,j}},\ \frac{\lambda_{\text{pk},j}\,n_{\text{out},j}}{\Phi_{D,j}}\right),
+\]
+<p>where \(s_{\text{spare}}\) is the spare fraction and the maximum becomes a sum for disaggregated tiers, whose prefill and decode pools are separate. Every term is a lever that a later chapter pulls. \(\Phi\) is the subject of all of Volume I. \(u\) is set by routing and autoscaling (Vol. I Chapter 27 and Chapter 9 of this volume). \(r_{\text{hit}}\) depends on routing requests to where their prefixes are cached, across replicas and across regions (Chapter 12). \(\lambda_{\text{pk}}\) can be flattened by moving deferrable work to batch tiers (Chapter 19). And \(s_{\text{spare}}\) depends on how often hardware fails and how fast it is replaced (Chapter 13). The fleet size is a product of engineering decisions, and the next section turns it into the physical quantities that bound it.</p>
+
+<h2 id="s1-6">1.6 Orders of magnitude: from tokens to megawatts to dollars</h2>
+<p>An infrastructure engineer must be able to move fluently between four units: tokens per second, accelerators, megawatts and dollars per year. Interviewers test this explicitly ("you have a 20 MW building; how many tokens per day can it serve?"), and real planning decisions turn on it. The conversions are simple, but each hides an assumption that is easy to get wrong.</p>
+<p><strong>From accelerators to power.</strong> The power that matters for a building is not the GPU's thermal design power alone but the <em>all-in IT power per GPU</em>, \(P_{\text{gpu}}\), which includes the GPU's share of its server (CPUs, memory, NICs, fans, power-supply losses) and of the network switches, storage and management servers around it. An eight-GPU H100 server is specified at about 10.2 kW, or 1.275 kW per GPU, and network and storage add perhaps 10%, so \(P_{\text{gpu}}\approx1.4\) kW for an H100 fleet; for B200 servers at about 14.3 kW, \(P_{\text{gpu}}\approx2\) kW; for GB200 NVL72 at about 132 kW per 72 GPUs plus networking, roughly 2 kW as well. The building must also power cooling, lighting and electrical losses. The ratio of total facility power to IT power is the <strong>power usage effectiveness</strong>, \(\text{PUE}=P_{\text{fac}}/P_{\text{IT}}\), which ranges from about 1.1 in the best hyperscale facilities to 1.5 or more in older ones (Chapter 2). So</p>
+\[
+P_{\text{IT}}=n_{\text{gpu}}\,P_{\text{gpu}},\qquad P_{\text{fac}}=\text{PUE}\cdot P_{\text{IT}}.
+\]
+<p>For Atlas, \(P_{\text{IT}}=4000\times1.4\ \text{kW}=5.6\) MW, and at PUE 1.3, \(P_{\text{fac}}\approx7.3\) MW. That is a single mid-sized data hall: Atlas fits in one building, but not in a server room.</p>
+<p><strong>From power to energy and its cost.</strong> Capacity is provisioned for peak power, but energy is consumed at average power. GPUs serving inference rarely draw their full rated power all day: at the daily trough the fleet may be scaled down or lightly loaded, and memory-bound decode draws less than compute-bound prefill. If the average draw is 70% of nameplate, Atlas consumes \(5.6\times0.7\times8760\approx34{,}000\) MWh of IT energy a year, or about 45,000 MWh including PUE. At an industrial electricity price of $0.08 per kWh that is about $3.6 million a year. Electricity is real money, but it is small next to the hardware.</p>
+<p><strong>From accelerators to dollars.</strong> The dominant cost is the accelerators, whether rented or owned. Renting H100s on multi-year contracts cost roughly $2–3 per GPU-hour in 2025, against on-demand hyperscaler list prices that were several times higher before cuts in mid-2025; owning costs roughly $250,000–$300,000 per eight-GPU server plus networking, amortised over four to five years, plus power, space and operations (Chapter 10). At $2.50 per GPU-hour, Atlas's 4,000 GPUs cost \(4000\times2.5\times8760\approx\$88\) million a year. Electricity is about 4% of that.</p>
+<p><strong>From dollars back to tokens.</strong> The figure customers care about is the cost per million tokens. In a day, Atlas serves on average \(\bar\lambda=10{,}000/1.8\approx5{,}600\) requests per second, producing a weighted mean of \(0.6\times400+0.35\times400+0.05\times1500\approx455\) output tokens each, or about \(2.2\times10^{11}\) output tokens per day alongside about \(9.6\times10^{11}\) input tokens. Dividing $88 million by \(365\times2.2\times10^{11}\) gives about <strong>$1.10 per million output tokens</strong> as Atlas's blended hardware cost, with input processing included in it. Atlas's list prices must cover this, plus electricity, staff, networking, margin, and the capacity it holds idle at night.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — what does a 20 MW building serve?</div>
+<p><strong>Question.</strong> An operator offers Atlas a new building with 20 MW of facility power at PUE 1.25. If Atlas fills it with H100s running Llama 3 70B at Atlas's operating point, how many output tokens per day can it serve, and what if it used B200s?</p>
+<p><strong>H100.</strong> IT power is \(20/1.25=16\) MW. At 1.4 kW per GPU that is about 11,400 GPUs, or 1,430 eight-GPU replicas. At 6,000 output tokens/s per replica and a time-averaged utilisation of 55% (peak 75%, troughs lower), the building produces \(1430\times6000\times0.55\approx4.7\times10^{6}\) tokens/s, or \(4.1\times10^{11}\) output tokens per day.</p>
+<p><strong>B200.</strong> At 2 kW per GPU, 16 MW holds 8,000 GPUs, or 1,000 replicas of eight. A B200 has 2.4 times the HBM bandwidth of an H100 (8 versus 3.35 TB/s) and supports FP4, so for bandwidth-bound decode a replica produces roughly two to three times the tokens per second at the same latency; take 2.5 times, 15,000 tokens/s. The building then produces about \(1000\times15{,}000\times0.55\) tokens/s, or \(7.1\times10^{11}\) tokens per day, 75% more from the same power.</p>
+<p><strong>Lesson.</strong> In a power-limited building, the right figure of merit is tokens per joule, not tokens per GPU or per dollar of GPU. The newer accelerator draws more per device but delivers more per watt, and when power is the binding constraint it wins even if its price per GPU-hour is higher. Chapter 2 makes the energy-per-token calculation precise.</p>
+</div>
+
+
+<details class="drill">
+<summary>Drill 1.2 — Megawatts for a quadrillion tokens</summary>
+<p>Suppose a provider serves \(10^{15}\) tokens per month and, from the estimate in interview question I1.12, needs about 200,000 H100-equivalent GPUs. What facility power does it need at PUE 1.2, and how much electricity does it consume in a year at 70% average draw?</p>
+<p><em>Solution.</em> IT power is \(2\times10^{5}\times1.4\) kW \(=280\) MW, and facility power is \(1.2\times280\approx336\) MW, the size of a large campus or several ordinary ones. Energy is \(280\times0.7\times8760\times1.2\approx2.1\times10^{6}\) MWh, or about 2 TWh per year, roughly 1% of all US datacenter consumption in 2023 for one provider's inference. Moving the same fleet to accelerators with twice the tokens per joule would free about 170 MW, which in a power-constrained market is worth far more than the electricity bill it saves.</p>
+</details>
+
+<p>These conversions also expose where uncertainty lives. A factor of two in \(\Phi\) (a better engine, quantisation, speculative decoding) halves the fleet; a factor of two in the peak-to-mean ratio doubles it; a fall in cache-hit rate can raise it by half; and the difference between renting on demand and owning is a factor of three in cost. Figure 1.4 shows the most important of these sensitivities, the cost per million output tokens of an Atlas replica as a function of utilisation and of the price paid per GPU-hour.</p>
+
+<figure class="chart" id="fig-1-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Cost per million output tokens of a Llama 3 70B replica (8 × H100, 6,000 tokens/s) against utilisation","height":330,
+ "x":{"label":"Time-averaged utilisation u","min":0.15,"max":1,"fmt":"pct","ticks":[0.2,0.4,0.6,0.8,1]},
+ "y":{"label":"Dollars per million output tokens (log)","log":true,"min":0.4,"max":20,"ticks":[0.5,1,2,5,10,20]},
+ "series":[
+  {"name":"On-demand, $6.90/GPU-h","color":"s2","points":[[0.2,12.8],[0.3,8.52],[0.4,6.39],[0.5,5.11],[0.6,4.26],[0.7,3.65],[0.8,3.19],[0.9,2.84],[1,2.56]]},
+  {"name":"Reserved, $2.50/GPU-h","color":"s1","points":[[0.2,4.63],[0.3,3.09],[0.4,2.31],[0.5,1.85],[0.6,1.54],[0.7,1.32],[0.8,1.16],[0.9,1.03],[1,0.93]]},
+  {"name":"Owned, ≈ $1.60/GPU-h all-in","color":"s3","points":[[0.2,2.96],[0.3,1.98],[0.4,1.48],[0.5,1.19],[0.6,0.99],[0.7,0.85],[0.8,0.74],[0.9,0.66],[1,0.59]]}
+ ]}
+</script>
+<figcaption><b>Figure 1.4 — Price and utilisation dominate the cost of a token.</b> Cost per million output tokens is \(n_gc_{\text{gpu}}\times10^6/(3600\,\Phi\,u)\) (Vol. I §27.7) with \(n_g=8\) and \(\Phi=6000\). Each curve is \(\propto1/u\); moving between purchasing arrangements shifts it by a constant factor. Prices are representative of 2025 and change quickly.</figcaption>
+</figure>
+
+<p>Figure 1.4 makes two points visible. Along each curve, cost is inversely proportional to utilisation, so a replica that is busy 30% of the time costs more than three times as much per token as one busy 100% of the time; a fleet sized for peak and left running at night lives on the left of the chart. Between the curves, the purchasing arrangement moves cost by a constant factor: the same replica at the same utilisation costs four times as much on on-demand capacity as on owned hardware. These two axes—how well we use capacity and how cheaply we obtain it—are the subjects of Part III. Both are managed by software that runs alongside, but separately from, the software that serves requests, and that separation is our next topic.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — why the peak sets the fleet</div>
+<p>Let demand be a periodic function \(\lambda(\tau)\) of time of day \(\tau\), with mean \(\bar\lambda\) and maximum \(\lambda_{\text{pk}}\). A fixed fleet of capacity \(C\) must satisfy \(C\ge\lambda_{\text{pk}}/u\), so its time-averaged utilisation is at most \(\bar\lambda/C\le u\,\bar\lambda/\lambda_{\text{pk}}\). With \(u=0.75\) and a peak-to-mean ratio of 1.8, a fixed fleet averages at most about 42% utilisation, which is why the green and blue curves in Figure 1.4 are read near \(u\approx0.4\)–0.55 for real fleets. An elastic fleet whose capacity tracks \(\lambda(\tau)/u\) can average close to \(u\), but only if capacity can be released and reacquired at low cost, which is precisely what scarce, reserved GPUs do not allow. Filling the troughs with deferrable work (batch inference, evaluation, reinforcement-learning rollouts) is the other way to raise average utilisation, and Chapter 19 treats it.</p>
+</div>
+
+<h2 id="s1-7">1.7 Control plane and data plane</h2>
+<p>Every large infrastructure system contains two kinds of software that are engineered in very different ways, and confusing them is one of the most common errors in system-design interviews. The <strong>data plane</strong> is the software on the path of each request: the load balancer that accepts the connection, the gateway that authenticates it, the router that picks a replica, the inference engine that computes the tokens, and the streaming connection that returns them. The <strong>control plane</strong> is the software that configures the data plane: the deployment system that rolls out a new model version, the autoscaler that adds replicas, the scheduler that decides which server runs which container, the capacity planner, the configuration store and the billing pipeline. Figure 1.5 separates the two for Atlas.</p>
+
+<figure class="diagram" id="fig-1-5">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Control plane and data plane of a serving system">
+<defs><marker id="a15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="15" width="690" height="110" rx="10" class="bx4"/>
+<text x="30" y="36" class="t-sm t-b">Control plane: decides (seconds to days; must be correct, may be slow)</text>
+<rect x="30" y="50" width="120" height="58" rx="6" class="bx"/><text x="90" y="74" text-anchor="middle" class="t-xs">deployment and</text><text x="90" y="88" text-anchor="middle" class="t-xs">model registry</text>
+<rect x="165" y="50" width="120" height="58" rx="6" class="bx"/><text x="225" y="74" text-anchor="middle" class="t-xs">autoscaler and</text><text x="225" y="88" text-anchor="middle" class="t-xs">capacity planner</text>
+<rect x="300" y="50" width="120" height="58" rx="6" class="bx"/><text x="360" y="74" text-anchor="middle" class="t-xs">cluster scheduler</text><text x="360" y="88" text-anchor="middle" class="t-xs">(Kubernetes)</text>
+<rect x="435" y="50" width="120" height="58" rx="6" class="bx"/><text x="495" y="74" text-anchor="middle" class="t-xs">config, quotas,</text><text x="495" y="88" text-anchor="middle" class="t-xs">routing policy</text>
+<rect x="570" y="50" width="120" height="58" rx="6" class="bx"/><text x="630" y="74" text-anchor="middle" class="t-xs">billing, usage,</text><text x="630" y="88" text-anchor="middle" class="t-xs">observability</text>
+<rect x="15" y="170" width="690" height="115" rx="10" class="bx3"/>
+<text x="30" y="191" class="t-sm t-b">Data plane: does (milliseconds; on every request; must stay up)</text>
+<rect x="30" y="208" width="95" height="58" rx="6" class="bx2"/><text x="77" y="234" text-anchor="middle" class="t-xs">DNS, global</text><text x="77" y="248" text-anchor="middle" class="t-xs">load balancer</text>
+<rect x="145" y="208" width="95" height="58" rx="6" class="bx2"/><text x="192" y="234" text-anchor="middle" class="t-xs">API gateway</text><text x="192" y="248" text-anchor="middle" class="t-xs">auth, limits</text>
+<rect x="260" y="208" width="95" height="58" rx="6" class="bx2"/><text x="307" y="234" text-anchor="middle" class="t-xs">router</text><text x="307" y="248" text-anchor="middle" class="t-xs">cache-aware</text>
+<rect x="375" y="208" width="140" height="58" rx="6" class="bx2"/><text x="445" y="234" text-anchor="middle" class="t-xs">inference engines</text><text x="445" y="248" text-anchor="middle" class="t-xs">on GPU servers</text>
+<rect x="535" y="208" width="155" height="58" rx="6" class="bx2"/><text x="612" y="234" text-anchor="middle" class="t-xs">token stream back</text><text x="612" y="248" text-anchor="middle" class="t-xs">to the client</text>
+<line x1="125" y1="237" x2="143" y2="237" class="ln" marker-end="url(#a15)"/>
+<line x1="240" y1="237" x2="258" y2="237" class="ln" marker-end="url(#a15)"/>
+<line x1="355" y1="237" x2="373" y2="237" class="ln" marker-end="url(#a15)"/>
+<line x1="515" y1="237" x2="533" y2="237" class="ln" marker-end="url(#a15)"/>
+<line x1="225" y1="108" x2="445" y2="206" class="ln ln-acc" marker-end="url(#a15)"/>
+<line x1="495" y1="108" x2="307" y2="206" class="ln ln-acc" marker-end="url(#a15)"/>
+<line x1="445" y1="206" x2="630" y2="110" class="ln ln-s3" marker-end="url(#a15)"/>
+<text x="360" y="150" text-anchor="middle" class="t-xs t-acc">configuration flows down</text>
+<text x="600" y="150" text-anchor="middle" class="t-xs t-s3">telemetry flows up</text>
+</svg>
+<figcaption><b>Figure 1.5 — Control plane and data plane.</b> The control plane writes configuration (how many replicas, which model version, which routing weights) that the data plane reads; the data plane emits telemetry (load, latency, errors, usage) that the control plane reads. A request touches only the data plane.</figcaption>
+</figure>
+
+<p>The two planes differ in four ways. <em>Timescale</em>: the data plane acts in milliseconds on every request, while control-plane decisions take seconds (an autoscaling step), minutes (a rollout) or months (a capacity purchase). <em>Volume</em>: the data plane handles every one of Atlas's 10,000 requests per second; the control plane handles perhaps a few hundred decisions per minute. <em>Correctness versus availability</em>: a control-plane decision should be right even if it is slow—scaling the wrong model down or rolling out a broken version causes an outage—while the data plane must keep answering even if it is not perfectly up to date. And <em>failure behaviour</em>: when the control plane fails, the data plane should keep serving with its last known configuration. This last property is called <strong>static stability</strong>, a term from Amazon's engineering literature<span class="cite"><a href="#r-static">[10]</a></span>: a statically stable system does not need to make changes, or call any control-plane service, in order to keep working through a failure.</p>
+<p>Static stability has concrete consequences for LLM serving. If the autoscaler is down, replicas must keep running at their current count rather than being torn down. If the model registry is unreachable, a replica that crashes and restarts must be able to find its weights in a local or regional cache rather than failing (Chapter 5). If the configuration service that holds rate limits is unreachable, the gateway must keep enforcing the last limits it knew rather than rejecting all traffic or admitting all of it. And capacity reserved for failover must be already running, not merely "available to launch", because launching it depends on the control plane at exactly the moment the control plane may be overloaded. Each of these is a design decision that seems wasteful in normal operation and proves essential in an incident.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — reconciliation as a fixed-point iteration</div>
+<p>Modern control planes, Kubernetes above all, are built from <em>controllers</em> that each run a loop: observe the actual state \(x\), compare it with a declared desired state \(x^*\), and take an action that moves \(x\) towards \(x^*\). Abstractly, a controller is a map \(F\) with \(F(x^*)=x^*\), and the system evolves as \(x_{k+1}=F(x_k)\) plus disturbances (a node fails, a pod crashes). The design goal is that \(x^*\) be an attracting fixed point: from any perturbed state the iteration returns to it, without the controller needing to know <em>what</em> happened, only <em>where</em> the system is now. This is more robust than an imperative script ("start three replicas") because the script's correctness depends on the starting state, while the loop's does not. The price is that convergence takes several iterations and that two controllers acting on the same state can oscillate, as an autoscaler and a load balancer sometimes do—a feedback-control problem that Chapter 9 analyses.</p>
+</div>
+
+<p>The control–data split organises the rest of this volume. Part I is about the physical substrate both planes run on. Part II is mostly about the control plane: how containers are placed, how platforms deploy models. Part III is about the control-plane decisions with the largest economic effect, capacity and cost. Part IV is mostly about the data plane: the request path, its geography, its reliability and its security. Part V examines new workloads that stress both. Before drawing that map, we should state precisely what Volume I did not cover, because this volume's coverage was chosen to fill those gaps.</p>
+
+<h2 id="s1-8">1.8 What Volume I left open</h2>
+<p>Volume I was written around a single question: what does it cost to compute tokens, and how can that cost be reduced? It answered it inside the engine and, in its last chapters, across a fleet of engines. It deliberately treated several things as given, and several workloads as out of scope. Listing them is the best way to see what an infrastructure role adds to an inference-engineering role.</p>
+<p>The first group of gaps is <em>physical</em>. Volume I quoted GPU power only in passing and never asked where the power came from, how the heat was removed, or why a building designed in 2020 cannot host a Blackwell rack. It described NVLink and InfiniBand as links with a bandwidth and a latency (Vol. I Chapter 17) but not how thousands of links are wired into a fabric, what that fabric costs, or why two flows can collide on one cable and halve each other's throughput. It assumed weights were somehow present in GPU memory, when in practice moving 140 GB of weights from storage into a new replica is often the slowest step of scaling up. Chapters 2 to 5 fill these gaps.</p>
+<p>The second group is <em>operational</em>. Volume I mentioned Kubernetes, autoscaling and cold starts (Vol. I §27.3) but did not explain what a container is, how a cluster scheduler places a job that needs eight GPUs on one NVLink domain, how scarce GPUs are shared fairly between teams, or how a model platform rolls out a new version safely. It derived cost per token from a price per GPU-hour without asking where that price comes from or how to buy capacity well. It treated a fleet as living in one place, without multiple regions, data-residency laws, failover or disaster recovery. It treated hardware as reliable, when at the scale of thousands of GPUs a failure is a daily event. And it said almost nothing about security: who can see a prompt, whether one tenant can learn another's prompts through a shared cache, how stolen weights can be prevented. Chapters 6 to 14 fill these.</p>
+<p>The third group is <em>workloads</em>. Volume I was about text-in, text-out language models answering one request at a time. Production serving now includes models that read images, audio and video, whose encoders and token counts change the cost model (Chapter 15); retrieval systems with embedding models and vector indexes that sit in front of most enterprise LLM applications (Chapter 16); agents that call tools, execute code in sandboxes and hold a session open across dozens of model calls (Chapter 17); guardrail models that screen every input and output (Chapter 18); and offline workloads—batch APIs, synthetic data, evaluation, and the rollouts of reinforcement learning (Vol. I Chapter 25)—that need throughput rather than latency (Chapter 19). Each changes what the infrastructure must provide.</p>
+<p>Table 1.2 lists the gaps and where they are closed. A reader preparing for an inference-engineer interview should know Volume I deeply and this volume broadly; a reader preparing for an ML-infrastructure, ML-platform or cloud-capacity interview should invert that emphasis.</p>
+
+<div class="table-wrap"><table>
+<caption>Table 1.2 — Topics beyond a single engine, and where this volume covers them</caption>
+<thead><tr><th>Topic</th><th>Volume I treatment</th><th>Volume II</th></tr></thead>
+<tbody>
+<tr><td>Power, cooling, rack density, energy per token</td><td>GPU TDP only</td><td>Chapter 2</td></tr>
+<tr><td>Instances, GPU sharing (MIG, MPS), cloud accelerators</td><td>Hardware specs</td><td>Chapter 3</td></tr>
+<tr><td>Fabric topology, congestion, front-end vs back-end networks</td><td>Collectives and link models</td><td>Chapter 4</td></tr>
+<tr><td>Weight formats, storage, cold starts</td><td>Cold start as a number</td><td>Chapter 5</td></tr>
+<tr><td>Containers, Kubernetes, cluster scheduling, serving platforms</td><td>Mentioned</td><td>Chapters 6–8</td></tr>
+<tr><td>Procurement, TCO, pricing, FinOps</td><td>Price per GPU-hour as input</td><td>Chapters 9–10</td></tr>
+<tr><td>Gateways, streaming protocols, distributed rate limits</td><td>SSE and token buckets</td><td>Chapter 11</td></tr>
+<tr><td>Multi-region serving, residency, disaster recovery</td><td>Not covered</td><td>Chapter 12</td></tr>
+<tr><td>SLOs, failure rates, safe rollouts, incidents</td><td>Reliability section</td><td>Chapter 13</td></tr>
+<tr><td>Security and isolation</td><td>Not covered</td><td>Chapter 14</td></tr>
+<tr><td>Multimodal, retrieval, agents, guardrails, batch and rollouts</td><td>Text-only; RL algorithms</td><td>Chapters 15–19</td></tr>
+</tbody></table></div>
+
+<h2 id="s1-9">1.9 A map of this volume</h2>
+<p>Figure 1.6 lays out the volume as a path from the building outward to the user and then across workloads. Each part answers the open question left by the previous one, in the same way that Volume I's parts did.</p>
+
+<figure class="diagram" id="fig-1-6">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Map of Volume II">
+<defs><marker id="a16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="20" width="215" height="105" rx="10" class="bx"/>
+<text x="122" y="42" text-anchor="middle" class="t-sm t-b">I · The physical cloud</text>
+<text x="122" y="62" text-anchor="middle" class="t-xs">2 power and cooling</text>
+<text x="122" y="77" text-anchor="middle" class="t-xs">3 instances and accelerators</text>
+<text x="122" y="92" text-anchor="middle" class="t-xs">4 networks</text>
+<text x="122" y="107" text-anchor="middle" class="t-xs">5 storage and cold starts</text>
+<rect x="252" y="20" width="215" height="105" rx="10" class="bx4"/>
+<text x="360" y="42" text-anchor="middle" class="t-sm t-b">II · Orchestration</text>
+<text x="360" y="66" text-anchor="middle" class="t-xs">6 containers and Kubernetes</text>
+<text x="360" y="82" text-anchor="middle" class="t-xs">7 cluster scheduling</text>
+<text x="360" y="98" text-anchor="middle" class="t-xs">8 serving platforms</text>
+<rect x="489" y="20" width="215" height="105" rx="10" class="bx2"/>
+<text x="597" y="42" text-anchor="middle" class="t-sm t-b">III · Elasticity, economics</text>
+<text x="597" y="70" text-anchor="middle" class="t-xs">9 capacity and autoscaling</text>
+<text x="597" y="88" text-anchor="middle" class="t-xs">10 the economics of inference</text>
+<rect x="15" y="150" width="215" height="105" rx="10" class="bx3"/>
+<text x="122" y="172" text-anchor="middle" class="t-sm t-b">IV · The request path</text>
+<text x="122" y="192" text-anchor="middle" class="t-xs">11 gateways and streaming</text>
+<text x="122" y="207" text-anchor="middle" class="t-xs">12 multi-region and DR</text>
+<text x="122" y="222" text-anchor="middle" class="t-xs">13 reliability</text>
+<text x="122" y="237" text-anchor="middle" class="t-xs">14 security and isolation</text>
+<rect x="252" y="150" width="215" height="105" rx="10" class="bx5"/>
+<text x="360" y="172" text-anchor="middle" class="t-sm t-b">V · Beyond chat</text>
+<text x="360" y="190" text-anchor="middle" class="t-xs">15 multimodal  ·  16 retrieval</text>
+<text x="360" y="206" text-anchor="middle" class="t-xs">17 agents and sandboxes</text>
+<text x="360" y="222" text-anchor="middle" class="t-xs">18 guardrails</text>
+<text x="360" y="238" text-anchor="middle" class="t-xs">19 batch and rollouts</text>
+<rect x="489" y="150" width="215" height="105" rx="10" class="bx"/>
+<text x="597" y="172" text-anchor="middle" class="t-sm t-b">VI · The interview</text>
+<text x="597" y="200" text-anchor="middle" class="t-xs">20 design case studies,</text>
+<text x="597" y="216" text-anchor="middle" class="t-xs">estimation and rubrics</text>
+<line x1="230" y1="72" x2="250" y2="72" class="ln" marker-end="url(#a16)"/>
+<line x1="467" y1="72" x2="487" y2="72" class="ln" marker-end="url(#a16)"/>
+<path d="M597,125 C597,140 122,135 122,148" class="ln" fill="none" marker-end="url(#a16)"/>
+<line x1="230" y1="202" x2="250" y2="202" class="ln" marker-end="url(#a16)"/>
+<line x1="467" y1="202" x2="487" y2="202" class="ln" marker-end="url(#a16)"/>
+</svg>
+<figcaption><b>Figure 1.6 — The structure of Volume II.</b> Parts I–III build and pay for the fleet; Part IV carries requests to it from around the world and keeps it safe; Part V adds workloads beyond chat; Part VI rehearses the interview.</figcaption>
+</figure>
+
+<p>Reading Figure 1.6 row by row gives the story. Part I asks what physical resources a fleet needs and what limits them: power and cooling (Chapter 2), accelerators as products one can rent (Chapter 3), the network that joins them (Chapter 4), and the storage from which weights reach them (Chapter 5). Its open question is how software is placed onto that hardware, which Part II answers with containers and Kubernetes (Chapter 6), cluster scheduling (Chapter 7) and serving platforms (Chapter 8). Part II's open question is how much capacity to hold and what it costs, which Part III answers (Chapters 9 and 10). Part IV then follows the request from the user's device through the gateway (Chapter 11) to a region (Chapter 12), and asks how the service stays available (Chapter 13) and secure (Chapter 14). Part V applies everything to new workload families, and Part VI turns it into interview answers.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We sized Atlas at about 4,000 H100s and converted that into about 5.6 MW of IT power and 7.3 MW at the facility meter, using two numbers we did not justify: an all-in power of 1.4 kW per GPU and a PUE of 1.3. We also saw, in the 20 MW example, that when power is the binding constraint the right figure of merit is tokens per joule. Both observations point to the same open problem: what exactly happens to the electricity a datacenter draws, why a modern AI rack draws more than ten times the power of a traditional one, and how heat at that density is removed. Chapter 2 answers these questions, starting from the watts drawn by a single GPU and ending at the substation and the grid.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Demand for LLM tokens grew from research scale to more than \(10^{15}\) tokens per month at a single provider by late 2025; serving it takes hundreds of thousands of accelerators and gigawatts of power.</li>
+<li>The infrastructure is a nested hierarchy—accelerator, server, rack, cluster, hall, campus, region—in which power grows and bandwidth falls at each level, and each level is a failure domain.</li>
+<li>Power, accelerators and skilled people were the scarce resources of 2023–2026. US datacenters used 4.4% of national electricity in 2023, projected at 6.7–12% by 2028.</li>
+<li>Hyperscalers, neoclouds, inference platforms, model labs and enterprises build and consume AI infrastructure; the shared-responsibility split decides which layers each operates.</li>
+<li>Atlas, the running service: three tiers (Llama 3 8B, Llama 3 70B, DeepSeek-V3), 10,000 requests/s at peak, 2,000 input tokens (60% cached) and 400–1,500 output tokens per request; about 4,000 H100s.</li>
+<li>Fleet size: for each tier take the larger of the prefill and decode replica counts (their sum if disaggregated), multiply by \(n_g\), sum over tiers, divide by \(u\) and add spares; \(P_{\text{IT}}=n_{\text{gpu}}P_{\text{gpu}}\) with \(P_{\text{gpu}}\approx1.4\) kW (H100) or 2 kW (B200); \(P_{\text{fac}}=\text{PUE}\cdot P_{\text{IT}}\).</li>
+<li>Accelerators dominate cost (Atlas ≈ $88M/year at $2.50/GPU-hour; electricity ≈ 4% of that); cost per token is \(\propto c_{\text{gpu}}/u\), and in a power-limited building tokens per joule is the figure of merit.</li>
+<li>The data plane serves each request in milliseconds and must stay up; the control plane decides slowly and must be correct; static stability keeps the data plane working when the control plane fails.</li>
+<li>Volume I left open the physical, operational and workload layers that this volume covers: power, networks, storage, orchestration, capacity, economics, global routing, reliability, security, and multimodal, retrieval, agent, guardrail and batch workloads.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci01-mcq-01" data-topic="§1.1 Scale">
+<p class="q">Google reported about 1.3 quadrillion tokens per month in late 2025. Roughly what average rate is that?</p>
+<ol class="opts"><li>About \(5\times10^{6}\) tokens/s</li><li data-correct>About \(5\times10^{8}\) tokens/s</li><li>About \(5\times10^{10}\) tokens/s</li><li>About \(5\times10^{12}\) tokens/s</li></ol>
+<div class="explain">\(1.3\times10^{15}/(30\times86{,}400)\approx5\times10^{8}\) tokens per second.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-02" data-topic="§1.1 Scale">
+<p class="q">Which features make LLM serving harder to scale than conventional web serving? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Work per request is large and highly variable</li><li data-correct>The hardware is specialised and was supply-constrained</li><li data-correct>Racks are far more power-dense</li><li>Requests cannot be load-balanced</li></ol>
+<div class="explain">LLM requests can be load-balanced (Vol. I §27.2); the other three are the distinctive difficulties.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-03" data-topic="§1.2 Stack">
+<p class="q">What is the typical maximum power of an eight-GPU H100 server?</p>
+<ol class="opts"><li>About 1 kW</li><li>About 3 kW</li><li data-correct>About 10 kW</li><li>About 120 kW</li></ol>
+<div class="explain">About 10.2 kW, so roughly 1.3 kW per GPU before network and storage.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-04" data-topic="§1.2 Stack">
+<p class="q">A GB200 NVL72 rack is distinctive because:</p>
+<ol class="opts"><li>It is air-cooled at 15 kW</li><li data-correct>72 GPUs share one NVLink domain in a liquid-cooled rack of about 120–132 kW</li><li>It has no CPUs</li><li>Each GPU has its own rack</li></ol>
+<div class="explain">The rack becomes the unit of scale-up communication, and its power density requires liquid cooling.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-05" data-topic="§1.2 Stack">
+<p class="q">What is a failure domain?</p>
+<ol class="opts"><li>A network address range</li><li data-correct>A component whose failure takes down everything it contains</li><li>A software bug class</li><li>A cloud billing account</li></ol>
+<div class="explain">Servers, racks, power feeds, halls and regions are nested failure domains.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-06" data-topic="§1.2 Stack">
+<p class="q">Moving outward through the hierarchy from GPU to region, bandwidth generally:</p>
+<ol class="opts"><li>Rises</li><li data-correct>Falls, while latency rises</li><li>Stays constant</li><li>Falls, while latency falls</li></ol>
+<div class="explain">HBM 3.35 TB/s → NVLink 450 GB/s → back-end NIC 50 GB/s → shared inter-zone and inter-region links.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-07" data-topic="§1.2 Stack">
+<p class="q">Availability zones within a region are typically:</p>
+<ol class="opts"><li>In different countries</li><li data-correct>Kilometres to tens of kilometres apart with independent power and networking</li><li>In the same rack</li><li>Connected only through the public internet</li></ol>
+<div class="explain">Close enough for millisecond latency, far enough apart to fail independently.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-08" data-topic="§1.3 Scarcity">
+<p class="q">According to LBNL's 2024 report, US datacenters used about what share of US electricity in 2023?</p>
+<ol class="opts"><li>0.5%</li><li>1.9%</li><li data-correct>4.4%</li><li>12%</li></ol>
+<div class="explain">About 176 TWh, 4.4%; 1.9% was 2018; 6.7–12% is the 2028 projection.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-09" data-topic="§1.3 Scarcity">
+<p class="q">Why was US datacenter electricity nearly flat from 2014 to 2018 despite growing demand for computing?</p>
+<ol class="opts"><li>Fewer servers were built</li><li data-correct>Efficiency gains (better PUE, virtualisation, hyperscale consolidation) offset growth</li><li>Electricity was rationed</li><li>Computing moved offshore</li></ol>
+<div class="explain">The upturn after 2020 came from power-dense accelerated servers run at high utilisation.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-10" data-topic="§1.3 Scarcity">
+<p class="q">The main manufacturing bottleneck behind the 2023–2025 GPU shortage was:</p>
+<ol class="opts"><li>Silicon wafers for compute dies</li><li data-correct>Advanced packaging (CoWoS) and HBM supply</li><li>Server chassis</li><li>Power supplies</li></ol>
+<div class="explain">Placing compute dies and HBM on an interposer requires CoWoS capacity, which takes years to expand.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-11" data-topic="§1.3 Scarcity">
+<p class="q">In 2024–2025, the longest lead-time input for a new large AI campus was often:</p>
+<ol class="opts"><li>The building shell</li><li data-correct>The grid interconnection for hundreds of megawatts</li><li>Racks</li><li>Software licences</li></ol>
+<div class="explain">New generation, transmission and substations take years to permit and build.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-12" data-topic="§1.4 Builders">
+<p class="q">Neoclouds are best described as:</p>
+<ol class="opts"><li>Hyperscalers' internal teams</li><li data-correct>Providers specialising in GPU capacity, often bare metal, competing on price and speed of deployment</li><li>Open-source model labs</li><li>Content-delivery networks</li></ol>
+<div class="explain">CoreWeave, Lambda, Crusoe and Nebius grew by supplying GPUs when hyperscalers could not.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-13" data-topic="§1.4 Builders">
+<p class="q">In the shared-responsibility model, a customer of a token API operates:</p>
+<ol class="opts"><li>The inference engine</li><li>The cluster manager</li><li data-correct>Only its prompts and application</li><li>The GPU drivers</li></ol>
+<div class="explain">Everything below the application is the provider's.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-14" data-topic="§1.4 Builders">
+<p class="q">Moving from bare-metal GPUs to a managed endpoint typically:</p>
+<ol class="opts"><li>Increases control and lowers cost per token</li><li data-correct>Trades control for convenience, with a higher cost per token</li><li>Has no effect on cost</li><li>Removes the need for prompts</li></ol>
+<div class="explain">Each layer the provider operates carries a margin.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-15" data-topic="§1.4 Builders">
+<p class="q">Which statement about Google's accelerator strategy is correct?</p>
+<ol class="opts"><li>It uses only NVIDIA GPUs</li><li data-correct>It designed TPUs, deployed internally from 2015 and offered to cloud customers from 2018</li><li>TPUs were first offered in 2023</li><li>TPUs are FPGAs</li></ol>
+<div class="explain">TPU v1 was an internal inference chip; Cloud TPUs became available in 2018.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-16" data-topic="§1.5 Atlas">
+<p class="q">With 2,000 input tokens and a prefix-cache hit rate of 60%, how many tokens per request must be prefilled?</p>
+<ol class="opts"><li>1,200</li><li data-correct>800</li><li>2,000</li><li>400</li></ol>
+<div class="explain">\(2000\times(1-0.6)=800\).</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-17" data-topic="§1.5 Atlas">
+<p class="q">For Atlas-Small, why does prefill rather than decode bind the replica count?</p>
+<ol class="opts"><li>Decode is free</li><li data-correct>4.8M uncached prefill tokens/s at 15,000 per replica needs 320 replicas, more than decode's 267</li><li>The 8B model cannot decode</li><li>Prefill is memory-bound</li></ol>
+<div class="explain">Long prompts with modest cache hits make prefill the larger load for a small model.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-18" data-topic="§1.5 Atlas">
+<p class="q">Why does Atlas-Max add its prefill and decode GPU counts rather than taking the maximum?</p>
+<ol class="opts"><li>It uses FP16</li><li data-correct>It is disaggregated, so prefill and decode run on separate pools</li><li>It has more users</li><li>Mixture-of-experts models cannot batch</li></ol>
+<div class="explain">Colocated replicas share GPUs between phases; disaggregated pools do not (Vol. I Chapter 13).</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-19" data-topic="§1.5 Atlas">
+<p class="q">Atlas's Llama 3 70B tier needs 1,864 GPUs at full use. At a target utilisation of 0.75, it needs about:</p>
+<ol class="opts"><li>1,400</li><li>1,864</li><li data-correct>2,485</li><li>3,700</li></ol>
+<div class="explain">\(1864/0.75\approx2485\).</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-20" data-topic="§1.5 Atlas">
+<p class="q">If Atlas-Small's cache-hit rate fell from 60% to 30%, its uncached prefill per request would rise from 800 to:</p>
+<ol class="opts"><li>1,000</li><li data-correct>1,400</li><li>1,600</li><li>2,000</li></ol>
+<div class="explain">\(2000\times0.7=1400\), a 75% increase, and prefill binds, so the tier grows by 75%.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-21" data-topic="§1.6 Orders of magnitude">
+<p class="q">PUE is defined as:</p>
+<ol class="opts"><li>IT power divided by facility power</li><li data-correct>Total facility power divided by IT power</li><li>GPU power divided by server power</li><li>Energy per token</li></ol>
+<div class="explain">A PUE of 1.3 means 0.3 W of overhead (cooling, losses) per watt of IT load.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-22" data-topic="§1.6 Orders of magnitude">
+<p class="q">At 1.4 kW all-in per GPU and PUE 1.3, a fleet of 4,000 GPUs needs a facility of about:</p>
+<ol class="opts"><li>0.73 MW</li><li>5.6 MW</li><li data-correct>7.3 MW</li><li>73 MW</li></ol>
+<div class="explain">\(4000\times1.4=5.6\) MW IT, \(\times1.3\approx7.3\) MW.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-23" data-topic="§1.6 Orders of magnitude">
+<p class="q">For Atlas, electricity is roughly what fraction of the annual GPU cost at $2.50 per GPU-hour?</p>
+<ol class="opts"><li data-correct>About 4%</li><li>About 25%</li><li>About 50%</li><li>More than 100%</li></ol>
+<div class="explain">About $3.6M against about $88M.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-24" data-topic="§1.6 Orders of magnitude">
+<p class="q">In a power-limited building, which figure of merit should guide the choice of accelerator?</p>
+<ol class="opts"><li>Tokens per GPU</li><li>Price per GPU-hour</li><li data-correct>Tokens per joule</li><li>HBM capacity alone</li></ol>
+<div class="explain">Power caps the number of devices, so output per watt determines output per building.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-25" data-topic="§1.6 Orders of magnitude">
+<p class="q">In Figure 1.4, halving utilisation:</p>
+<ol class="opts"><li>Halves cost per token</li><li data-correct>Doubles cost per token</li><li>Has no effect</li><li>Quadruples cost per token</li></ol>
+<div class="explain">Cost per token is proportional to \(1/u\).</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-26" data-topic="§1.6 Orders of magnitude">
+<p class="q">A fixed fleet provisioned at \(u=0.75\) for a peak-to-mean ratio of 1.8 averages at most about:</p>
+<ol class="opts"><li>75% utilisation</li><li>60% utilisation</li><li data-correct>42% utilisation</li><li>18% utilisation</li></ol>
+<div class="explain">\(0.75/1.8\approx0.42\).</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-27" data-topic="§1.7 Planes">
+<p class="q">Which components belong to the data plane? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>API gateway</li><li data-correct>Router choosing a replica</li><li>Capacity planner</li><li data-correct>Inference engine</li></ol>
+<div class="explain">The capacity planner is a control-plane component; the others are on every request's path.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-28" data-topic="§1.7 Planes">
+<p class="q">A statically stable system:</p>
+<ol class="opts"><li>Never changes configuration</li><li data-correct>Keeps working through a failure without needing to make changes or call the control plane</li><li>Has no autoscaler</li><li>Runs only in one region</li></ol>
+<div class="explain">E.g. failover capacity is already running, and replicas keep their last-known configuration.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-29" data-topic="§1.7 Planes">
+<p class="q">If the configuration service holding rate limits becomes unreachable, a well-designed gateway should:</p>
+<ol class="opts"><li>Reject all traffic</li><li>Admit all traffic without limits</li><li data-correct>Keep enforcing the last limits it knew</li><li>Restart itself repeatedly</li></ol>
+<div class="explain">Static stability: continue with the last known good configuration.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-30" data-topic="§1.7 Planes">
+<p class="q">Why are reconciliation loops more robust than imperative scripts for managing infrastructure?</p>
+<ol class="opts"><li>They run faster</li><li data-correct>They converge to the desired state from whatever the current state is, without knowing what happened</li><li>They need no desired state</li><li>They never oscillate</li></ol>
+<div class="explain">The desired state is an attracting fixed point; but two interacting controllers can oscillate.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-31" data-topic="§1.8 Gaps">
+<p class="q">Which topics are outside Volume I's scope and covered in this volume? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Data residency and multi-region failover</li><li>The KV cache size formula</li><li data-correct>Vector search indexes</li><li data-correct>Prompt-cache timing side channels</li></ol>
+<div class="explain">The KV-cache formula is Vol. I §3.4.</div>
+</div>
+
+<div class="mcq" data-id="ci01-mcq-32" data-topic="§1.6 Orders of magnitude">
+<p class="q">Which input most directly sets the all-in power per GPU of a fleet?</p>
+<ol class="opts"><li>The model's vocabulary size</li><li data-correct>The server's power (GPUs, CPUs, NICs, fans, PSU losses) plus a share of network and storage</li><li>The PUE</li><li>The price per GPU-hour</li></ol>
+<div class="explain">PUE multiplies IT power to get facility power; it is not part of the per-GPU IT figure.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci01-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Walk me through the infrastructure hierarchy from a GPU to a region, with rough sizes.</summary>
+<div class="answer">
+<p>An accelerator draws 0.7–1.4 kW (H100 700 W, B200 about 1 kW). Eight sit in a server with two CPUs, a terabyte or two of DRAM, NVMe drives and one NIC per GPU, about 10 kW for H100 and 14 kW for B200. Servers go into racks: 30–40 kW air-cooled racks hold three or four H100 servers; a liquid-cooled GB200 NVL72 rack holds 72 GPUs in one NVLink domain at 120–130 kW. Racks join a cluster through a back-end fabric (1,000 to 100,000+ GPUs). Clusters live in data halls (5–30 MW), halls in buildings and campuses (50 MW to over a gigawatt), exposed by clouds as availability zones, grouped into regions. Each level is a failure domain, and bandwidth falls while latency rises as you go outward, from HBM at TB/s to inter-region links at tens of milliseconds.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-02">
+<summary><span class="lvl warm">Warm-up</span> What is PUE, what values are typical, and why does it matter for AI capacity?</summary>
+<div class="answer">
+<p>Power usage effectiveness is total facility power divided by IT power. The best hyperscale facilities run near 1.1; the industry average has been around 1.5; liquid-cooled AI halls in good climates reach 1.1–1.2. In a power-limited site the facility power is fixed, so IT power is facility power divided by PUE: going from 1.5 to 1.2 gives 25% more IT power, hence 25% more GPUs, from the same grid connection. PUE does not capture efficiency inside the IT load (fans in servers count as IT), so it is necessary but not sufficient as a metric.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Explain the difference between the control plane and the data plane, with LLM-serving examples.</summary>
+<div class="answer">
+<p>The data plane is on each request's path: DNS and load balancers, the API gateway, the router, the inference engines, the streaming response. It acts in milliseconds on every request and must stay available. The control plane configures the data plane: deployments, the model registry, autoscalers, the cluster scheduler, quota and routing configuration, billing and capacity planning. It acts in seconds to months, handles few decisions, and must be correct. Configuration flows down and telemetry flows up. A key principle is static stability: when the control plane fails, the data plane keeps serving with its last known configuration, so failover capacity is pre-provisioned and weights are cached locally.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-04">
+<summary><span class="lvl core">Core</span> Size the GPU fleet for a service with 3,500 requests/s at peak, 2,000 input tokens (60% cached) and 400 output tokens, on Llama 3 70B.</summary>
+<div class="answer">
+<p>Work at peak: decode \(3500\times400=1.4\)M tokens/s; uncached prefill \(3500\times800=2.8\)M tokens/s. Replica: TP8 on 8 H100s in FP8, measured around 6,000 decode tokens/s and 25,000 chunked-prefill tokens/s at the latency target. Decode needs 233 replicas, prefill 112; with chunked prefill colocated, decode binds: 233 replicas = 1,864 GPUs at full use. At 75% target utilisation, 2,485 GPUs; plus about 10% for failures, draining and cold-start headroom, about 2,750. I would state assumptions about the operating point, check the prefix-cache hit rate since it can swing prefill by 2×, and consider disaggregation or FP4 hardware as levers. Power: about 3.9 MW IT at 1.4 kW per GPU.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-05">
+<summary><span class="lvl core">Core</span> You have 20 MW of facility power at PUE 1.25. How many output tokens per day can you serve with a 70B model on H100s versus B200s?</summary>
+<div class="answer">
+<p>IT power 16 MW. H100 at about 1.4 kW all-in: 11,400 GPUs, 1,430 TP8 replicas; at 6,000 tokens/s and 55% average utilisation, about \(4\times10^{11}\) tokens/day. B200 at about 2 kW: 8,000 GPUs, 1,000 replicas; bandwidth 8 vs 3.35 TB/s and FP4 give roughly 2–3× per-replica decode throughput; at 15,000 tokens/s, about \(7\times10^{11}\) tokens/day. The point is that power, not GPU count, binds, so tokens per joule decides. I would also mention that B200 replicas might use fewer GPUs (TP4 fits 70B in FP8 in 4 × 192 GB), which improves per-GPU throughput further, and that the cooling must support 1 kW parts, likely liquid.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-06">
+<summary><span class="lvl core">Core</span> Why does a fixed fleet rarely average more than about 40–50% utilisation, and what can be done about it?</summary>
+<div class="answer">
+<p>Capacity must cover the peak at a safe utilisation \(u\) (queues explode near 1), so time-averaged utilisation is at most \(u\,\bar\lambda/\lambda_{\text{pk}}\); with \(u=0.75\) and a peak-to-mean of 1.8 that is 42%. Remedies: elasticity (scale capacity with demand, which requires capacity that can be released cheaply—on-demand or shared pools—and fast cold starts); filling troughs with deferrable work (batch APIs, evaluations, RL rollouts, embedding backfills) at lower priority; spreading demand across time zones by serving several regions from shared capacity; consolidating models onto shared replicas (multi-LoRA, multi-model); and pricing incentives (cheaper off-peak or batch tiers). Each raises the average without raising the peak.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-07">
+<summary><span class="lvl core">Core</span> What made GPUs scarce in 2023–2025, and how did the market adapt?</summary>
+<div class="answer">
+<p>Demand jumped after ChatGPT while supply was limited by TSMC's CoWoS advanced packaging and by HBM production, both slow to expand; GPU dies themselves were less of a bottleneck. Lead times for H100 servers reached six to twelve months. Adaptations: hyperscalers sold multi-year reservations and capacity blocks rather than on-demand instances; neoclouds raised capital to buy GPUs and rent them at lower prices; model labs signed direct multi-billion-dollar capacity deals; secondary markets and inference platforms resold capacity as tokens; and engineering effort shifted to utilisation (batching, quantisation, consolidation) because each percent of efficiency was capacity that could not otherwise be bought. Even when one generation loosens, the newest one is scarce.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-08">
+<summary><span class="lvl core">Core</span> Explain static stability and give three design consequences for an LLM service.</summary>
+<div class="answer">
+<p>A statically stable system keeps working through a failure without making changes or depending on the control plane. Consequences: (1) failover capacity in another zone or region must already be running and serving a share of traffic, not launched on demand during the incident; (2) replicas must be able to restart from locally or regionally cached weights and container images if the registry or object store is unreachable; (3) gateways and routers must keep the last known configuration (rate limits, routing weights, model versions) rather than failing open or closed; (4) autoscalers should fail to "hold current size", not to zero; (5) health checks should not cause mass eviction when the monitoring system itself fails. The cost is idle capacity and duplicated caches; the benefit is that a control-plane outage does not become a data-plane outage.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-09">
+<summary><span class="lvl core">Core</span> Compare hyperscalers, neoclouds and token-API platforms from the point of view of a company deploying an open-weight 70B model.</summary>
+<div class="answer">
+<p>Hyperscalers: broad services (identity, storage, VPCs, compliance certifications, private networking to data), managed endpoints and Kubernetes, many regions; on-demand GPU prices historically high, reservations required for capacity, GPU supply rationed. Neoclouds: cheaper GPU-hours, bare metal or Kubernetes with good back-end networks, fast access to new generations; fewer surrounding services and regions, more operational work for the customer, contractual commitments. Token-API platforms: no infrastructure work, pay per token, engine optimisations included; less control over model version, latency, data handling and cost at scale, and possible multi-tenant side effects. The choice depends on volume and utilisation (self-hosting wins only at high, steady utilisation), data-governance needs, and the team's ability to operate infrastructure.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Derive the formula for fleet size from a demand model and explain which terms each part of the stack controls.</summary>
+<div class="answer">
+<p>For tier \(j\): uncached prefill load \(\lambda_{\text{pk},j}n_{\text{in},j}(1-r_{\text{hit}})\) tokens/s, decode load \(\lambda_{\text{pk},j}n_{\text{out},j}\). With replicas of \(n_{g,j}\) GPUs sustaining \(\Phi_{P,j}\) and \(\Phi_{D,j}\) simultaneously (chunked prefill), replicas at full use are the maximum of the two ratios; for disaggregated tiers, the two pools add. Fleet \(=\frac{1+s_{\text{spare}}}{u}\sum_j n_{g,j}\max(\cdot)\). Control: \(\Phi\) by the engine and hardware (Volume I: batching, quantisation, attention, speculation, parallelism); \(r_{\text{hit}}\) by cache-aware routing and prompt design; \(u\) by routing quality, autoscaling and queueing targets; \(\lambda_{\text{pk}}\) by product (batch tiers, pricing) and multi-region load shifting; \(s_{\text{spare}}\) by failure rates, repair times and cold-start speed. A good answer identifies which binds and its sensitivity: for small models with long prompts, prefill and cache hits; for large models, decode and \(\Phi\).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> Why did rack power density rise so fast, and what does it imply for where AI capacity can be built?</summary>
+<div class="answer">
+<p>Accelerator power rose (V100 300 W, A100 400 W, H100 700 W, B200 about 1 kW, B300 about 1.2 kW) and, more importantly, the value of putting many GPUs inside one NVLink domain pushed vendors to pack them tightly: copper NVLink cables are short, so 72 GPUs must sit in one rack, giving 120–130 kW, and future designs target several hundred kilowatts. Air cooling tops out at roughly 30–40 kW per rack, so these racks need direct-to-chip liquid cooling, higher-capacity power distribution and floor loading. Existing enterprise and colocation halls designed for 5–15 kW racks cannot host them without retrofit. New capacity therefore goes to purpose-built facilities with liquid cooling and large grid connections, often in regions chosen for power availability rather than proximity to users, which in turn raises latency and residency questions handled by multi-region design.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Estimate the GPU fleet needed to serve one quadrillion tokens per month, stating your assumptions.</summary>
+<div class="answer">
+<p>\(10^{15}/(30\times86{,}400)\approx3.9\times10^{8}\) tokens/s. Assume 80% input and 20% output, with half of input cached: \(1.5\times10^{8}\) uncached input and \(7.7\times10^{7}\) output tokens/s. Assume a mix whose average cost resembles a 70B dense model at Atlas's operating point: 6,000 output tokens/s and 25,000 prefill tokens/s per 8-GPU replica. Decode needs about 12,800 replicas; prefill about 6,000; decode binds: about 100,000 GPUs at full use, about 140,000 at 75% peak utilisation with a 1.8 peak-to-mean ratio partially absorbed by elasticity, plus spares: roughly 150,000–250,000 H100-equivalents. The range is wide because the model mix (small models are 10× cheaper, reasoning models generate many hidden tokens) and the hardware generation each move it by factors of several. Power: 200,000 × 1.4 kW ≈ 280 MW IT. The order of magnitude—hundreds of thousands of GPUs, hundreds of megawatts—is the useful answer.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-13">
+<summary><span class="lvl deep">Deep-dive</span> How do the hierarchy's failure domains influence where you place replicas of a model?</summary>
+<div class="answer">
+<p>Replicas should be spread so that no single failure domain holds more than the capacity you can lose while meeting SLOs. Tensor-parallel replicas must sit within one server (or one NVL72 rack), so a server or rack failure removes whole replicas. Spread replicas across racks (power feeds, top-of-rack switches), across network pods, and across availability zones; keep at least N+1 or N+2 at each level, sized so that losing the largest domain still leaves enough capacity at the target utilisation. Correlated failures matter: a rack's power distribution unit, a cooling loop or a firmware rollout can hit many servers at once, so rollouts are also staged by failure domain. Disaggregated or multi-node deployments create larger blast radii, since one failed GPU can stall a 16- or 32-GPU replica, which argues for smaller replicas where latency allows.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-14">
+<summary><span class="lvl design">Design</span> An executive asks: "Should we build our own datacenter for inference, rent from a neocloud, or use APIs?" Structure your answer.</summary>
+<div class="answer">
+<p>Start from demand: volume, growth, shape (peak-to-mean), model mix, latency and data-governance needs. Compute the fleet at each option's utilisation and price: APIs (no fixed cost, highest per-token price, fastest start, least control); renting (reserved neocloud or hyperscaler capacity, mid price, needs an operations team, commitment risk); building (lowest cost per GPU-hour at high utilisation over 4–5 years, but capital-intensive, 18–36 months to power and build, technology-generation risk, needs facilities expertise). Include hidden costs: staff, networking, storage, egress, redundancy and idle capacity. Break-even is usually driven by utilisation: owning beats renting only if you keep hardware busy; renting beats APIs only above some steady volume. A common answer is a portfolio: owned or reserved capacity for the predictable base load, on-demand or API burst capacity for peaks and new models, and APIs for frontier models you cannot self-host.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-15">
+<summary><span class="lvl design">Design</span> Sketch the end-to-end architecture of Atlas, naming the components in each plane and the main risks.</summary>
+<div class="answer">
+<p>Data plane: global DNS/anycast load balancing to the nearest healthy region; TLS termination and an API gateway (auth, per-tenant rate limits, metering, request validation); a router per region and tier with cache-affine, load-aware placement; replica pools (8B on single GPUs, 70B on TP8 nodes, DeepSeek-V3 disaggregated with large expert parallelism); streaming responses via SSE; guardrail classifiers on inputs and outputs. Control plane: model registry and rollout system (canaries, progressive rollout by failure domain); autoscalers per tier using token-based signals; Kubernetes with topology-aware scheduling; capacity planning and procurement; configuration and quota services; billing and observability pipelines. Risks: capacity shortfalls at peak (mitigate with reservations, batch tiers and cross-region spillover), cache-hit regressions, cold starts, correlated hardware failures, a bad model rollout, control-plane outages (mitigate with static stability), noisy tenants and security of prompts and weights.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci01-qa-16">
+<summary><span class="lvl core">Core</span> Why is electricity only a few percent of the cost of an inference fleet, yet power is often the binding constraint?</summary>
+<div class="answer">
+<p>Electricity is cheap per GPU-hour: an H100 at about 1.4 kW all-in with PUE 1.3 uses about 1.8 kWh per hour, roughly $0.15 at $0.08/kWh, against $2–3 per GPU-hour for the hardware. But power capacity—a grid connection, substations, transformers, generators, cooling plant—cannot be bought quickly at any price: it takes years to build. So the cost of the energy is small, while the availability of megawatts limits how many GPUs can be installed at all. That is why tokens per joule matters for capacity even when it hardly matters for the bill, and why operators value efficient hardware and low PUE far more than their effect on electricity costs suggests.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-google-tokens">Alphabet. Remarks by S. Pichai at Google I/O (May 2025) and on the Q2 and Q3 2025 earnings calls (July and October 2025), reporting monthly tokens processed across Google products and APIs.</li>
+<li id="r-lbnl">A. Shehabi et al. <em>2024 United States Data Center Energy Usage Report</em>. Lawrence Berkeley National Laboratory, LBNL-2001637, December 2024.</li>
+<li>L. A. Barroso, U. Hölzle, P. Ranganathan. <em>The Datacenter as a Computer: Designing Warehouse-Scale Machines</em>, 3rd ed. Morgan &amp; Claypool, 2018.</li>
+<li>A. Grattafiori et al. (Llama Team, Meta). The Llama 3 Herd of Models. 2024. <a href="https://arxiv.org/abs/2407.21783">arXiv:2407.21783</a>.</li>
+<li>DeepSeek-AI. DeepSeek-V3 Technical Report. 2024. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>.</li>
+<li>R. Pope et al. Efficiently Scaling Transformer Inference. <em>MLSys</em>, 2023. <a href="https://arxiv.org/abs/2211.05102">arXiv:2211.05102</a>.</li>
+<li>A. Verma et al. Large-scale cluster management at Google with Borg. <em>EuroSys</em>, 2015.</li>
+<li>B. Burns, B. Grant, D. Oppenheimer, E. Brewer, J. Wilkes. Borg, Omega, and Kubernetes. <em>ACM Queue</em> 14(1), 2016.</li>
+<li>J. Dean, L. A. Barroso. The Tail at Scale. <em>Communications of the ACM</em> 56(2), 2013.</li>
+<li id="r-static">B. Weiss, M. Furr. Static stability using Availability Zones. <em>The Amazon Builders' Library</em>, Amazon Web Services, 2020.</li>
+<li>D. Patterson et al. Carbon Emissions and Large Neural Network Training. 2021. <a href="https://arxiv.org/abs/2104.10350">arXiv:2104.10350</a>.</li>
+<li>C. Huyen. <em>AI Engineering: Building Applications with Foundation Models</em>. O'Reilly, 2025.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

@@ -212,3 +212,20 @@ Every chapter must use these symbols. If a new symbol is needed, add it here fir
 - Memory sizes of tensors: binary units (KiB, MiB, GiB). Datasheet capacities and bandwidths: decimal (GB, TB/s), as vendors quote them.
 - FLOPs = floating-point operations (a count); FLOP/s = rate. A multiply-add counts as 2 FLOPs.
 - "Dense" throughput figures never include the 2× structured-sparsity marketing factor.
+
+---
+
+# Volume II — Cloud AI Infrastructure
+
+Volume II uses every symbol above with the same meaning and adds the following. Where a Volume I letter is reused, it carries a subscript that keeps it distinct (for example \(P_{\text{IT}}\) is a power, never the attention-probability matrix \(P\)).
+
+## Capacity, power and cost (Vol. II Ch. 1–2, 9–10)
+| Symbol | Meaning |
+|---|---|
+| \(\lambda_{\text{pk}}\), \(\bar\lambda\) | peak and daily-mean arrival rates; \(\lambda_{\text{pk}}/\bar\lambda\) is the peak-to-mean ratio |
+| \(r_{\text{hit}}\) | prefix-cache hit rate: fraction of input tokens served from cache |
+| \(\Phi_P\), \(\Phi_D\) | prefill and decode tokens per second a replica sustains at its operating point |
+| \(n_{\text{gpu}}\) | number of accelerators in a fleet |
+| \(s_{\text{spare}}\) | spare-capacity fraction (failures, draining, cold-start headroom, canaries) |
+| \(P_{\text{gpu}}\) | all-in IT power per accelerator (its share of server, network and storage), kW |
+| \(P_{\text{IT}}\), \(P_{\text{fac}}\) | IT power; total facility power. \(\text{PUE}=P_{\text{fac}}/P_{\text{IT}}\) |
