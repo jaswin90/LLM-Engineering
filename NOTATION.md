@@ -229,3 +229,9 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(s_{\text{spare}}\) | spare-capacity fraction (failures, draining, cold-start headroom, canaries) |
 | \(P_{\text{gpu}}\) | all-in IT power per accelerator (its share of server, network and storage), kW |
 | \(P_{\text{IT}}\), \(P_{\text{fac}}\) | IT power; total facility power. \(\text{PUE}=P_{\text{fac}}/P_{\text{IT}}\) |
+| \(e_{\text{tok}}\), \(e_{\text{tok}}^{\text{fac}}\) | energy per token at the IT level, \(n_gP_{\text{gpu}}/\Phi\); at the facility meter (Ch. 2) |
+| \(a_{\text{act}}\), \(C_{\text{sw}}\), \(V\) | switching activity, switched capacitance and supply voltage in \(P_{\text{dyn}}=a_{\text{act}}C_{\text{sw}}V^2f_{\text{clk}}\) (Ch. 2) |
+| \(\mu_P\), \(\sigma_P\), \(\rho_P\) | mean, standard deviation and pairwise correlation of per-server power draw (Ch. 2) |
+| \(z_\epsilon\) | upper \(\epsilon\)-quantile of the standard normal distribution |
+| \(\dot m\), \(c_p\), \(\vartheta\) | coolant mass flow (kg/s), specific heat (J/(kg·K)), temperature (\(\Delta\vartheta\): temperature rise) (Ch. 2) |
+| \(\ell\), \(n_{\text{rt}}\) | network path length; number of sequential round trips (Ch. 2, 12, 17) |

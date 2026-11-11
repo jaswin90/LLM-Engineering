@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 2 · The AI Datacenter: Power, Cooling and Space — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 2 of Cloud AI Infrastructure: where the watts of a GPU server go, power versus clock frequency, energy per token, why rack density rose from 10 kW to 130 kW, power distribution and redundancy, oversubscription, air and liquid cooling, PUE, and the grid.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci02" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part I · The Physical Cloud — Chapter 2</div>
+<h1 id="top">The AI Datacenter: Power, Cooling and Space</h1>
+<p class="lede">A datacenter turns electricity into computation and heat. For AI serving, the amount of electricity a site can draw, and the amount of heat it can remove, now limit capacity more often than the number of accelerators one can buy. This chapter follows the watts from the GPU to the grid: where a server's power goes, what one token costs in joules, why racks went from ten to more than a hundred kilowatts, how power is delivered and made redundant, how heat is removed by air and by liquid, and why siting a new AI campus has become a negotiation with utilities.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Chapter 1 sized Atlas at about 4,000 H100s and converted the fleet into 5.6 MW of IT power and 7.3 MW at the facility meter, using two constants: an all-in power of 1.4 kW per GPU and a power usage effectiveness (PUE) of 1.3. It also showed that when power is the binding constraint, the right figure of merit for hardware is tokens per joule rather than tokens per GPU. This chapter justifies those constants, shows how much they vary, and explains the engineering behind them.</p>
+<p>The topic matters for interviews in two ways. First, capacity questions increasingly begin with power: "you have a 50 MW site; what can you serve?", "why can't we put GB200 racks in our existing datacenter?", "how would you cut energy per token by a third?". Answering them needs a quantitative model of where power goes. Second, many systems decisions in serving—batch size, power capping, choice of precision, disaggregation, hardware generation—have first-order effects on energy, and an engineer who can compute those effects can find capacity that others miss. Volume I measured performance in seconds; this chapter adds joules.</p>
+<p>We work from the inside out. We first take apart an eight-GPU server and see where its 10 kW goes, and why GPU power grows faster than linearly with clock frequency (§2.1). We then define and compute energy per token, the bridge between serving efficiency and power (§2.2). We explain why rack power density rose twelve-fold in five years (§2.3), how power is delivered from the utility to the chip with redundancy and controlled oversubscription (§2.4), how the resulting heat is removed (§2.5), and what PUE does and does not measure (§2.6). We close at the grid, where the scarcest input to new AI capacity now lies (§2.7), and contrast facilities built for training with those built for inference (§2.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Break down the power of an eight-GPU server into its components and explain the dynamic-power relation \(P\propto CV^2f\) and its consequence for power capping memory-bound decode.</li>
+<li>Compute energy per token for prefill and decode from a replica's power and throughput, and explain how batch size, context length, precision and hardware change it.</li>
+<li>Explain why rack power density rose from about 10 kW to over 120 kW, and what that implies for buildings.</li>
+<li>Describe the power-delivery chain, its losses and redundancy schemes (N, N+1, 2N), and quantify the capacity gained by statistical oversubscription and when correlated loads defeat it.</li>
+<li>Derive the airflow or coolant flow needed to remove a rack's heat and explain why high-density racks require direct liquid cooling.</li>
+<li>Define PUE and WUE, list what PUE omits, and explain how grid interconnection, siting and load flexibility constrain new AI capacity.</li>
+</ol>
+<p class="small muted">Uses: Chapter 1 of this volume; the roofline and decode latency model (Vol. I §3.6–3.7); GPU architecture (Vol. I Chapter 5). Symbols: <a href="../notation.html">notation page</a>.</p>
+</div>
+
+<h2 id="s2-1">2.1 Where the watts go: from a GPU to a server</h2>
+<p>An H100 SXM is rated at a thermal design power (TDP) of 700 W: the maximum sustained power its cooling must be able to remove. That number is the starting point of every datacenter power calculation, but it is neither what the GPU draws in practice nor the whole story, because the GPU sits in a server whose other components draw almost as much again. To plan a building we need the server's power, and to save energy we need to know which part of it responds to what we do in software.</p>
+<p>Figure 2.1 gives an approximate breakdown of an eight-GPU H100 server at its specified maximum of about 10.2 kW. The eight GPUs account for 5.6 kW, a little over half. The two host CPUs and their terabytes of DRAM add roughly 1 kW. The NVSwitch chips that join the GPUs, the ten or so network interface cards and the local NVMe drives add several hundred watts. The fans that push air through the chassis are a surprisingly large item: at full speed they can draw well over a kilowatt, because the power of a fan rises with the cube of its speed and a 10 kW air-cooled chassis needs a great deal of air. Finally, the power supplies themselves convert alternating current to the low-voltage direct current the components need, at 94–97% efficiency, so a few percent of the input is lost as heat before any component sees it.</p>
+
+<figure class="diagram" id="fig-2-1">
+<svg class="dg" viewBox="0 0 720 210" role="img" aria-label="Approximate power breakdown of an eight-GPU H100 server at maximum load">
+<text x="20" y="28" class="t-sm t-b">Eight-GPU H100 server at its ≈ 10.2 kW maximum (approximate)</text>
+<rect x="20" y="45" width="372" height="56" class="bx2"/><text x="206" y="70" text-anchor="middle" class="t-sm t-b">8 × GPU · 5.6 kW</text><text x="206" y="88" text-anchor="middle" class="t-xs">55%</text>
+<rect x="392" y="45" width="66" height="56" class="bx"/><text x="425" y="70" text-anchor="middle" class="t-xs">CPUs +</text><text x="425" y="84" text-anchor="middle" class="t-xs">DRAM 1.0</text>
+<rect x="458" y="45" width="33" height="56" class="bx4"/><text x="474" y="78" text-anchor="middle" class="t-xs">0.5</text>
+<rect x="491" y="45" width="113" height="56" class="bx3"/><text x="547" y="70" text-anchor="middle" class="t-xs">fans (full</text><text x="547" y="84" text-anchor="middle" class="t-xs">speed) ≈ 1.7</text>
+<rect x="604" y="45" width="33" height="56" class="bx5"/><text x="620" y="78" text-anchor="middle" class="t-xs">0.4</text>
+<rect x="637" y="45" width="63" height="56" class="bx"/><text x="668" y="70" text-anchor="middle" class="t-xs">margin</text><text x="668" y="84" text-anchor="middle" class="t-xs">≈ 1.0</text>
+<text x="474" y="120" text-anchor="middle" class="t-xs">NVSwitch, NICs, NVMe</text>
+<text x="620" y="138" text-anchor="middle" class="t-xs">PSU loss</text>
+<line x1="474" y1="104" x2="474" y2="110" class="ln"/><line x1="620" y1="104" x2="620" y2="127" class="ln"/>
+<text x="20" y="170" class="t-xs">Typical draw while serving decode-heavy traffic: 6–8 kW. GPUs run below TDP when memory-bound; fans slow down;</text>
+<text x="20" y="188" class="t-xs">CPUs idle. The facility must still be provisioned for the specified maximum unless power is capped (§2.4).</text>
+</svg>
+<figcaption><b>Figure 2.1 — Where a GPU server's power goes.</b> The GPUs are just over half of the specified maximum; host, interconnect and fans account for most of the rest. Component values are estimates assembled from datasheets and vary by vendor; the vendor's 10.2 kW figure includes margin.</figcaption>
+</figure>
+
+<p>Two lessons follow from Figure 2.1. The first is that the all-in power per GPU is roughly twice the GPU's own TDP: 10.2 kW divided by eight is 1.275 kW, and network switches and storage push it to about 1.4 kW per GPU, which is the constant we used for Atlas. A rule that "an H100 uses 700 W" underestimates a fleet's power by a factor of two. The second lesson is that the specified maximum is not the typical draw. In decode-heavy serving, GPUs are memory-bound and draw well below their TDP, fans run slower, and the CPUs idle; measured draws of 6–8 kW per server are common. The gap between the maximum the facility must be able to supply and the typical draw is the opportunity that oversubscription exploits (§2.4).</p>
+<p>Why does a memory-bound GPU draw less than its TDP? The answer comes from how digital circuits consume power. A CMOS transistor dissipates energy each time it switches, charging and discharging the capacitance of the wires it drives. If a chip has effective switched capacitance \(C_{\text{sw}}\), runs at supply voltage \(V\) and clock frequency \(f_{\text{clk}}\), and a fraction \(a_{\text{act}}\) of its circuits switch each cycle, its <strong>dynamic power</strong> is</p>
+\[
+P_{\text{dyn}}=a_{\text{act}}\,C_{\text{sw}}\,V^{2}f_{\text{clk}}.
+\]
+<p>Two consequences matter for serving. First, power depends on <em>activity</em>: when tensor cores sit idle waiting for data from HBM, \(a_{\text{act}}\) is low for the compute units and power falls, which is why memory-bound decode draws less than compute-bound prefill. Second, the voltage needed to run reliably rises roughly in proportion to frequency over the operating range, so \(P_{\text{dyn}}\propto f_{\text{clk}}^{3}\) approximately. Lowering the clock by 10% lowers dynamic power by about 27%. For compute-bound work that costs 10% of throughput; for memory-bound work it costs almost nothing, because the bottleneck is HBM bandwidth, which does not depend on the SM clock.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — why power grows like the cube of frequency</div>
+<p>A logic gate's switching delay is roughly proportional to \(C_{\text{sw}}V/(V-V_{\text{th}})^{\gamma_v}\) for a threshold voltage \(V_{\text{th}}\) and an exponent \(\gamma_v\) between 1 and 2; to run at frequency \(f\) the delay must be below \(1/f\), which forces \(V\) to rise with \(f\). Over the narrow operating range of a modern GPU, \(V\approx V_0+k_vf\) with \(V_0\) small, so \(V\propto f\) to first order and \(P_{\text{dyn}}\propto V^2f\propto f^3\). Static (leakage) power, which flows even when nothing switches, adds a term that grows with voltage and temperature. The practical model is \(P(f)=P_{\text{static}}+c_3f^3\), convex in \(f\). Energy per operation is \(P/f\propto f^2\) for the dynamic part, so running slower is always more energy-efficient per operation, down to the point where static power, paid per second, dominates.</p>
+</div>
+
+<p>This physics is exposed to software through <strong>power capping</strong> and <strong>clock locking</strong>. NVIDIA's management tools let an operator set a power limit below the TDP (the GPU then lowers its clocks to stay under it) or fix the clocks directly. For serving, the effect is asymmetric. A study of LLM inference clusters at Microsoft (POLCA, 2024) found that capping GPU power during inference reduced throughput far less than proportionally, because decode is memory-bound, and used this to fit about 30% more servers into the same power envelope<span class="cite"><a href="#r-polca">[1]</a></span>. Training, which is compute-bound and synchronous, suffers more from caps.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — power-capping a decode replica</div>
+<p><strong>Setup.</strong> Atlas-Small replicas (Llama 3 8B, FP8, one H100) spend most of their time in decode at batch 128 and context around 2,000 tokens. A decode step reads about 8 GB of weights and about 17 GB of KV cache (128 sequences × 2,000 tokens × 64 KiB in FP8) and performs \(2\times8\times10^{9}\times128\approx2\times10^{12}\) FLOPs.</p>
+<p><strong>Is the step memory-bound?</strong> At 3.35 TB/s and 80% bandwidth utilisation, reading 25 GB takes about 9.4 ms. At 1,979 TFLOP/s dense FP8 and 60% utilisation, the FLOPs take about 1.7 ms. The step is memory-bound with a five-fold margin: the tensor cores are busy about a fifth of the time.</p>
+<p><strong>Cap the power.</strong> Suppose a cap from 700 W to 500 W lowers the SM clock by 20%. Compute time rises to about 2.1 ms, still far below the 9.4 ms memory time, so the step time, and therefore throughput, is essentially unchanged. HBM bandwidth is not reduced by the SM clock. The GPU's actual draw in this regime might fall from about 550 W to about 450 W.</p>
+<p><strong>What it buys.</strong> If each server's provisioned power falls from 10.2 kW to about 8.6 kW (eight GPUs capped 200 W lower), a hall provisioned for 1,000 servers can hold about 1,180, 18% more replicas from the same electrical capacity. The same cap applied to a prefill-heavy replica would cost throughput, so caps should follow the workload: disaggregated decode pools (Vol. I Chapter 13) are the natural place for them.</p>
+</div>
+
+<p>Power capping shows that energy is not fixed by the hardware; it depends on how the hardware is used. To reason about that dependence for any workload, we need a single quantity that connects serving efficiency to power, and that quantity is the energy per token.</p>
+
+<h2 id="s2-2">2.2 Energy per token</h2>
+<p>The energy needed to produce one token is the power drawn by the hardware producing it, divided by the rate at which it produces tokens. For a replica of \(n_g\) GPUs, each drawing all-in power \(P_{\text{gpu}}\), producing \(\Phi\) tokens per second, the <strong>energy per token</strong> at the IT level and at the facility meter is</p>
+\[
+e_{\text{tok}}=\frac{n_g\,P_{\text{gpu}}}{\Phi},\qquad e_{\text{tok}}^{\text{fac}}=\text{PUE}\cdot e_{\text{tok}}.
+\]
+<p>The formula is trivial, but it has a useful structure: anything that raises throughput at fixed power lowers energy per token in proportion, and anything that lowers power at fixed throughput does the same. Every optimisation of Volume I—batching, quantisation, GQA and MLA, FlashAttention, speculative decoding—is therefore also an energy optimisation, with exactly the same factor. Power capping is the rare lever that acts only on the numerator.</p>
+<p>Let us compute it for Atlas. The 70B tier runs on eight H100s at about 1.4 kW each, producing 6,000 decode tokens per second, so \(e_{\text{tok}}=8\times1400/6000\approx1.9\) J per output token at the IT level, or about 2.4 J at PUE 1.3. The 8B tier, one H100 at 9,000 tokens per second, uses about 0.16 J per output token, twelve times less. Prefill tokens are much cheaper than decode tokens because prefill is compute-bound and batches thousands of tokens per weight read: a token of 70B prefill needs \(2N\approx1.4\times10^{11}\) FLOPs, and an H100 sustaining 800 TFLOP/s of FP8 prefill processes about 5,700 such tokens per second per GPU, or about 0.25 J per prefill token—an eighth of the decode cost.</p>
+<p>Combining the two gives the energy of a request. An Atlas request to the 70B tier, with 800 uncached prompt tokens and 400 output tokens, uses about \(800\times0.25+400\times1.9\approx960\) J at the IT level, or about 0.35 Wh at the meter. That is the energy of a 10 W LED bulb for two minutes. Google reported in 2025 that the median text prompt to its Gemini apps consumed about 0.24 Wh including idle capacity and datacenter overhead<span class="cite"><a href="#r-google-energy">[2]</a></span>, the same order of magnitude: one query is cheap; a billion queries a day are a power plant.</p>
+<p>Energy per token depends strongly on the operating point, and Figure 2.2 shows how. It plots the roofline-model energy per output token of Llama 3 8B in FP8 on one H100 as a function of decode batch size, at two context lengths, with all-in power held at 1.4 kW. At batch 1, a decode step reads all 8 GB of weights to produce a single token, and the energy is over 4 J per token. As the batch grows, the same weight read is shared by more tokens and energy per token falls roughly as \(1/B\), until the KV-cache reads, which grow with the batch, take over. At a 2,000-token context the curve reaches about 0.1 J at batch 128; at 8,000 tokens it flattens near 0.3 J, because each sequence's cache is four times larger.</p>
+
+<figure class="chart" id="fig-2-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Energy per output token, Llama 3 8B FP8 on one H100 (roofline model, 1.4 kW all-in, 80% MBU)","height":330,
+ "x":{"label":"Decode batch size B (log)","log":true,"min":1,"max":256,"ticks":[1,2,4,8,16,32,64,128,256]},
+ "y":{"label":"Joules per output token (log)","log":true,"min":0.07,"max":6,"ticks":[0.1,0.2,0.5,1,2,5]},
+ "series":[
+  {"name":"Context 2,000 tokens","color":"s1","points":[[1,4.27],[2,2.16],[4,1.10],[8,0.595],[16,0.335],[32,0.201],[64,0.136],[128,0.103],[256,0.086]]},
+  {"name":"Context 8,000 tokens","color":"s2","points":[[1,4.47],[2,2.35],[4,1.29],[8,0.80],[16,0.528],[32,0.41],[64,0.345],[128,0.313],[256,0.296]]}
+ ]}
+</script>
+<figcaption><b>Figure 2.2 — Batching is an energy optimisation.</b> Energy per token \(=P_{\text{gpu}}\,t_{\text{step}}/B\), with \(t_{\text{step}}\) from the memory-bound decode model (Vol. I §3.7): weights 8.03 GB, KV cache 64 KiB per token in FP8. Holding power constant is conservative: the GPU draws less at small batches, which flattens the left of the curves slightly.</figcaption>
+</figure>
+
+<p>Figure 2.2 has two practical readings. The first is that <em>a lightly loaded replica is an energy-inefficient replica</em>. A GPU serving a handful of concurrent requests uses ten to forty times more energy per token than one serving a hundred, and since its power draw does not fall in proportion, a fleet that is over-provisioned for latency wastes energy as well as money. The second is that <em>long contexts set a floor</em>. Once the batch is large, the KV-cache reads dominate, and the only ways to lower the floor are to read fewer KV bytes: grouped-query or latent attention, KV quantisation, sparse attention (Vol. I Chapters 8 and 21). Reasoning models, which generate long contexts as they think, live on the flat part of the orange curve.</p>
+<p>Hardware generations change energy per token by changing both terms of the ratio. A B200 draws about 1 kW against 700 W for an H100, so its all-in power is about 40% higher, but its HBM bandwidth is 2.4 times larger and it supports FP4 weights, so memory-bound decode throughput rises by more than its power. In the example of §1.6 we estimated 2.5 times the throughput per replica at about 1.4 times the power per GPU, a 40% saving in energy per token. Each generation since Volta has followed the same pattern—more power per device, less energy per operation—and that is why, in a power-limited building, upgrading hardware is often the cheapest way to add capacity.</p>
+
+<details class="drill">
+<summary>Drill 2.1 — Energy for a day of Atlas</summary>
+<p>Using the per-token energies above (70B: 1.9 J per decode token and 0.25 J per prefill token; 8B: 0.16 J per decode token and, by the same reasoning, about 0.025 J per prefill token), estimate the IT energy Atlas's 8B and 70B tiers would use per day if every GPU-second were productive. Compare with the energy the fleet actually draws.</p>
+<p><em>Solution.</em> Daily means are the peaks of Table 1.1 divided by 1.8. 8B: \(3333\) req/s × (400 × 0.16 + 800 × 0.025) J ≈ \(3333\times84\approx2.8\times10^{5}\) W, about 0.28 MW. 70B: \(1944\times(400\times1.9+800\times0.25)\approx1944\times960\approx1.9\) MW. Together about 2.2 MW of productive IT power, or 53 MWh per day. The two tiers' GPUs (about 2,900 at 1.4 kW, drawing about 70% of nameplate on average) actually draw about 2.9 MW. The difference—about a quarter—is the energy of headroom, troughs and small batches: GPUs that are powered but not producing tokens at their best operating point. This "idle energy" is why Google's per-prompt figure includes idle machines, and why utilisation matters for energy as much as for cost.</p>
+</details>
+
+<p>Energy per token tells us how much power a given token rate needs. The building must deliver that power to the racks, and the amount of power per rack has changed so fast that it has redefined what a datacenter is.</p>
+
+<h2 id="s2-3">2.3 Rack density and why it rose</h2>
+<p>For most of the history of commercial datacenters, a rack drew 3–10 kW. Facilities were designed around that density: raised floors that delivered cold air from below, computer-room air handlers around the walls, and electrical distribution sized at a few hundred watts per square foot. Surveys of operators by the Uptime Institute found average rack densities still below about 8 kW as late as 2024. AI racks broke this model in a few years, and Figure 2.3 shows how fast.</p>
+
+<figure class="chart" id="fig-2-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Power per rack of NVIDIA reference AI systems, against a typical enterprise rack","height":330,
+ "x":{"label":"Year of volume deployment","min":2016,"max":2028,"fmt":"year","ticks":[2016,2018,2020,2022,2024,2026,2028]},
+ "y":{"label":"kW per rack (log)","log":true,"min":4,"max":800,"ticks":[5,10,20,50,100,200,500]},
+ "series":[
+  {"name":"AI rack (vendor reference designs)","color":"s1","points":[[2017,14,"4 × DGX-1 (V100)"],[2020,26,"4 × DGX A100"],[2023,41,"4 × DGX H100"],[2025,125,"GB200 NVL72"],[2026,138,"GB300 NVL72"],[2027.5,600,"Kyber (announced)"]]}
+ ],
+ "notes":[{"x":2017.3,"y":11.5,"text":"4 × DGX-1 (V100)","anchor":"start"},{"x":2020.3,"y":21,"text":"4 × DGX A100","anchor":"start"},{"x":2022.8,"y":55,"text":"4 × DGX H100","anchor":"end"},{"x":2024.8,"y":160,"text":"GB200 NVL72","anchor":"end"},{"x":2026.2,"y":112,"text":"GB300","anchor":"start"},{"x":2027.3,"y":640,"text":"Kyber (announced)","anchor":"end"}],
+ "hlines":[{"y":8,"text":"typical enterprise rack (≈ 5–10 kW)"},{"y":35,"text":"practical limit of air cooling (≈ 30–40 kW)"}]}
+</script>
+<figcaption><b>Figure 2.3 — The twelve-fold rise in rack power.</b> Points are approximate rack totals for common configurations: four air-cooled eight-GPU servers per rack until H100, then single-rack NVLink systems. The 2027 point is NVIDIA's announced design for Rubin Ultra, not a shipping product. Above the air-cooling line, racks need liquid cooling.</figcaption>
+</figure>
+
+<p>The first three points in Figure 2.3 follow GPU power: four eight-GPU servers per rack went from about 14 kW with V100s to about 41 kW with H100s, because the GPUs went from 300 W to 700 W and the servers around them grew accordingly. Many operators could not even supply 41 kW per rack, and ran H100 servers two to a rack, spreading the load over more floor space. Then the curve jumps, because the unit of design changed. GB200 NVL72 places 72 GPUs in a single rack not because racks were too empty, but because NVLink's copper cables reach only about a metre or two at the signalling rates involved, and the value of a 72-GPU NVLink domain—for tensor and expert parallelism, for large-batch decode of mixture-of-experts models (Vol. I §19.6)—is high enough that everything is packed within reach of a single spine of cables. The rack becomes a single computer of about 120–140 kW. The announced next steps push further, to designs of several hundred kilowatts per rack later in the decade.</p>
+<p>The physics of the building did not change at the same speed. The power and cooling of a hall are designed for an average density, and a hall built for 10 kW racks has power distribution, floor loading and air handling for that density. Placing a 130 kW rack in it is not a matter of a bigger plug: it requires feeding twelve times the power into one floor tile, removing twelve times the heat from it, and supporting a rack that weighs more than 1.3 tonnes. A hall of 10 kW racks can sometimes be retrofitted for a few high-density racks with liquid-to-air "sidecar" heat exchangers and new busways, at the cost of leaving many positions empty, so that the hall's total power is spread over fewer, denser racks. But at scale, AI capacity moved to new facilities designed around liquid cooling and 100+ kW racks, and the scarcest thing about such a facility is the large power connection it needs.</p>
+<p>For capacity planning, density is a conversion factor between power and floor space. A 20 MW hall at 10 kW per rack needs about 2,000 rack positions; at 130 kW it needs about 150. Floor space is cheap; what the high-density hall needs instead is power and heat delivered at high intensity. That brings us to the electrical chain that carries megawatts from the grid to those racks.</p>
+
+<h2 id="s2-4">2.4 Delivering power: the electrical chain, redundancy and oversubscription</h2>
+<p>Electricity reaches a GPU through a chain of conversions, each of which loses a little energy and each of which is a potential point of failure. Figure 2.4 shows a typical chain. The utility delivers power at high or medium voltage (tens to hundreds of kilovolts) to an on-site <strong>substation</strong>, where transformers step it down to a medium voltage for distribution around the campus and then to a low voltage (415 V three-phase in many designs) at each hall. An <strong>uninterruptible power supply</strong> (UPS) sits in the path: batteries, or increasingly flywheels or other storage, that carry the load for the seconds to minutes it takes standby <strong>generators</strong> to start if the utility fails. From the UPS, power flows through <strong>power distribution units</strong> (PDUs) or overhead busways to the racks, and in each server the <strong>power supply units</strong> (PSUs) convert alternating current to the 12 V or 48 V direct current that the boards use; voltage regulators on the board then produce the sub-volt supplies of the chips themselves.</p>
+
+<figure class="diagram" id="fig-2-4">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="The power delivery chain from utility to GPU">
+<defs><marker id="a24" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="50" width="90" height="60" rx="8" class="bx"/><text x="55" y="76" text-anchor="middle" class="t-xs t-b">utility grid</text><text x="55" y="92" text-anchor="middle" class="t-xs">69–345 kV</text>
+<rect x="122" y="50" width="90" height="60" rx="8" class="bx4"/><text x="167" y="76" text-anchor="middle" class="t-xs t-b">substation</text><text x="167" y="92" text-anchor="middle" class="t-xs">→ 13–35 kV</text>
+<rect x="234" y="50" width="90" height="60" rx="8" class="bx4"/><text x="279" y="76" text-anchor="middle" class="t-xs t-b">transformer</text><text x="279" y="92" text-anchor="middle" class="t-xs">→ 415 V</text>
+<rect x="346" y="50" width="90" height="60" rx="8" class="bx2"/><text x="391" y="76" text-anchor="middle" class="t-xs t-b">UPS</text><text x="391" y="92" text-anchor="middle" class="t-xs">94–99%</text>
+<rect x="458" y="50" width="90" height="60" rx="8" class="bx3"/><text x="503" y="76" text-anchor="middle" class="t-xs t-b">PDU / busway</text><text x="503" y="92" text-anchor="middle" class="t-xs">≈ 98–99%</text>
+<rect x="570" y="50" width="140" height="60" rx="8" class="bx5"/><text x="640" y="72" text-anchor="middle" class="t-xs t-b">rack PSUs → boards</text><text x="640" y="88" text-anchor="middle" class="t-xs">AC→48/12 V DC 94–97%</text><text x="640" y="102" text-anchor="middle" class="t-xs">VRMs → &lt; 1 V at chip</text>
+<line x1="100" y1="80" x2="120" y2="80" class="ln" marker-end="url(#a24)"/>
+<line x1="212" y1="80" x2="232" y2="80" class="ln" marker-end="url(#a24)"/>
+<line x1="324" y1="80" x2="344" y2="80" class="ln" marker-end="url(#a24)"/>
+<line x1="436" y1="80" x2="456" y2="80" class="ln" marker-end="url(#a24)"/>
+<line x1="548" y1="80" x2="568" y2="80" class="ln" marker-end="url(#a24)"/>
+<rect x="346" y="150" width="90" height="50" rx="8" class="bx"/><text x="391" y="172" text-anchor="middle" class="t-xs t-b">generators</text><text x="391" y="188" text-anchor="middle" class="t-xs">start in ≈ 10–15 s</text>
+<line x1="391" y1="150" x2="391" y2="112" class="ln ln-acc" marker-end="url(#a24)"/>
+<text x="452" y="140" class="t-xs t-acc">batteries bridge the gap</text>
+<text x="20" y="30" class="t-sm t-b">End-to-end conversion efficiency ≈ 0.99 × 0.96 × 0.985 × 0.95 ≈ 0.89 before cooling</text>
+</svg>
+<figcaption><b>Figure 2.4 — From the grid to the GPU.</b> Each conversion loses a few percent as heat. Losses outside the IT equipment (transformers, UPS, distribution) count against PUE; losses in the server's own PSUs count as IT power.</figcaption>
+</figure>
+
+<p>Figure 2.4 shows why datacenter designers care about voltages. Losses in a conductor scale as \(I^2R\), so delivering the same power at a higher voltage, with a proportionally lower current, cuts resistive losses quadratically and lets thinner, cheaper copper carry it. Hyperscale designs moved from 208 V to 415 V distribution and to 48 V DC inside racks (instead of 12 V) for this reason, and at 130 kW per rack the currents involved at low voltage become physically unwieldy; NVIDIA announced in 2025 that it would move future racks to 800 V DC distribution. Each conversion step that can be removed or made more efficient both saves energy and removes a component that can fail.</p>
+<p>Redundancy is described by counting. A system needs \(N\) units (UPS modules, generators, cooling units) to carry its full load. An <strong>N</strong> design has exactly that: any failure reduces capacity. <strong>N+1</strong> adds one spare unit, so any single failure is tolerated. <strong>2N</strong> duplicates the entire path, typically as two independent feeds ("A and B") to every rack, each able to carry the full load, so that even a failure or maintenance of a whole path is tolerated. The Uptime Institute's widely used tier classification maps designs to expected availability: Tier I (no redundancy) about 99.67%, Tier II (redundant components) about 99.74%, Tier III (concurrently maintainable: any component can be taken down for maintenance without interrupting the load) about 99.98%, and Tier IV (fault tolerant) about 99.995%, or roughly 26 minutes of downtime a year.</p>
+<p>Redundancy is expensive: a 2N design buys twice the UPS and distribution capacity for the same IT load, and generators sized for the full load sit idle for years. AI facilities have therefore revisited the traditional choices. Large training clusters checkpoint their state and restart after a failure, so some are built with reduced redundancy on the IT load, trading a small risk of an interruption for a large saving in capital and a faster build. Inference fleets serve users in real time, so their facilities usually keep N+1 or 2N on the critical path—but they can also achieve availability at a higher level, by spreading replicas across halls and zones so that the loss of one facility's power is absorbed elsewhere (Chapter 12). The cheapest redundancy for a stateless service is often geographical rather than electrical.</p>
+<p>The other lever is <strong>oversubscription</strong>: installing more IT equipment than the electrical capacity could support if every device drew its nameplate maximum at the same time. Servers rarely do. In 2007, Fan, Weber and Barroso measured thousands of Google servers and found that the aggregate power of large groups never approached the sum of their nameplates, so a facility could host substantially more servers than a nameplate calculation allowed<span class="cite"><a href="#r-fan">[3]</a></span>. The reason is statistical, and it is worth deriving because it also explains when oversubscription fails.</p>
+
+<div class="box thm">
+<div class="box-title">Proposition 2.1 — Provisioned power for a group of servers</div>
+<p>Let \(n\) servers draw powers \(X_1,\dots,X_n\), each with mean \(\mu_P\) and standard deviation \(\sigma_P\), with pairwise correlation \(\rho_P\ge0\). If the total is approximately normal, the power that is exceeded with probability at most \(\epsilon\) is</p>
+\[
+P_{\text{prov}}(n)=n\mu_P+z_\epsilon\,\sigma_P\sqrt{n\bigl(1+(n-1)\rho_P\bigr)},
+\]
+<p>where \(z_\epsilon\) is the upper \(\epsilon\)-quantile of the standard normal. Per server, \(P_{\text{prov}}/n\to\mu_P\) as \(n\to\infty\) when \(\rho_P=0\), and \(\to\mu_P+z_\epsilon\sigma_P\sqrt{\rho_P}\) when \(\rho_P>0\).</p>
+<p><em>Proof.</em> The total \(S=\sum X_i\) has mean \(n\mu_P\) and variance \(\sum_i\operatorname{Var}X_i+\sum_{i\ne j}\operatorname{Cov}(X_i,X_j)=n\sigma_P^2+n(n-1)\rho_P\sigma_P^2\). Under the normal approximation, \(\Pr(S>n\mu_P+z_\epsilon\sqrt{\operatorname{Var}S})=\epsilon\). Dividing by \(n\) gives the per-server limit. \(\square\)</p>
+</div>
+
+<p>Proposition 2.1 says that independence is what makes oversubscription work: with \(\rho_P=0\) the per-server headroom shrinks like \(1/\sqrt{n}\), so a large hall needs to provision only slightly above the mean draw. Even modest correlation destroys this: with \(\rho_P>0\) the headroom tends to a constant \(z_\epsilon\sigma_P\sqrt{\rho_P}\) that no amount of scale removes. Figure 2.5 plots the provisioned power per server for servers with mean draw 7 kW, standard deviation 1.2 kW and nameplate 10.2 kW, at \(\epsilon=10^{-4}\).</p>
+
+<figure class="chart" id="fig-2-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Power to provision per server (exceeded with probability 10⁻⁴), mean 7 kW, s.d. 1.2 kW","height":320,
+ "x":{"label":"Servers sharing the power budget, n (log)","log":true,"min":10,"max":10000,"ticks":[10,30,100,300,1000,3000,10000]},
+ "y":{"label":"kW per server","min":6.5,"max":10.8,"ticks":[7,8,9,10]},
+ "series":[
+  {"name":"Independent (ρ = 0)","color":"s3","points":[[10,8.41],[30,7.82],[100,7.45],[300,7.26],[1000,7.14],[3000,7.08],[10000,7.05]]},
+  {"name":"Weakly correlated (ρ = 0.1)","color":"s1","points":[[10,8.95],[30,8.62],[100,8.47],[300,8.43],[1000,8.42],[3000,8.41],[10000,8.41]]},
+  {"name":"Strongly correlated (ρ = 0.5)","color":"s2","points":[[10,10.2],[30,10.2],[100,10.17],[300,10.16],[1000,10.16],[3000,10.16],[10000,10.16]]}
+ ],
+ "hlines":[{"y":10.2,"text":"nameplate 10.2 kW"}]}
+</script>
+<figcaption><b>Figure 2.5 — Oversubscription works only for uncorrelated loads.</b> From Proposition 2.1 with \(z_\epsilon\approx3.72\), capped at the nameplate. Independent inference servers in a 1,000-server hall need only about 7.1 kW each; synchronised training servers need nearly their nameplate.</figcaption>
+</figure>
+
+<p>Figure 2.5 explains a difference between training and inference facilities that surprises many engineers. An inference fleet's servers are driven by independent streams of user requests, so their power draws are nearly uncorrelated; a hall of a thousand of them needs to provision only about 7.1 kW per server instead of 10.2 kW, which is room for 40% more servers in the same electrical envelope, or the equivalent of a large building for free. A synchronous training job is the opposite: tens of thousands of GPUs compute and then communicate in lockstep, so their power rises and falls together. The Llama 3 team reported that such synchronised fluctuations across a training cluster reached tens of megawatts, stressing the limits of the power grid itself<span class="cite"><a href="#r-llama3">[4]</a></span>. For them, \(\rho_P\approx1\), and oversubscription is impossible without help.</p>
+<p>Oversubscription always needs a safety net, because rare events do happen—a traffic spike that pushes every replica into compute-bound prefill, a software rollout that changes the workload everywhere at once. The net is a <strong>power-capping system</strong> that monitors aggregate draw at each level of the electrical hierarchy and, when it approaches a breaker's limit, lowers the caps of selected servers within seconds. Meta described such a system in 2016 (confusingly also called Dynamo), and Microsoft's POLCA applied the idea to LLM inference clusters, capping first the GPUs whose throughput suffers least—the memory-bound decode replicas of §2.1<span class="cite"><a href="#r-polca">[1]</a></span>. With capping as a backstop, an operator can choose \(\epsilon\) aggressively. The power arrives; next it must leave as heat.</p>
+
+<h2 id="s2-5">2.5 Removing heat: air, liquid and immersion</h2>
+<p>Every watt a datacenter draws becomes heat, and that heat must be carried out of the chips, out of the servers, out of the hall and finally into the outside air or water. The basic relation is the steady-flow energy balance: a fluid with mass flow rate \(\dot m\) (kg/s) and specific heat capacity \(c_p\) (J/(kg·K)) that warms by \(\Delta\vartheta\) kelvin as it passes the equipment carries away heat at a rate</p>
+\[
+P_{\text{heat}}=\dot m\,c_p\,\Delta\vartheta.
+\]
+<p>(We write \(\vartheta\) for temperature, because \(T\) is a sequence length and \(\Theta\) the RoPE base in this book.) The equation says that to remove more heat we need more fluid, a fluid with higher heat capacity, or a larger temperature rise. Air is a poor coolant: its density is about 1.2 kg/m³ and its specific heat about 1,005 J/(kg·K), so a cubic metre of air warming by one kelvin carries about 1.2 kJ. Water is about 1,000 kg/m³ with specific heat 4,186 J/(kg·K), so a cubic metre carries about 4.2 MJ per kelvin—about 3,500 times as much heat per unit volume.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — air versus water for one rack</div>
+<p><strong>Air.</strong> A 40 kW rack of H100 servers, with air warming by 15 K as it passes through, needs \(\dot m=40{,}000/(1005\times15)\approx2.65\) kg/s, or about 2.2 m³/s of air—roughly 4,700 cubic feet per minute, the output of a large industrial fan, through one rack. A 130 kW GB200 rack would need about 7.2 m³/s, more than three times as much, through the same cross-section; the air velocities and fan power involved are impractical, and the chips' heat flux is too concentrated for air to pick up anyway.</p>
+<p><strong>Water.</strong> The same 130 kW carried by water warming by 10 K needs \(\dot m=130{,}000/(4186\times10)\approx3.1\) kg/s, about 3.1 litres per second, through pipes a few centimetres across. Pumping that flow takes a few hundred watts.</p>
+<p><strong>Lesson.</strong> Above roughly 30–40 kW per rack, air cooling becomes impractical, and above about 100 kW it is physically infeasible. This is why GB200-class racks are liquid-cooled, and why liquid cooling moved from a niche in high-performance computing to the default for AI in about two years.</p>
+</div>
+
+<p>Air-cooled halls are organised to keep the cold air entering servers separate from the hot air leaving them. Figure 2.6 shows the standard arrangement. Racks are placed in rows facing each other, so that their intakes face a common <strong>cold aisle</strong> and their exhausts face a common <strong>hot aisle</strong>. Computer-room air handlers (CRAHs) draw hot air from the hot aisle, pass it over coils carrying chilled water, and return it cold to the cold aisle, either through a raised floor or from overhead. <strong>Containment</strong>—physical barriers that enclose the hot or cold aisle—prevents hot exhaust from recirculating to the intakes, which would raise inlet temperatures and force more cooling. Containment and raising the allowed inlet temperature (ASHRAE's guidelines permit server inlets up to about 27 °C in the recommended range) were two of the main reasons PUE fell between 2007 and 2018.</p>
+
+<figure class="diagram" id="fig-2-6">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="Hot aisle and cold aisle layout in an air-cooled data hall">
+<defs><marker id="a26" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="30" y="40" width="70" height="150" rx="6" class="bx3"/><text x="65" y="118" text-anchor="middle" class="t-xs t-b">CRAH</text><text x="65" y="134" text-anchor="middle" class="t-xs">chilled-water</text><text x="65" y="148" text-anchor="middle" class="t-xs">coil + fans</text>
+<rect x="190" y="60" width="60" height="120" rx="4" class="bx"/><text x="220" y="124" text-anchor="middle" class="t-xs">racks</text>
+<rect x="360" y="60" width="60" height="120" rx="4" class="bx"/><text x="390" y="124" text-anchor="middle" class="t-xs">racks</text>
+<rect x="530" y="60" width="60" height="120" rx="4" class="bx"/><text x="560" y="124" text-anchor="middle" class="t-xs">racks</text>
+<rect x="255" y="60" width="100" height="120" rx="4" class="bx2"/><text x="305" y="116" text-anchor="middle" class="t-xs t-b">hot aisle</text><text x="305" y="132" text-anchor="middle" class="t-xs">(contained)</text>
+<rect x="110" y="60" width="75" height="120" rx="4" class="bx4"/><text x="147" y="116" text-anchor="middle" class="t-xs t-b">cold aisle</text>
+<rect x="425" y="60" width="100" height="120" rx="4" class="bx4"/><text x="475" y="116" text-anchor="middle" class="t-xs t-b">cold aisle</text>
+<line x1="160" y1="150" x2="188" y2="150" class="ln ln-s3" marker-end="url(#a26)"/>
+<line x1="252" y1="150" x2="285" y2="150" class="ln ln-s2" marker-end="url(#a26)"/>
+<line x1="450" y1="150" x2="428" y2="150" class="ln ln-s3" marker-end="url(#a26)"/>
+<line x1="358" y1="150" x2="325" y2="150" class="ln ln-s2" marker-end="url(#a26)"/>
+<path d="M305,58 C305,20 65,20 65,38" class="ln ln-s2" fill="none" marker-end="url(#a26)"/>
+<path d="M65,192 C65,225 147,225 147,182" class="ln ln-s3" fill="none" marker-end="url(#a26)"/>
+<text x="185" y="18" class="t-xs t-s2">hot exhaust returns to the air handler</text>
+<text x="90" y="236" class="t-xs t-s3">cold supply (under floor or overhead)</text>
+<text x="600" y="100" class="t-xs">server intakes face</text>
+<text x="600" y="114" class="t-xs">cold aisles; exhausts</text>
+<text x="600" y="128" class="t-xs">face the hot aisle</text>
+</svg>
+<figcaption><b>Figure 2.6 — Hot-aisle/cold-aisle containment.</b> Cold air (green arrows) enters the fronts of the servers; hot air (orange) leaves the backs into an enclosed hot aisle and returns to the air handler. Without containment, hot air recirculates to the intakes and the whole hall must be cooled harder.</figcaption>
+</figure>
+
+<p>Air can be pushed further with <strong>rear-door heat exchangers</strong>, water-cooled coils mounted on the back of each rack that cool the exhaust before it enters the hall, handling perhaps 50–75 kW per rack. Beyond that, the heat must be captured at the chip. <strong>Direct-to-chip liquid cooling</strong> attaches a <em>cold plate</em>—a copper block with fine internal channels—to each GPU and CPU package, and pumps a coolant (usually water with additives) through it. Figure 2.7 traces the heat path in such a system. Inside the rack, manifolds distribute coolant to the cold plates of every tray; the warmed coolant returns to a <strong>coolant distribution unit</strong> (CDU), which contains pumps and a heat exchanger that transfers the heat to the facility's water loop while keeping the two loops separate. The facility loop carries the heat to the outside through cooling towers, dry coolers or chillers.</p>
+
+<figure class="diagram" id="fig-2-7">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="The heat path in a direct-to-chip liquid-cooled facility">
+<defs><marker id="a27" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="60" width="110" height="70" rx="8" class="bx2"/><text x="70" y="88" text-anchor="middle" class="t-xs t-b">GPU + cold plate</text><text x="70" y="104" text-anchor="middle" class="t-xs">≈ 1 kW each</text><text x="70" y="118" text-anchor="middle" class="t-xs">die ≤ ≈ 85–95 °C</text>
+<rect x="150" y="60" width="110" height="70" rx="8" class="bx4"/><text x="205" y="88" text-anchor="middle" class="t-xs t-b">rack manifolds</text><text x="205" y="104" text-anchor="middle" class="t-xs">≈ 130 kW per rack</text>
+<rect x="285" y="60" width="120" height="70" rx="8" class="bx"/><text x="345" y="84" text-anchor="middle" class="t-xs t-b">CDU</text><text x="345" y="100" text-anchor="middle" class="t-xs">pumps + liquid-to-</text><text x="345" y="114" text-anchor="middle" class="t-xs">liquid heat exchanger</text>
+<rect x="430" y="60" width="120" height="70" rx="8" class="bx3"/><text x="490" y="88" text-anchor="middle" class="t-xs t-b">facility water loop</text><text x="490" y="104" text-anchor="middle" class="t-xs">supply ≈ 25–40 °C</text>
+<rect x="575" y="60" width="130" height="70" rx="8" class="bx5"/><text x="640" y="84" text-anchor="middle" class="t-xs t-b">heat rejection</text><text x="640" y="100" text-anchor="middle" class="t-xs">dry cooler, tower,</text><text x="640" y="114" text-anchor="middle" class="t-xs">or chiller</text>
+<line x1="125" y1="95" x2="148" y2="95" class="ln ln-s2" marker-end="url(#a27)"/>
+<line x1="260" y1="95" x2="283" y2="95" class="ln ln-s2" marker-end="url(#a27)"/>
+<line x1="405" y1="95" x2="428" y2="95" class="ln ln-s2" marker-end="url(#a27)"/>
+<line x1="550" y1="95" x2="573" y2="95" class="ln ln-s2" marker-end="url(#a27)"/>
+<text x="20" y="35" class="t-sm t-b">Technology loop (rack, sealed)</text>
+<text x="432" y="35" class="t-sm t-b">Facility loop</text>
+<line x1="418" y1="25" x2="418" y2="140" class="ln" stroke-dasharray="4 4"/>
+<text x="20" y="165" class="t-xs">Warm-water designs return coolant at 40 °C or more, hot enough to reject heat to outside air with dry coolers for most</text>
+<text x="20" y="182" class="t-xs">of the year without compressor-based chillers, which lowers PUE and avoids evaporating water. Remaining air-cooled parts</text>
+<text x="20" y="199" class="t-xs">(power supplies, NICs, drives) still need some room air, typically 10–20% of the rack's heat.</text>
+</svg>
+<figcaption><b>Figure 2.7 — Liquid cooling's heat path.</b> The CDU separates a small, clean technology loop inside the racks from the large facility loop. Because water carries heat so well, the coolant can be warm, so outside air is usually cold enough to absorb it.</figcaption>
+</figure>
+
+<p>Figure 2.7 highlights the feature of liquid cooling that matters most for efficiency: the coolant can be warm. Chips tolerate die temperatures of 85–95 °C, and the thermal path from die to coolant through a cold plate is short, so coolant arriving at 30–40 °C still keeps them within limits. Water at that temperature can reject its heat to outside air on most days in most climates through dry coolers, without the vapour-compression chillers that dominate cooling energy in air-cooled facilities, and without evaporating water in cooling towers. The remaining air-cooled components in each rack still need a modest air-handling system. <strong>Immersion cooling</strong> goes one step further, submerging entire servers in a dielectric fluid that either stays liquid (single-phase) or boils at the chip surface (two-phase), capturing nearly all of the heat; it has been deployed at smaller scales but faces issues of fluid cost, serviceability and, for some two-phase fluids, environmental regulation.</p>
+<p>Liquid cooling also changes operations, which is why infrastructure interviews ask about it. A leak in a rack is a new failure mode with a large blast radius; coolant quality must be monitored; and a failure of a CDU or pump can force a rack to throttle or shut down within tens of seconds, because the thermal mass of a cold plate is small. The CDU and its pumps become part of the rack's failure domain (§1.2), and redundancy (N+1 pumps, dual CDUs) is designed into it. With heat removal understood, we can now ask how to measure the overhead of the whole facility.</p>
+
+<h2 id="s2-6">2.6 PUE and what it hides</h2>
+<p>Power usage effectiveness, defined in §1.6 as \(\text{PUE}=P_{\text{fac}}/P_{\text{IT}}\), was introduced by The Green Grid consortium in 2007 to give operators a simple measure of facility overhead. It succeeded spectacularly as a management target. Industry-average PUE, as surveyed by the Uptime Institute, fell from about 2.5 in 2007 to about 1.6 by the early 2020s, and has been nearly flat around 1.55–1.6 since, because many older facilities are hard to improve. The best hyperscale operators report fleet-wide annual PUEs of about 1.1: Google has reported a trailing twelve-month average near 1.09–1.10 across its fleet for several years.</p>
+<p>Where does the overhead go? In a conventional air-cooled facility at PUE 1.5, the extra 0.5 W per IT watt is mostly cooling—chillers, pumps, air handlers and cooling-tower fans—with a few percent for UPS and transformer losses and a little for lighting and offices. The levers that pushed PUE down are the ones we have met: containment and higher inlet temperatures (less chilling), "free cooling" with outside air or water when the climate allows, more efficient UPS designs, and, now, warm-water liquid cooling that removes compressor-based chilling for most of the year. Because cooling energy depends on the outside temperature, PUE varies by season and by site: the same design might run at 1.08 in a cold climate and 1.25 in a hot, humid one.</p>
+<p>PUE has three blind spots that an engineer should name in an interview. First, it measures overhead <em>relative to</em> IT power, so it says nothing about whether the IT power is used well. A hall full of idle GPUs can have an excellent PUE. Energy per token (§2.2) is the measure that captures usefulness. Second, the boundary of "IT" is a convention: the fans inside a server count as IT load, the fans in an air handler count as overhead. Moving from air to liquid cooling shifts power across that boundary, by removing server fans (lowering IT power) while adding pumps (overhead), so PUE comparisons across cooling technologies understate the gain; metrics such as total-usage effectiveness (TUE), which also counts power losses inside the IT equipment, were proposed to correct this. Third, PUE says nothing about water or carbon. Evaporative cooling towers achieve low PUE by evaporating water; the <strong>water usage effectiveness</strong>, WUE, in litres per kWh of IT energy, captures that cost, and some sites trade a slightly higher PUE for zero water use with dry coolers. Carbon depends on the electricity's source, whose intensity varies by more than a factor of ten between grids dominated by hydro or nuclear and those dominated by coal.</p>
+
+<details class="drill">
+<summary>Drill 2.2 — What is a point of PUE worth?</summary>
+<p>A 100 MW (facility) campus runs at PUE 1.4. A retrofit to warm-water liquid cooling would bring it to 1.15. How much IT power does the retrofit free, how many H100-class GPUs is that, and roughly what is the annual GPU-rental value of the extra capacity at $2.50 per GPU-hour?</p>
+<p><em>Solution.</em> IT power rises from \(100/1.4\approx71.4\) MW to \(100/1.15\approx87.0\) MW, a gain of about 15.6 MW. At 1.4 kW all-in per GPU (and noting that liquid cooling also removes some server fan power, so the real figure is slightly better), that is about 11,000 more GPUs. At $2.50 per GPU-hour they would rent for about \(11{,}000\times2.5\times8760\approx\$245\) million a year. The electricity saved at constant IT load would be worth only about \(0.25\times71.4\times8760\times\$0.08\approx\$12\) million a year. In a power-limited market the value of efficiency is the capacity it unlocks, twenty times its energy saving.</p>
+</details>
+
+<p>PUE and its relatives measure how efficiently a site uses its power. The harder question is how to get the power in the first place, and that question is answered not by engineers inside the building but by utilities, regulators and markets outside it.</p>
+
+<h2 id="s2-7">2.7 The grid, siting and power procurement</h2>
+<p>A large AI campus asks the grid for hundreds of megawatts to more than a gigawatt, comparable to a large city or a heavy industrial plant, and it wants that power within two or three years. Electricity systems were not built for load to grow this fast. Connecting a large new load requires the utility or grid operator to study its effect on the network, often to build new transmission lines and substations, and sometimes to procure new generation; in several US markets in 2024–2025 the expected wait for a large new connection stretched to several years. The constraint is not unique to the United States: Ireland's grid operator restricted new datacenter connections around Dublin in 2022, and several European and Asian markets have imposed similar limits.</p>
+<p>Operators responded with four strategies, each of which appears in interviews about capacity planning. The first is <strong>siting for power</strong>: choosing locations where large connections are available quickly, even at the cost of distance from users, which shifted new capacity towards regions with surplus generation, available transmission and cheaper land. The second is <strong>long-term power purchase</strong>: contracting directly with generators, including high-profile agreements in 2024 under which Microsoft would buy the output of a restarted Three Mile Island nuclear unit, Amazon would buy power and a campus adjacent to the Susquehanna nuclear plant, and Google would buy power from small modular reactors to be developed by Kairos Power. The third is <strong>behind-the-meter generation</strong>: building gas turbines, fuel cells or other generation on site to supply the campus directly, either as a bridge until a grid connection arrives or permanently; xAI's Memphis cluster, for example, initially relied on on-site gas turbines. The fourth is <strong>load flexibility</strong>: agreeing to reduce consumption during the grid's few hours of peak stress, in exchange for faster connection.</p>
+<p>The last strategy deserves a closer look because it ties the grid back to the workloads of this book. Grids are sized for their peak hours, which occur for only a small fraction of the year; a load that can curtail itself during those hours imposes far less need for new capacity than one that cannot. A 2025 study from Duke University estimated that the US grid could absorb about 76 GW of new load with no new capacity if those loads accepted curtailment for about 0.25% of their annual hours, and about 98 GW at 0.5%<span class="cite"><a href="#r-duke">[5]</a></span>. AI workloads differ in how easily they can curtail. Batch inference, evaluation and reinforcement-learning rollouts (Chapter 19) can pause or move to another region; training can slow by lowering power caps; interactive inference can shed low-priority traffic or shift to other regions (Chapter 12). Google announced demand-response agreements with US utilities in 2025 that would shift or reduce machine-learning workloads during grid peaks. Flexibility is thus a property of the workload that infrastructure can sell to the grid.</p>
+<p>Siting a facility involves weighing many factors at once. Power availability and price usually dominate for AI. Climate determines how many hours a year free cooling is possible. Water availability matters for evaporative cooling. Fibre routes and distance to users determine latency. Land, taxes, permitting time and the attitude of the local community determine cost and schedule. Data-residency laws (Chapter 12) may require capacity within a particular jurisdiction regardless of its power situation. Because these factors pull in different directions, a large provider ends up with a portfolio: a few very large campuses where power is plentiful, used for training and latency-tolerant serving, and many smaller sites near population centres and inside regulated jurisdictions, used for latency-sensitive and residency-bound serving.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — how far can inference move from its users?</div>
+<p>Light in optical fibre travels at about \(2\times10^{8}\) m/s, so a round trip over a fibre path of length \(\ell\) takes at least \(\ell/10^{5}\) seconds per kilometre—10 ms per 1,000 km—and real routes add perhaps 30–50% for indirect paths and equipment. A chat request with a TTFT target of 500 ms and a generation time of several seconds can absorb a 2,000 km detour (≈ 25–30 ms round trip) with little effect on user experience. A voice assistant with a 300 ms end-to-end budget, or an agent making forty sequential model calls (Chapter 17), cannot: the network delay is multiplied by the number of round trips. Formally, if a task makes \(n_{\text{rt}}\) sequential round trips over distance \(\ell\), the added latency is roughly \(n_{\text{rt}}\cdot\ell/10^{5}\) seconds, and the feasible distance for a latency budget \(b\) is \(\ell\le10^{5}b/n_{\text{rt}}\). Interactive workloads with few round trips can follow the power; real-time and multi-step workloads must stay near their users.</p>
+</div>
+
+<h2 id="s2-8">2.8 Training facilities and inference facilities</h2>
+<p>Training and inference now drive most AI datacenter construction, and they want different things from a building. It helps to compare them directly, because many capacity decisions—where to put a fleet, how much redundancy to buy, whether to oversubscribe—follow from the differences.</p>
+<p>A frontier <strong>training</strong> cluster wants to be as large and as tightly connected as possible, because a single job spans tens of thousands of GPUs that communicate every step (Vol. I Chapter 17). That favours one huge contiguous facility, located wherever the most power can be obtained soonest. The job checkpoints its state and tolerates occasional interruptions, so the facility can use less electrical redundancy. Its load is synchronised, so its power swings by tens of megawatts in seconds, which the facility must buffer with energy storage, power-smoothing features in the hardware, or agreements with the grid, and it cannot be oversubscribed (§2.4). Its location is set by power, not by users.</p>
+<p>An <strong>inference</strong> fleet is a population of independent replicas, each of one to a few dozen GPUs, serving uncorrelated requests. It can be spread across many sites, which improves reliability and lets it be placed near users and inside jurisdictions. It must be highly available, so it keeps redundancy on its critical path or achieves it geographically. Its power is statistically smooth and can be oversubscribed, especially with workload-aware capping. Its demand follows the clock, so it has troughs that can be filled with batch work or offered to the grid as flexibility. And because chat-style interactions tolerate tens of milliseconds of network delay, a substantial part of inference can be placed in the same power-rich locations as training—sometimes in the same buildings, sharing capacity across the day.</p>
+<p>The trend through 2025–2026 has been for these two kinds of facility to converge, for an economic reason: the same accelerators serve both, and a provider that can move capacity between training and inference as demand changes uses its scarce GPUs and megawatts better. That convergence places new demands on the software that schedules work onto the hardware, which Part II takes up. But first we need to know what the hardware looks like as a product one can rent, because most AI capacity is consumed not as buildings but as instances.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We now know where a server's power goes, how many joules a token costs, why racks reached 130 kW, how power is delivered, made redundant and oversubscribed, how heat is removed, and why the grid has become the constraint on growth. Throughout, we treated the accelerator as a given H100 or B200. In practice, a team rarely buys a building; it rents capacity from a cloud, in the form of instances with particular GPUs, memory, networks and prices, and it must choose among H100, H200, B200, GB200, TPUs, Trainium and AMD's MI300X and MI355X, sometimes sharing a single GPU among several workloads. How do these products differ, how can a GPU be safely divided, and how should a team choose hardware for a given model and latency target? Chapter 3 answers these questions.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>An eight-GPU H100 server is specified at about 10.2 kW; GPUs are about 55% of it, and the all-in IT power per GPU is about 1.4 kW, twice the GPU's 700 W TDP. Typical serving draw is 6–8 kW.</li>
+<li>Dynamic power is \(a_{\text{act}}C_{\text{sw}}V^2f_{\text{clk}}\propto f_{\text{clk}}^3\); memory-bound decode loses almost no throughput when power-capped, so capping decode pools adds capacity in a power-limited hall.</li>
+<li>Energy per token \(e_{\text{tok}}=n_gP_{\text{gpu}}/\Phi\): about 1.9 J per decode token for Llama 3 70B on eight H100s, 0.16 J for Llama 3 8B, and roughly an eighth of that per prefill token; a 70B request uses about 0.35 Wh at the meter.</li>
+<li>Batching lowers energy per token roughly as \(1/B\) until KV reads dominate; long contexts set a floor that only smaller KV caches lower.</li>
+<li>Rack power rose from about 14 kW (V100) to about 41 kW (H100) to 120–140 kW (GB200/GB300 NVL72), driven by GPU power and the reach of copper NVLink; air cooling tops out around 30–40 kW.</li>
+<li>Power passes through substation, transformers, UPS, PDUs and PSUs with about 11% total loss; redundancy is N, N+1 or 2N; Uptime tiers range from about 99.67% to 99.995%.</li>
+<li>Oversubscription (Proposition 2.1) lets uncorrelated inference servers be provisioned near their mean draw; correlated training loads (\(\rho_P\to1\)) need nearly nameplate; power capping is the safety net.</li>
+<li>Heat removal: \(P_{\text{heat}}=\dot m c_p\Delta\vartheta\); water carries about 3,500 times more heat per volume than air; direct-to-chip liquid cooling with warm water enables chiller-free heat rejection.</li>
+<li>PUE fell from about 2.5 (2007) to about 1.6 industry-wide and 1.1 at hyperscalers; it ignores IT usefulness, the fan boundary, water (WUE) and carbon.</li>
+<li>The grid is the scarcest input: operators site for power, sign long-term and nuclear purchase agreements, build on-site generation, and offer load flexibility; batch and rollout work make AI loads flexible.</li>
+<li>Training facilities want one huge, synchronised, power-sited cluster; inference fleets are distributed, redundant, oversubscribable and partly placeable near power because chat tolerates tens of milliseconds of network delay.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci02-mcq-01" data-topic="§2.1 Server power">
+<p class="q">Roughly what fraction of an eight-GPU H100 server's specified maximum power is drawn by the GPUs?</p>
+<ol class="opts"><li>About 20%</li><li data-correct>About 55%</li><li>About 90%</li><li>100%</li></ol>
+<div class="explain">5.6 kW of about 10.2 kW; CPUs, memory, NVSwitch, NICs, fans and PSU losses make up the rest.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-02" data-topic="§2.1 Server power">
+<p class="q">Why is "an H100 uses 700 W" a poor basis for facility planning?</p>
+<ol class="opts"><li>H100s use 300 W</li><li data-correct>The all-in power per GPU, including its share of server, network and storage, is about twice that</li><li>GPUs never reach TDP</li><li>Facilities are sized by floor area</li></ol>
+<div class="explain">About 1.4 kW per GPU all-in.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-03" data-topic="§2.1 Server power">
+<p class="q">Under the approximation \(V\propto f\), lowering the clock by 10% lowers dynamic power by about:</p>
+<ol class="opts"><li>10%</li><li>19%</li><li data-correct>27%</li><li>50%</li></ol>
+<div class="explain">\(0.9^3\approx0.73\).</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-04" data-topic="§2.1 Server power">
+<p class="q">Why does power capping hurt memory-bound decode much less than compute-bound prefill?</p>
+<ol class="opts"><li>Decode uses no power</li><li data-correct>The SM clock does not set HBM bandwidth, which is decode's bottleneck</li><li>Caps only apply to prefill</li><li>Decode runs on the CPU</li></ol>
+<div class="explain">Slower tensor cores still finish before the memory reads do.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-05" data-topic="§2.1 Server power">
+<p class="q">Which component's power rises with the cube of its speed and is a large item in air-cooled GPU servers?</p>
+<ol class="opts"><li>NVMe drives</li><li data-correct>Fans</li><li>NICs</li><li>DRAM</li></ol>
+<div class="explain">Fan affinity laws: power \(\propto\) speed³.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-06" data-topic="§2.2 Energy per token">
+<p class="q">A replica of 8 GPUs at 1.4 kW each produces 6,000 tokens/s. Its IT energy per token is about:</p>
+<ol class="opts"><li>0.19 J</li><li data-correct>1.9 J</li><li>19 J</li><li>0.02 J</li></ol>
+<div class="explain">\(8\times1400/6000\approx1.87\) J.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-07" data-topic="§2.2 Energy per token">
+<p class="q">Why is a prefill token much cheaper in energy than a decode token for the same model?</p>
+<ol class="opts"><li>Prefill skips attention</li><li data-correct>Prefill is compute-bound and shares each weight read across thousands of tokens</li><li>Prefill runs at lower precision always</li><li>Prefill tokens are smaller</li></ol>
+<div class="explain">Decode at moderate batch is memory-bound, so weight and KV reads dominate its energy.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-08" data-topic="§2.2 Energy per token">
+<p class="q">In Figure 2.2, why does energy per token flatten at large batch for long contexts?</p>
+<ol class="opts"><li>The GPU overheats</li><li data-correct>KV-cache reads grow with the batch and dominate the step time</li><li>Weights grow with batch</li><li>Batches above 64 are not allowed</li></ol>
+<div class="explain">Only smaller KV caches (GQA, MLA, KV quantisation, sparsity) lower the floor.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-09" data-topic="§2.2 Energy per token">
+<p class="q">Which of these reduce energy per token? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Larger decode batches</li><li data-correct>FP8 or FP4 weights</li><li data-correct>Speculative decoding that raises tokens per step</li><li>Running at low utilisation for lower latency</li></ol>
+<div class="explain">Any throughput gain at fixed power lowers \(e_{\text{tok}}\); low utilisation raises it.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-10" data-topic="§2.2 Energy per token">
+<p class="q">Google reported the median Gemini Apps text prompt in 2025 used roughly:</p>
+<ol class="opts"><li>0.0024 Wh</li><li data-correct>0.24 Wh</li><li>24 Wh</li><li>2.4 kWh</li></ol>
+<div class="explain">Including idle capacity and datacenter overhead.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-11" data-topic="§2.3 Density">
+<p class="q">The main reason GB200 NVL72 places 72 GPUs in one rack is:</p>
+<ol class="opts"><li>To save floor space</li><li data-correct>Copper NVLink reaches only about a metre or two, and a large NVLink domain is valuable</li><li>Air cooling requires it</li><li>Racks are cheaper than servers</li></ol>
+<div class="explain">The rack becomes one scale-up computer of about 120–140 kW.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-12" data-topic="§2.3 Density">
+<p class="q">Approximately what rack power can air cooling practically handle?</p>
+<ol class="opts"><li>3–5 kW</li><li data-correct>30–40 kW</li><li>130 kW</li><li>600 kW</li></ol>
+<div class="explain">Rear-door heat exchangers push this to perhaps 50–75 kW.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-13" data-topic="§2.3 Density">
+<p class="q">A 20 MW hall at 130 kW per rack needs about how many rack positions?</p>
+<ol class="opts"><li>15</li><li data-correct>150</li><li>1,500</li><li>15,000</li></ol>
+<div class="explain">\(20{,}000/130\approx154\).</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-14" data-topic="§2.4 Power delivery">
+<p class="q">Why does higher-voltage distribution reduce losses?</p>
+<ol class="opts"><li>Voltage has no effect</li><li data-correct>Resistive losses scale as \(I^2R\), and higher voltage carries the same power at lower current</li><li>Higher voltage cools cables</li><li>Transformers are removed entirely</li></ol>
+<div class="explain">Hence 415 V AC, 48 V DC racks and announced 800 V DC designs.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-15" data-topic="§2.4 Power delivery">
+<p class="q">What bridges the gap between a utility failure and generators coming online?</p>
+<ol class="opts"><li>Server PSUs</li><li data-correct>The UPS (batteries or other storage)</li><li>The CDU</li><li>The PDU</li></ol>
+<div class="explain">Generators take on the order of 10–15 s to start and stabilise.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-16" data-topic="§2.4 Power delivery">
+<p class="q">A 2N power design means:</p>
+<ol class="opts"><li>Two spare generators</li><li data-correct>Two fully independent paths, each able to carry the full load</li><li>Twice the IT load</li><li>Two racks per server</li></ol>
+<div class="explain">Typically A and B feeds to every rack.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-17" data-topic="§2.4 Power delivery">
+<p class="q">Uptime Tier IV corresponds to roughly how much downtime per year?</p>
+<ol class="opts"><li>29 hours</li><li>22 hours</li><li>1.6 hours</li><li data-correct>26 minutes</li></ol>
+<div class="explain">99.995% availability.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-18" data-topic="§2.4 Oversubscription">
+<p class="q">By Proposition 2.1, with independent servers the per-server headroom above the mean shrinks as:</p>
+<ol class="opts"><li>\(1/n\)</li><li data-correct>\(1/\sqrt n\)</li><li>A constant</li><li>\(\sqrt n\)</li></ol>
+<div class="explain">\(z_\epsilon\sigma_P\sqrt n/n\).</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-19" data-topic="§2.4 Oversubscription">
+<p class="q">Why can synchronous training clusters not be oversubscribed in the same way as inference fleets?</p>
+<ol class="opts"><li>Training uses less power</li><li data-correct>Their power draws are strongly correlated, so headroom does not shrink with scale</li><li>Training has no peak</li><li>Training runs on CPUs</li></ol>
+<div class="explain">With \(\rho_P\to1\), per-server provisioned power tends to \(\mu_P+z_\epsilon\sigma_P\).</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-20" data-topic="§2.4 Oversubscription">
+<p class="q">What is the role of a power-capping system in an oversubscribed facility?</p>
+<ol class="opts"><li>To raise clocks during peaks</li><li data-correct>To lower selected servers' caps when aggregate draw nears a breaker limit</li><li>To turn off cooling</li><li>To bill customers</li></ol>
+<div class="explain">It is the safety net that makes an aggressive \(\epsilon\) acceptable; decode replicas are capped first.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-21" data-topic="§2.5 Cooling">
+<p class="q">Per unit volume and kelvin, water carries roughly how much more heat than air?</p>
+<ol class="opts"><li>4×</li><li>40×</li><li data-correct>3,500×</li><li>1,000,000×</li></ol>
+<div class="explain">About 4.2 MJ/(m³·K) against about 1.2 kJ/(m³·K).</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-22" data-topic="§2.5 Cooling">
+<p class="q">To remove 130 kW with water warming by 10 K needs roughly:</p>
+<ol class="opts"><li>0.3 L/s</li><li data-correct>3 L/s</li><li>30 L/s</li><li>300 L/s</li></ol>
+<div class="explain">\(130{,}000/(4186\times10)\approx3.1\) kg/s.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-23" data-topic="§2.5 Cooling">
+<p class="q">What does a coolant distribution unit (CDU) do?</p>
+<ol class="opts"><li>Converts AC to DC</li><li data-correct>Pumps the rack's coolant and transfers its heat to the facility loop through a heat exchanger</li><li>Stores backup power</li><li>Routes network traffic</li></ol>
+<div class="explain">It keeps the clean technology loop separate from the facility water.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-24" data-topic="§2.5 Cooling">
+<p class="q">Why is warm-water liquid cooling good for PUE?</p>
+<ol class="opts"><li>Warm water is cheaper</li><li data-correct>Coolant at 30–40 °C+ can reject heat to outside air without compressor-based chillers for most of the year</li><li>It heats the offices</li><li>It removes the need for pumps</li></ol>
+<div class="explain">Chillers dominate cooling energy in conventional designs.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-25" data-topic="§2.5 Cooling">
+<p class="q">What does hot-aisle containment prevent?</p>
+<ol class="opts"><li>Power failures</li><li data-correct>Hot exhaust recirculating to server intakes</li><li>Water leaks</li><li>Network congestion</li></ol>
+<div class="explain">Recirculation raises inlet temperatures and forces harder cooling.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-26" data-topic="§2.6 PUE">
+<p class="q">Which are blind spots of PUE? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Whether IT power is used productively</li><li data-correct>Server fans count as IT load, so cooling changes shift power across the boundary</li><li data-correct>Water and carbon</li><li>Facility overhead relative to IT load</li></ol>
+<div class="explain">Overhead relative to IT load is exactly what PUE measures.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-27" data-topic="§2.6 PUE">
+<p class="q">Moving from PUE 1.4 to 1.15 in a 100 MW (facility) campus frees about how much IT power?</p>
+<ol class="opts"><li>2.5 MW</li><li data-correct>15.6 MW</li><li>25 MW</li><li>40 MW</li></ol>
+<div class="explain">\(100/1.15-100/1.4\approx87.0-71.4\).</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-28" data-topic="§2.7 Grid">
+<p class="q">Which strategies have AI operators used to obtain power faster? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Siting where large connections are available</li><li data-correct>Long-term power purchase agreements, including nuclear</li><li data-correct>On-site (behind-the-meter) generation</li><li data-correct>Agreeing to curtail load during grid peaks</li></ol>
+<div class="explain">All four have been used; flexibility is increasingly offered in exchange for faster connection.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-29" data-topic="§2.7 Grid">
+<p class="q">Which AI workloads can most easily curtail during grid peaks?</p>
+<ol class="opts"><li>Real-time voice assistants</li><li data-correct>Batch inference, evaluation and RL rollouts</li><li>Interactive code completion</li><li>Payment fraud scoring</li></ol>
+<div class="explain">Deferrable work can pause or move region.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-30" data-topic="§2.7 Grid">
+<p class="q">A task makes 40 sequential round trips; the latency budget for network delay is 200 ms. Ignoring route inflation, the farthest it can be served is about:</p>
+<ol class="opts"><li>50 km</li><li data-correct>500 km</li><li>5,000 km</li><li>50,000 km</li></ol>
+<div class="explain">\(\ell\le10^5\times0.2/40=500\) km.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-31" data-topic="§2.8 Training vs inference">
+<p class="q">Which properties describe inference fleets better than training clusters? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Statistically smooth power that can be oversubscribed</li><li data-correct>Can be spread over many sites</li><li>Requires one contiguous 100,000-GPU network</li><li data-correct>Has daily troughs that can be filled with deferrable work</li></ol>
+<div class="explain">A single huge synchronous network is a training requirement.</div>
+</div>
+
+<div class="mcq" data-id="ci02-mcq-32" data-topic="§2.4 Power delivery">
+<p class="q">Why might a training-only facility be built with less electrical redundancy than an inference facility?</p>
+<ol class="opts"><li>Training GPUs never fail</li><li data-correct>Training jobs checkpoint and can restart after an interruption, while inference serves users in real time</li><li>Training uses DC power</li><li>Regulations require it</li></ol>
+<div class="explain">Inference can also get its redundancy geographically, across zones and regions.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci02-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Where does the power of an eight-GPU H100 server go?</summary>
+<div class="answer">
+<p>The specified maximum is about 10.2 kW. Eight GPUs at 700 W are 5.6 kW. Two CPUs and 1–2 TB of DRAM add about 1 kW. NVSwitches, about ten NICs and NVMe drives add a few hundred watts. Fans at full speed can exceed a kilowatt in an air-cooled chassis. PSUs lose 3–6% converting AC to DC. There is vendor margin on top. In practice decode-heavy serving draws 6–8 kW. For a fleet, use about 1.4 kW per GPU all-in, including network and storage.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Define PUE and WUE. What is a good PUE today?</summary>
+<div class="answer">
+<p>PUE = total facility power / IT power. WUE = litres of water consumed per kWh of IT energy. Industry average is about 1.55–1.6; leading hyperscalers report about 1.1 fleet-wide; liquid-cooled AI halls in good climates reach 1.1–1.2. PUE varies with season and climate, ignores whether IT power does useful work, depends on where the IT boundary is drawn (server fans), and ignores water and carbon. Some sites trade slightly higher PUE for zero water use with dry coolers.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-03">
+<summary><span class="lvl warm">Warm-up</span> Why do GB200-class racks require liquid cooling?</summary>
+<div class="answer">
+<p>At 120–140 kW per rack, air would need several cubic metres per second through one rack (\(P=\dot mc_p\Delta\vartheta\) with air's low density and heat capacity), with impractical fan power and velocities, and the chip-level heat flux is too concentrated for air. Water carries about 3,500 times more heat per volume, so about 3 L/s at a 10 K rise removes 130 kW. Direct-to-chip cold plates on GPUs and CPUs feed rack manifolds and a CDU, which transfers heat to the facility loop. Air cooling practically tops out around 30–40 kW per rack.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-04">
+<summary><span class="lvl core">Core</span> Compute the energy per output token and per request for Llama 3 70B on eight H100s, and say what would lower it.</summary>
+<div class="answer">
+<p>At about 1.4 kW per GPU all-in and 6,000 decode tokens/s per TP8 replica: \(8\times1400/6000\approx1.9\) J per output token; at PUE 1.3, about 2.4 J. Prefill at about 800 TFLOP/s FP8 per GPU and \(2N\approx1.4\times10^{11}\) FLOPs per token: about 5,700 tokens/s per GPU, 0.25 J per token. A request with 800 uncached input and 400 output tokens: about 960 J IT, 0.35 Wh at the meter. Lower it by raising throughput at the same power (larger batches, FP4/FP8, GQA/MLA and KV quantisation for long contexts, speculative decoding, better kernels, newer hardware with more bandwidth per watt), by lowering power at the same throughput (capping decode GPUs), by improving cache hits (less prefill), and by keeping utilisation high (idle capacity still draws power).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-05">
+<summary><span class="lvl core">Core</span> Explain why power capping can add capacity to an inference hall without losing throughput.</summary>
+<div class="answer">
+<p>Dynamic power is \(a_{\text{act}}C_{\text{sw}}V^2f\), roughly \(\propto f^3\). Decode at practical batch sizes is memory-bound: in a step, the tensor cores finish their FLOPs well before the HBM reads complete (e.g. 1.7 ms of compute vs 9.4 ms of memory for Llama 3 8B at batch 128). Lowering the clock lengthens only the hidden compute time, not the step. A cap from 700 W to 500 W may cost nothing in throughput while reducing provisioned power per server by more than 1.5 kW; in a fixed electrical envelope that admits about 18% more servers. Apply caps to decode pools, not prefill or training; back them with dynamic capping that tightens when aggregate power approaches breaker limits; validate with measurements since kernels with high arithmetic intensity (large-batch MoE, long prefill chunks) do lose throughput.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-06">
+<summary><span class="lvl core">Core</span> Derive how much power to provision for a hall of servers, and explain when oversubscription fails.</summary>
+<div class="answer">
+<p>With \(n\) servers of mean draw \(\mu_P\), s.d. \(\sigma_P\) and pairwise correlation \(\rho_P\), the total has variance \(n\sigma_P^2(1+(n-1)\rho_P)\); provisioning \(n\mu_P+z_\epsilon\sqrt{\operatorname{Var}}\) is exceeded with probability \(\epsilon\) under a normal approximation. Independent servers need per-server headroom shrinking as \(1/\sqrt n\): 1,000 servers at mean 7 kW, s.d. 1.2 kW need about 7.14 kW each against a 10.2 kW nameplate, about 40% more servers. Correlation sets a floor \(z_\epsilon\sigma_P\sqrt{\rho_P}\) that scale cannot remove: synchronous training (\(\rho_P\approx1\)) needs nearly nameplate. Failure modes: correlated events in inference (global traffic spikes, a rollout that changes the workload everywhere, a failover that shifts load), so a fast power-capping system must back the design.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-07">
+<summary><span class="lvl core">Core</span> Your company wants to put GB200 NVL72 racks into an existing 10 kW-per-rack colocation hall. What problems do you raise?</summary>
+<div class="answer">
+<p>Power: each rack needs about 130 kW, so the hall's distribution (busways, PDUs, breakers) cannot feed it at existing positions; total hall power limits how many racks fit, leaving most positions empty. Cooling: the racks are liquid-cooled; the hall needs CDUs and a facility water loop or liquid-to-air sidecars whose heat goes into a room designed for 10 kW per position, which may overload air handlers. Structure: racks weigh over a tonne and need floor loading checks. Redundancy and failure domains: CDUs, pumps and leaks become new failure modes; the rack's 72 GPUs are a single blast radius. Network: rack-scale systems need new cabling and back-end fabric. Timeline and cost of retrofit vs leasing space in a purpose-built liquid-cooled facility. Conclusion: usually a few racks at most, or move to a new facility.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-08">
+<summary><span class="lvl core">Core</span> Explain N, N+1 and 2N redundancy, and how you would choose for an inference fleet.</summary>
+<div class="answer">
+<p>N: exactly enough units; any failure reduces capacity. N+1: one spare; tolerates any single unit failure. 2N: two independent full-capacity paths (A/B feeds); tolerates failure or maintenance of a whole path. Cost rises from N to 2N. For inference, choose based on the cost of losing a facility versus losing it elsewhere: if the service is spread across zones and regions with enough spare capacity to absorb a facility outage (geographic redundancy), N+1 within each facility may suffice; for a fleet concentrated in one site, or for stateful/residency-bound serving that cannot move, 2N on the critical path is justified. Also consider maintenance: concurrently maintainable designs (Tier III) avoid planned downtime.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Why does the fan boundary make PUE misleading when comparing air and liquid cooling?</summary>
+<div class="answer">
+<p>PUE divides facility power by IT power, and server fans are counted as IT. Converting from air to liquid removes most server fan power (which can be 10–15% of an air-cooled GPU server at full load), lowering the denominator, while adding CDU pumps to the numerator's overhead. The facility may use substantially less total energy, but PUE improves by less than the total saving, or can even look worse if chillers were already efficient. Metrics such as ITUE and TUE (total-usage effectiveness = PUE × ITUE) account for energy lost inside IT equipment (fans, PSUs, voltage regulators), giving a fair comparison. The best comparison is total facility energy per unit of useful work—joules per token.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Training clusters produce power swings of tens of megawatts. Why, and what can be done?</summary>
+<div class="answer">
+<p>Synchronous data-parallel and model-parallel training alternates between compute phases (GPUs near TDP) and communication or synchronisation phases (GPUs idle-ish), and all GPUs do this in lockstep, so the cluster's power rises and falls together, at timescales of hundreds of milliseconds to seconds; a checkpoint or a failure that stalls the job drops load abruptly. On a 100 MW cluster this is a large, fast load step that can disturb the grid and stress generators and UPS. Mitigations: on-site energy storage (batteries, supercapacitors) to buffer steps; hardware power-smoothing features that ramp power gradually or burn power during idle phases; software that inserts dummy work or staggers phases; agreements with the utility; and power capping. Inference fleets largely avoid this because their loads are uncorrelated.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-11">
+<summary><span class="lvl deep">Deep-dive</span> How does hardware generation change energy per token, and when is upgrading worth it in a power-limited site?</summary>
+<div class="answer">
+<p>Newer accelerators draw more per device (H100 700 W, B200 about 1 kW, B300 about 1.2 kW) but deliver more per watt: B200 has 2.4× the HBM bandwidth (8 vs 3.35 TB/s) and FP4 support, so memory-bound decode throughput per replica may rise 2–3× at about 1.4× the power per GPU, roughly 40% less energy per token. In a power-limited site, capacity scales with tokens per joule, so replacing H100s with B200s raises tokens per day from the same megawatts by perhaps 1.7×. Upgrading is worth it when the value of extra capacity (or the cost of not having it) exceeds the depreciation lost by retiring older hardware early plus the new hardware's cost; older hardware can be redeployed to unconstrained sites or to batch work. Also consider cooling: Blackwell parts may require liquid cooling the site lacks.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-12">
+<summary><span class="lvl deep">Deep-dive</span> Can inference be served from a power-rich site 2,000 km from users? Answer quantitatively.</summary>
+<div class="answer">
+<p>Fibre propagation is about \(2\times10^8\) m/s, so a 2,000 km path is at least 20 ms round trip, realistically 25–35 ms. For chat, TTFT budgets are hundreds of milliseconds and generation lasts seconds, so 30 ms is negligible: yes. For voice with a 300 ms end-to-end budget, 30 ms is 10% and may be acceptable, but tighter real-time systems struggle. For agents or pipelines with \(n_{\text{rt}}\) sequential round trips between the user-side system and the model, latency adds \(n_{\text{rt}}\times30\) ms: forty round trips add 1.2 s, which may be unacceptable—co-locate the orchestrator with the model rather than with the user. Also check data residency (Chapter 12), egress costs and failure-domain diversity. Conclusion: much of inference can follow power, but real-time and many-round-trip workloads stay near users.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-13">
+<summary><span class="lvl design">Design</span> You have a 50 MW grid connection for a new inference site. Walk through how you would plan its capacity.</summary>
+<div class="answer">
+<p>Facility to IT: choose cooling (warm-water liquid for Blackwell-class, target PUE about 1.15–1.2): IT about 42–43 MW. Choose hardware by tokens per joule for the target models and availability: e.g. GB200/B200 at about 2 kW all-in per GPU gives about 21,000 GPUs; H100 at 1.4 kW about 30,000. Decide oversubscription: inference loads are uncorrelated, so provision near measured P99.99 draw with power capping as a safety net, perhaps 20–30% more servers than nameplate allows; cap decode pools first. Redundancy: N+1 on UPS and cooling, geographic redundancy across sites for full outages. Network and storage power (≈10%). Convert GPUs to tokens per day with measured per-replica throughput and expected utilisation; compare with demand forecasts and plan phased build-out. Also plan for flexibility: offer curtailment of batch work to the utility, which may speed interconnection.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-14">
+<summary><span class="lvl design">Design</span> Leadership asks you to cut the energy per token of the inference fleet by 30% within a year. What do you do?</summary>
+<div class="answer">
+<p>Measure first: per-replica power (DCGM), throughput and utilisation by model and tier, giving joules per token per pool; identify idle energy. Levers by size: (1) utilisation—consolidate under-used replicas, better autoscaling, fill troughs with batch work, shut down idle GPUs or lower their clocks: often the largest gain; (2) throughput—FP8/FP4 quantisation, larger decode batches with paged KV, speculative decoding, prefix caching to cut prefill, newer engine versions, disaggregation; (3) power—cap decode pools; (4) hardware—move high-volume models to newer generations with better tokens per joule, push older GPUs to batch; (5) facility—PUE improvements where feasible. Track joules per token (and per request) on dashboards and in model launch reviews, since reasoning modes and longer contexts can silently reverse gains.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-15">
+<summary><span class="lvl core">Core</span> Why is load flexibility valuable to a grid, and which AI workloads can provide it?</summary>
+<div class="answer">
+<p>Grids are sized for a small number of peak hours; a load that curtails during those hours needs far less new generation and transmission. A 2025 Duke study estimated about 76 GW of new US load could connect with no new capacity if it curtailed about 0.25% of its hours. AI workloads that can curtail: batch inference, embeddings backfills, evaluation sweeps and RL rollouts (pause or move region); training (lower power caps, slow steps, checkpoint and pause); interactive inference (shed low-priority tiers, shift traffic to other regions, lower power caps on decode). Flexibility can be traded for faster interconnection, which is often worth more than any energy saving.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci02-qa-16">
+<summary><span class="lvl deep">Deep-dive</span> What new failure modes does liquid cooling introduce, and how do you design for them?</summary>
+<div class="answer">
+<p>Leaks (damage to equipment, large blast radius), pump or CDU failure (cold plates have little thermal mass, so GPUs throttle or shut down within tens of seconds), coolant contamination or corrosion (clogged microchannels), air in loops, and quick-disconnect failures during servicing. Design: N+1 pumps and dual CDUs per row, leak detection with automatic isolation valves, coolant quality monitoring, thermal-throttling policies and fast health signals to the scheduler so affected replicas drain gracefully, spare capacity in other racks to absorb a rack loss, and maintenance procedures. In the software stack, treat a CDU as a failure domain covering all racks it serves when spreading replicas.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-polca">P. Patel et al. Characterizing Power Management Opportunities for LLMs in the Cloud (POLCA). <em>ASPLOS</em>, 2024. <a href="https://arxiv.org/abs/2308.12908">arXiv:2308.12908</a>.</li>
+<li id="r-google-energy">C. Elsworth et al. Measuring the Environmental Impact of Delivering AI at Google Scale. 2025. <a href="https://arxiv.org/abs/2508.15734">arXiv:2508.15734</a>.</li>
+<li id="r-fan">X. Fan, W.-D. Weber, L. A. Barroso. Power Provisioning for a Warehouse-sized Computer. <em>ISCA</em>, 2007.</li>
+<li id="r-llama3">A. Grattafiori et al. The Llama 3 Herd of Models. 2024. <a href="https://arxiv.org/abs/2407.21783">arXiv:2407.21783</a>.</li>
+<li id="r-duke">T. H. Norris, T. Profeta, D. Patiño-Echeverri, A. Cowie-Haskell. Rethinking Load Growth: Assessing the Potential for Integration of Large Flexible Loads in US Power Systems. Nicholas Institute for Energy, Environment &amp; Sustainability, Duke University, 2025.</li>
+<li>A. Shehabi et al. <em>2024 United States Data Center Energy Usage Report</em>. Lawrence Berkeley National Laboratory, 2024.</li>
+<li>Q. Wu et al. Dynamo: Facebook's Data Center-Wide Power Management System. <em>ISCA</em>, 2016.</li>
+<li>J. Stojkovic et al. DynamoLLM: Designing LLM Inference Clusters for Performance and Energy Efficiency. <em>HPCA</em>, 2025. <a href="https://arxiv.org/abs/2408.00741">arXiv:2408.00741</a>.</li>
+<li>J.-W. Chung et al. Reducing Energy Bloat in Large Model Training (Perseus). <em>SOSP</em>, 2024. <a href="https://arxiv.org/abs/2312.06902">arXiv:2312.06902</a>.</li>
+<li>The Green Grid. PUE: A Comprehensive Examination of the Metric. White Paper 49, 2012.</li>
+<li>ASHRAE TC 9.9. <em>Thermal Guidelines for Data Processing Environments</em>, 5th ed., 2021.</li>
+<li>L. A. Barroso, U. Hölzle, P. Ranganathan. <em>The Datacenter as a Computer</em>, 3rd ed. Morgan &amp; Claypool, 2018.</li>
+<li>D. Patterson et al. Carbon Emissions and Large Neural Network Training. 2021. <a href="https://arxiv.org/abs/2104.10350">arXiv:2104.10350</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

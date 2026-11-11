@@ -303,8 +303,8 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 ## Volume II writing status
 | Ch | Title | Status |
 |---|---|---|
-| 1 | Why Serving Became a Cloud Problem | ⏳ |
-| 2 | The AI Datacenter: Power, Cooling and Space | ⏳ |
+| 1 | Why Serving Became a Cloud Problem | ✅ v1 |
+| 2 | The AI Datacenter: Power, Cooling and Space | ✅ v1 |
 | 3 | Accelerators as Cloud Products | ⏳ |
 | 4 | Datacenter Networks for AI | ⏳ |
 | 5 | Storage, Weights and Cold Starts | ⏳ |
