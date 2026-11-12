@@ -75,3 +75,12 @@ Renumbering rules: only displayed numbers change. File names (`chNN.html`), ques
 - Ch 25 (Reinforcement Learning with Verifiable Rewards) written: verifiable rewards and verifier costs, the informative-group probability \(1-p_s^{n_s}-(1-p_s)^{n_s}\), GRPO derived with its exact relation to RLOO, the arcsine-square-root objective implied by standard-deviation normalisation, Dr. GRPO and DAPO, entropy collapse, outcome vs process rewards, what RLVR teaches (R1-Zero, pass@k, distillation), and rollout systems with a worked 64-GPU step budget. Self-checks corrected one comparison in the arcsine box (1%→2% matches 50%→54%, not 57%), a PPO cost figure in a model answer, and a label collision in Figure 25.5.
 - Ch 26 (Reasoning Models) now opens by placing itself after the three training chapters, and §26.7 refers back to §25.3 and §25.7 instead of introducing GRPO from scratch.
 - Book totals after Review 5: 30 chapters in 9 parts, about 290,000 words, 131 SVG diagrams, 71 charts, 985 MCQs, 491 interview questions.
+
+## Review 6 — Volume II, Cloud AI Infrastructure, first version (2026-11-12)
+
+A companion volume was written in `docs/cloud/` (files `ci01.html`–`ci20.html`, question ids `ciNN-…`), covering what Volume I leaves open: the datacentre, accelerator instances, networks, storage and cold starts, Kubernetes and scheduling, serving platforms, capacity and economics, gateways, multi-region serving, reliability, security, and in Part V the workload gaps of Volume I (multimodal, retrieval, agents, guardrails, batch and rollouts), ending with a design-interview chapter.
+
+- Totals: 20 chapters in 6 parts, about 175,000 words including questions, 81 SVG diagrams, 42 charts, 623 MCQs, 320 interview questions. Every page passes the Playwright checks at 1280 px and 390 px.
+- Known shortfall against CLAUDE.md §4: chapters are about 6,500–10,000 words, so several (notably Ch 15 and Ch 17–20) are below the 9,000-word floor. They need a lengthening pass: a third worked example each and fuller treatment of the shorter sections.
+- Not independently fact-checked: figures quoted from vendors and papers (prices, boot times, discount levels) were written from memory of the sources cited and should be verified in an editorial pass.
+- `book.js` now supports two books (`BOOKS`, `data-book="cloud"`); Volume I ids and URLs are unchanged.
