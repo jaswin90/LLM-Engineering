@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 19 · Batch, Offline and Rollout Inference — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 19 of Cloud AI Infrastructure: inference that nobody waits for. Throughput-optimal operation, why batch APIs cost half, filling the diurnal trough, scheduling batch beside online traffic with priorities and preemption, spot capacity and row-level checkpoints, offline pipelines, and the rollout fleets that feed reinforcement-learning trainers.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci19" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part V · Beyond Chat — Chapter 19</div>
+<h1 id="top">Batch, Offline and Rollout Inference</h1>
+<p class="lede">A large and growing share of tokens is generated with nobody waiting for them: evaluation suites, synthetic training data, document-processing pipelines, embedding backfills and the reinforcement-learning rollouts that train reasoning models. Freed from latency targets, such work is judged on cost per token and on meeting a deadline hours away. It can run at batch sizes no interactive service would tolerate, in the troughs that online traffic leaves, and on capacity that may be taken back at any moment. This chapter develops the engineering of inference without an audience.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Every chapter so far has assumed a user, or an agent, waiting for each answer. That assumption shaped everything: capacity had to cover the peak (Chapter 9), batch sizes were limited by latency targets (Vol. I Chapter 11), and utilisation of 50–60% counted as good (Chapter 10). But consider a company that wants to classify two hundred million support tickets, a lab that must score a new checkpoint on forty benchmarks before tomorrow's meeting, or a training run that needs thirty million generated tokens for each gradient step. None of them cares whether an individual response takes two seconds or two minutes. They care that the whole job finishes by a deadline and what it costs.</p>
+<p>Removing the latency constraint changes the optimisation problem, and with it the infrastructure. It is also a favourite interview topic, because it tests whether a candidate understands which constraints produce which designs: "why is the batch API half price?", "how would you run a 200-million-document job by tomorrow, and what would it cost?", "how do you run batch jobs on the same GPUs as production without hurting production?", "why is batch inference a good fit for spot instances when training is a harder one?", "in RL for reasoning models, where does the time go?".</p>
+<p>We classify work by how long it can wait (§19.1), derive the throughput-optimal operating point (§19.2) and explain batch pricing through the diurnal trough (§19.3). We then schedule batch work beside online traffic (§19.4), run it on preemptible capacity (§19.5), build the pipelines around the model (§19.6), and examine rollout fleets for reinforcement learning (§19.7), ending with the operational habits of offline work (§19.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Classify inference workloads by deadline and explain how the objective changes from latency to cost per token.</li>
+<li>Derive decode throughput as a function of batch size and context length, and find the throughput-optimal operating point.</li>
+<li>Explain batch-API pricing from utilisation and trough filling, and compute how much batch work a fleet can absorb for free.</li>
+<li>Design priority, preemption and deadline-aware admission for batch work on a shared fleet.</li>
+<li>Run batch inference on spot capacity with row-level checkpoints and idempotent outputs, and estimate the waste.</li>
+<li>Size an offline pipeline end to end, and describe the infrastructure of RL rollout generation.</li>
+</ol>
+<p class="small muted">Uses: the bandwidth model of decode (Vol. I Chapter 6), prefix caching (Vol. I Chapter 10), cluster sharing (§7.7), spot capacity (§9.5), cold starts (Chapter 5), token economics (Chapter 10), RL rollouts (Vol. I §25.7 and §26.7), sandboxes (§17.3).</p>
+</div>
+
+<h2 id="s19-1">19.1 Work that nobody waits for</h2>
+<p>It is useful to place workloads on a single axis: how long the requester will wait. Figure 19.1 shows four classes. <strong>Interactive</strong> work—chat, completion, voice—has deadlines of milliseconds to seconds and has occupied this book so far. <strong>Asynchronous</strong> work—a research agent, a long report, a code review—returns in minutes, and the user does something else meanwhile. <strong>Batch</strong> work—evaluations, document processing, synthetic data—has a deadline of hours, classically 24. And <strong>best-effort</strong> work—backfills, speculative precomputation, low-priority experiments—has no deadline at all and runs whenever capacity would otherwise idle.</p>
+
+<figure class="diagram" id="fig-19-1">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Inference workloads by deadline">
+<defs><marker id="a191" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<line x1="20" y1="205" x2="700" y2="205" class="ln" marker-end="url(#a191)"/>
+<text x="360" y="238" text-anchor="middle" class="t-xs">how long the requester will wait →</text>
+<text x="100" y="222" text-anchor="middle" class="t-xs">≈ 1 s</text><text x="270" y="222" text-anchor="middle" class="t-xs">minutes</text><text x="445" y="222" text-anchor="middle" class="t-xs">hours (24 h)</text><text x="620" y="222" text-anchor="middle" class="t-xs">no deadline</text>
+<rect x="20" y="30" width="160" height="160" rx="10" class="bx2"/>
+<text x="100" y="52" text-anchor="middle" class="t-sm t-b">Interactive</text>
+<text x="100" y="74" text-anchor="middle" class="t-xs">chat, completion, voice</text>
+<text x="100" y="98" text-anchor="middle" class="t-xs">metric: TTFT, TPOT</text>
+<text x="100" y="114" text-anchor="middle" class="t-xs">capacity for the peak</text>
+<text x="100" y="130" text-anchor="middle" class="t-xs">utilisation ≈ 50–60%</text>
+<text x="100" y="160" text-anchor="middle" class="t-xs t-b">full price</text>
+<rect x="192" y="30" width="160" height="160" rx="10" class="bx4"/>
+<text x="272" y="52" text-anchor="middle" class="t-sm t-b">Asynchronous</text>
+<text x="272" y="74" text-anchor="middle" class="t-xs">agents, long reports</text>
+<text x="272" y="98" text-anchor="middle" class="t-xs">metric: completion time</text>
+<text x="272" y="114" text-anchor="middle" class="t-xs">can queue for seconds</text>
+<text x="272" y="130" text-anchor="middle" class="t-xs">smooths short bursts</text>
+<text x="272" y="160" text-anchor="middle" class="t-xs t-b">full or flex price</text>
+<rect x="364" y="30" width="160" height="160" rx="10" class="bx3"/>
+<text x="444" y="52" text-anchor="middle" class="t-sm t-b">Batch</text>
+<text x="444" y="74" text-anchor="middle" class="t-xs">evals, documents, data</text>
+<text x="444" y="98" text-anchor="middle" class="t-xs">metric: cost, deadline</text>
+<text x="444" y="114" text-anchor="middle" class="t-xs">fills the diurnal trough</text>
+<text x="444" y="130" text-anchor="middle" class="t-xs">utilisation ≈ 90%</text>
+<text x="444" y="160" text-anchor="middle" class="t-xs t-b">≈ half price</text>
+<rect x="536" y="30" width="170" height="160" rx="10" class="bx5"/>
+<text x="621" y="52" text-anchor="middle" class="t-sm t-b">Best effort</text>
+<text x="621" y="74" text-anchor="middle" class="t-xs">backfills, precompute</text>
+<text x="621" y="98" text-anchor="middle" class="t-xs">metric: cost only</text>
+<text x="621" y="114" text-anchor="middle" class="t-xs">preempted at will</text>
+<text x="621" y="130" text-anchor="middle" class="t-xs">spot / harvested GPUs</text>
+<text x="621" y="160" text-anchor="middle" class="t-xs t-b">marginal cost</text>
+</svg>
+<figcaption><b>Figure 19.1 — Four classes of inference by deadline.</b> As the tolerable delay grows, the metric shifts from latency to cost, utilisation rises, and the price falls.</figcaption>
+</figure>
+
+<p>Figure 19.1 is a statement about <em>flexibility</em>. A workload that can wait gives the operator a degree of freedom: when to run it, on which hardware, and in what company. Every technique in this chapter spends that freedom—on larger batches, on off-peak hours, on cheaper preemptible machines. The classes also differ in what failure means. An interactive request that fails must be retried within the user's patience; a batch row that fails is simply run again later, so batch systems can tolerate far higher transient error rates per attempt, provided they track which rows are done. The first question is how much cheaper a token becomes when latency no longer matters.</p>
+
+<h2 id="s19-2">19.2 The throughput-optimal operating point</h2>
+<p>Vol. I Chapter 6 showed that a decode step is limited by memory bandwidth: the step must read the weights once and every active sequence's KV cache once. With \(B\) sequences of mean context \(n_{\text{ctx}}\) tokens, weights of \(W_{\text{bytes}}\) bytes, \(s_{kv}\) bytes of cache per token and effective bandwidth \(\beta_{\text{eff}}\), the step time and the throughput are</p>
+\[
+t_{\text{step}}(B)=\frac{W_{\text{bytes}}+B\,n_{\text{ctx}}\,s_{kv}}{\beta_{\text{eff}}},\qquad
+\text{throughput}(B)=\frac{B}{t_{\text{step}}(B)}=\frac{B\,\beta_{\text{eff}}}{W_{\text{bytes}}+B\,n_{\text{ctx}}\,s_{kv}}.
+\]
+<p>Throughput rises with \(B\) because the fixed cost of reading the weights is shared among more sequences, and it saturates at \(\beta_{\text{eff}}/(n_{\text{ctx}}s_{kv})\) when cache reads dominate. Two limits stop the rise earlier: the KV caches must fit in memory, and at very large batches the GPU's arithmetic rate \(\pi\) becomes the limit instead. Figure 19.2 plots the formula for Llama 3 8B on an H100.</p>
+
+<figure class="chart" id="fig-19-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Decode throughput of Llama 3 8B on one H100 against batch size (BF16, 80% of peak bandwidth)","height":330,
+ "x":{"label":"Batch size B (sequences, log)","log":true,"min":1,"max":1000,"ticks":[1,8,32,128,512]},
+ "y":{"label":"Tokens per second (log)","log":true,"min":100,"max":50000,"ticks":[100,1000,10000]},
+ "series":[
+  {"name":"Mean context 500 tokens (fits B ≤ 945)","color":"s3","points":[[1,166],[8,1293],[32,4723],[64,8468],[128,14031],[256,20893],[512,27656],[945,32473,"32k"]]},
+  {"name":"Mean context 2,000 tokens (fits B ≤ 236)","color":"s2","points":[[1,164],[8,1181],[32,3508],[64,5223],[128,6914],[236,8116,"8.1k"]]}
+ ]}
+</script>
+<figcaption><b>Figure 19.2 — Throughput keeps rising until memory runs out.</b> Each curve ends where the KV caches fill the 80 GB of HBM. Short contexts allow nearly a thousand concurrent sequences and 32,000 tokens per second; at 2,000 tokens of context the same GPU tops out near 8,000.</figcaption>
+</figure>
+
+<p>Figure 19.2 shows why batch work is cheap, and what limits it. An interactive service rarely runs this model above \(B\approx64\): arrivals are bursty, headroom must be kept for the peak, and each additional sequence lengthens every user's step. A batch job has a queue of millions of rows, so every slot is refilled the instant a sequence finishes, and it runs at the right-hand end of the curve. For short contexts that is 32,000 tokens per second against about 8,500 at \(B=64\), nearly four times the throughput from the same GPU. The figure also shows that context length, not batch size, is the real constraint: at 2,000 tokens of context the memory fills at \(B=236\) and throughput is a quarter of the short-context value. Batch jobs with short rows are therefore far cheaper per token than jobs with long documents, and anything that shortens the context each row carries—sharing a common instruction prefix, trimming retrieved passages—pays twice, in prefill and in decode.</p>
+<p>Three further optimisations become available when nobody is watching. <strong>Prefix sharing</strong>: a batch job typically applies one instruction to millions of rows, so the instruction's KV is computed once and shared by every row (Vol. I Chapter 10), and row order can even be arranged so that rows with a common prefix are adjacent. <strong>No streaming</strong>: results are written when complete, so the gateway machinery of Chapter 11 is unnecessary and tokens need not be detokenised one at a time. <strong>Quantisation and model choice</strong>: with time to validate quality offline, a job can use a smaller or more aggressively quantised model for easy rows and escalate hard ones, the cascade of §18.6 applied to cost. What it cannot do is exceed the memory, which makes the context-length distribution of a job the first thing to measure.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — two hundred million documents by tomorrow</div>
+<p><strong>Job.</strong> Classify 200 million support tickets with Llama 3 8B. Each row has a 300-token instruction, a 500-token ticket and a 50-token structured answer: 160 billion input tokens and 10 billion output tokens.</p>
+<p><strong>Rates.</strong> Prefill is compute-bound: \(2N=16\) GFLOP per token at an effective 500 TFLOP/s gives about 31,000 tokens per second per H100. Decode at \(B=512\) with about 850 tokens of context reads \(16+57=73\) GB per step, 27 ms, so about 18,800 tokens per second.</p>
+<p><strong>GPU time, naive.</strong> Prefill: \(1.6\times10^{11}/31{,}000\approx5.2\times10^6\) s. Decode: \(10^{10}/18{,}800\approx0.53\times10^6\) s. Total about 1,580 GPU-hours.</p>
+<p><strong>With the instruction cached.</strong> Only the 500-token ticket is prefilled per row: \(10^{11}/31{,}000\approx3.2\times10^6\) s, for a total of about 1,040 GPU-hours, a third less.</p>
+<p><strong>Deadline and cost.</strong> To finish in 24 hours needs \(1{,}040/24\approx44\) H100s, say 50 with margin. At $2.50 per committed GPU-hour the job costs about $2,600; on spot capacity at $1.00, about $1,050 plus a few percent of waste (§19.5)—roughly five dollars per million documents.</p>
+<p><strong>Lesson.</strong> The job is dominated by prefill, so the levers are the cached prefix and input length, not decode batching; and its total need, about a thousand GPU-hours, is small beside the idle capacity of a large online fleet, as the next section shows.</p>
+</div>
+
+<h2 id="s19-3">19.3 Why the batch API is half price: filling the trough</h2>
+<p>In April 2024 OpenAI introduced a Batch API that accepted a file of requests, promised results within 24 hours and charged half the interactive price; Anthropic, Google and others followed with similar offerings within the year, at similar discounts. The 50% figure is not arbitrary generosity. It follows from the shape of online demand and the cost structure of Chapter 10.</p>
+<p>An online fleet is sized for its peak plus headroom, but demand follows the sun (§12.3), so for much of the day a large fraction of the fleet idles. Those idle GPU-hours are already paid for—by commitments, by depreciation, by the power contract—so their marginal cost is little more than the extra electricity of running rather than idling. Any revenue from them is nearly pure margin. Figure 19.3 shows a stylised day in one region.</p>
+
+<figure class="chart" id="fig-19-3">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"One region's fleet over a day: online load and the capacity batch work can fill","height":320,
+ "x":{"label":"Local hour of day","min":0,"max":24,"ticks":[0,3,6,9,12,15,18,21,24]},
+ "y":{"label":"Fraction of fleet capacity in use","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"Online load (peak 80%, mean 55%)","color":"s1","points":[[0,0.373],[3,0.30],[6,0.373],[9,0.55],[12,0.727],[15,0.80],[18,0.727],[21,0.55],[24,0.373]]},
+  {"name":"Online + batch, filled to 90%","color":"s3","dash":true,"points":[[0,0.90],[24,0.90]],"markers":false}
+ ],
+ "notes":[{"x":3,"y":0.62,"text":"spare: mean 35% of the fleet"}]}
+</script>
+<figcaption><b>Figure 19.3 — The trough is free capacity.</b> Online load swings between 30% and 80% of capacity; filling the gap up to a 90% ceiling lets batch work use, on average, 35% of the fleet—64% more tokens than online traffic alone, on hardware that is already paid for.</figcaption>
+</figure>
+
+<p>Figure 19.3's arithmetic is the business case for batch pricing. If online load averages 55% of capacity and batch work fills the fleet to 90%, the spare capacity averages 35% of the fleet: the fleet can generate \(0.35/0.55\approx64\%\) more token-capacity without one additional GPU. For Atlas's 4,000 H100s that is about 33,600 GPU-hours every day—thirty times the two-hundred-million-document job of §19.2. Selling this capacity at half price is profitable because its marginal cost is near zero, and attractive to customers because half price moves work that would otherwise not be done at all. The 24-hour window is what makes the promise safe: whatever the hour of submission, the window contains a full trough.</p>
+<p>The discount also reflects the higher efficiency of batch execution—larger batches, shared prefixes, no streaming—described in §19.2, and it serves the provider in a third way: flexible demand is a shock absorber. When a region loses capacity, or online demand spikes, batch work can be paused within seconds, releasing GPUs to interactive traffic; the batch tier is thus the first rung of the load-shedding ladder of §9.7, and a cheap substitute for idle reserve. The limit of the argument is equally clear. Once batch demand exceeds the trough, further batch work needs GPUs bought for it, and its cost returns to the full cost of a GPU-hour at high utilisation, which is roughly where a 50% discount on a 55%-utilised online price lands.</p>
+
+<details class="drill">
+<summary>Drill 19.1 — How much batch can the fleet absorb?</summary>
+<p>A region has 1,000 GPUs. Online load is 70% of capacity for 8 hours, 50% for 8 hours and 25% for 8 hours. Batch may fill the fleet to 90%. How many GPU-hours per day are available to batch work? A customer submits a job needing 9,000 GPU-hours with a 24-hour deadline at the start of the 70% period; can it be accepted?</p>
+<p><em>Solution.</em> Spare capacity: \((0.90-0.70)\times8+(0.90-0.50)\times8+(0.90-0.25)\times8=1.6+3.2+5.2=10\) fleet-hours, that is 10,000 GPU-hours per day. The job needs 9,000, and its 24-hour window covers all three periods, so it fits—with only 1,000 GPU-hours of slack, and only if no other batch work is queued. An admission controller would accept it at a lower priority than work already promised, or quote a later completion time, because an online surge of a few percent would consume the slack.</p>
+</details>
+
+<h2 id="s19-4">19.4 Scheduling batch beside online traffic</h2>
+<p>Using the trough requires running batch and online work on the same GPUs without the first harming the second. Two designs exist. The coarse one switches whole replicas: an autoscaler (§9.6) watches online load, and replicas not needed online are handed to a batch pool, then reclaimed as load rises. It is simple, but a replica takes minutes to change hands (the cold starts of Chapter 5 if the model differs), so it follows only the slow diurnal swing and wastes the minute-to-minute slack.</p>
+<p>The fine-grained design mixes both classes <em>inside</em> one engine. Online and batch requests for the same model share a replica; the engine's scheduler gives online sequences strict priority and fills whatever batch slots and KV memory remain with batch sequences. When online load rises, batch sequences are preempted at a token boundary: their KV is evicted (or offloaded), and they are requeued to resume later—by recomputation, or from a saved prefix—exactly the preemption mechanism of Vol. I §11.7. Systems such as ConServe (2024) showed that this kind of harvesting can raise GPU utilisation substantially while keeping online tail latency close to that of a dedicated fleet<span class="cite"><a href="#r-conserve">[1]</a></span>. Figure 19.4 illustrates the mechanism.</p>
+
+<figure class="diagram" id="fig-19-4">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="Online and batch sequences sharing one replica with preemption">
+<text x="20" y="22" class="t-sm t-b">Decode slots of one replica over time (each row is a time step)</text>
+<g>
+<text x="20" y="54" class="t-xs">quiet</text>
+<rect x="80" y="40" width="90" height="22" rx="3" class="bx2"/><text x="125" y="55" text-anchor="middle" class="t-xs">online</text>
+<rect x="172" y="40" width="90" height="22" rx="3" class="bx2"/><text x="217" y="55" text-anchor="middle" class="t-xs">online</text>
+<rect x="264" y="40" width="90" height="22" rx="3" class="bx3"/><text x="309" y="55" text-anchor="middle" class="t-xs">batch</text>
+<rect x="356" y="40" width="90" height="22" rx="3" class="bx3"/><text x="401" y="55" text-anchor="middle" class="t-xs">batch</text>
+<rect x="448" y="40" width="90" height="22" rx="3" class="bx3"/><text x="493" y="55" text-anchor="middle" class="t-xs">batch</text>
+<rect x="540" y="40" width="90" height="22" rx="3" class="bx3"/><text x="585" y="55" text-anchor="middle" class="t-xs">batch</text>
+</g>
+<g>
+<text x="20" y="94" class="t-xs">burst</text>
+<rect x="80" y="80" width="90" height="22" rx="3" class="bx2"/><text x="125" y="95" text-anchor="middle" class="t-xs">online</text>
+<rect x="172" y="80" width="90" height="22" rx="3" class="bx2"/><text x="217" y="95" text-anchor="middle" class="t-xs">online</text>
+<rect x="264" y="80" width="90" height="22" rx="3" class="bx2"/><text x="309" y="95" text-anchor="middle" class="t-xs">online (new)</text>
+<rect x="356" y="80" width="90" height="22" rx="3" class="bx2"/><text x="401" y="95" text-anchor="middle" class="t-xs">online (new)</text>
+<rect x="448" y="80" width="90" height="22" rx="3" class="bx3"/><text x="493" y="95" text-anchor="middle" class="t-xs">batch</text>
+<rect x="540" y="80" width="90" height="22" rx="3" class="bx3"/><text x="585" y="95" text-anchor="middle" class="t-xs">batch</text>
+</g>
+<g>
+<text x="20" y="134" class="t-xs">calm</text>
+<rect x="80" y="120" width="90" height="22" rx="3" class="bx2"/><text x="125" y="135" text-anchor="middle" class="t-xs">online</text>
+<rect x="172" y="120" width="90" height="22" rx="3" class="bx3"/><text x="217" y="135" text-anchor="middle" class="t-xs">batch</text>
+<rect x="264" y="120" width="90" height="22" rx="3" class="bx3"/><text x="309" y="135" text-anchor="middle" class="t-xs">batch (resumed)</text>
+<rect x="356" y="120" width="90" height="22" rx="3" class="bx3"/><text x="401" y="135" text-anchor="middle" class="t-xs">batch (resumed)</text>
+<rect x="448" y="120" width="90" height="22" rx="3" class="bx3"/><text x="493" y="135" text-anchor="middle" class="t-xs">batch</text>
+<rect x="540" y="120" width="90" height="22" rx="3" class="bx3"/><text x="585" y="135" text-anchor="middle" class="t-xs">batch</text>
+</g>
+<rect x="80" y="165" width="550" height="34" rx="8" class="bx4"/>
+<text x="355" y="186" text-anchor="middle" class="t-xs">preempted batch sequences wait in a queue with their progress (tokens so far, or KV offloaded to host memory)</text>
+<text x="20" y="222" class="t-xs">Online sequences always get slots first; batch fills the rest. Preemption happens at token boundaries, within one step (tens of ms).</text>
+<text x="20" y="238" class="t-xs">A cap on batch slots and KV keeps headroom so that a new online request never waits for an eviction to finish.</text>
+</svg>
+<figcaption><b>Figure 19.4 — Harvesting inside a replica.</b> Batch sequences occupy slots that online traffic does not need and are preempted within a step when it does; their progress is kept so that preemption wastes little.</figcaption>
+</figure>
+
+<p>Figure 19.4 hides three details that decide whether harvesting is safe. First, <em>interference</em>: even a preemptible batch sequence lengthens the decode step while it runs (the \(B\,n_{\text{ctx}}s_{kv}\) term of §19.2), so online TPOT rises with the batch load; the engine must cap batch occupancy at the level where online TPOT still meets its target, and long prefill chunks of batch rows must be bounded (Vol. I §11.5) so that they do not stall decode steps. Second, <em>memory headroom</em>: a new online request needs KV space immediately, so some memory is kept free, or batch KV is evictable without waiting. Third, <em>fairness among batch jobs</em>: with many customers' jobs sharing the trough, a job with a near deadline should run before one submitted earlier with a distant deadline.</p>
+<p>That last point is classical real-time scheduling. Each job \(j\) has remaining work \(w_j\) (in GPU-hours) and a deadline; the <em>earliest-deadline-first</em> rule runs the job whose deadline is nearest, and it is optimal in the sense that if any schedule meets all deadlines on the available capacity, EDF does. The admission test is correspondingly simple: order jobs by deadline and check, for each deadline in turn, that the cumulative work due by then does not exceed the spare capacity forecast up to then. Because spare capacity is a forecast—tomorrow's online demand is uncertain—prudent systems admit against a conservative quantile of the forecast (§9.4) and keep purchased capacity or the next region's trough (§12.3) as a fallback for the promises that the forecast fails to cover.</p>
+
+<h2 id="s19-5">19.5 Spot capacity and row-level checkpoints</h2>
+<p>Spot instances (§9.5) sell a cloud's own idle capacity at discounts of 60–90%, with the condition that the provider may take the machine back at short notice. Chapter 7 showed what this costs a training job: its state is a single large object, so it must write checkpoints at an interval chosen by the Young–Daly formula, and every preemption loses the work since the last one. Batch inference is in a much better position, for a structural reason: its work is a set of independent rows, and a row's result, once written, never needs recomputing. The checkpoint is simply the set of completed row identifiers, and a preemption loses only the rows in flight—seconds of work—plus the time to restart.</p>
+<p>The waste can be estimated in one line. If preemptions arrive at a mean interval \(\text{MTBF}\) and each costs a restart time \(t_{\text{restart}}\) (acquiring a new instance, loading weights, re-warming caches) plus the in-flight work, the fraction of paid time that produces no output is about \(t_{\text{restart}}/(\text{MTBF}+t_{\text{restart}})\). With a preemption every two hours and four minutes to restart, that is about 3%. A spot price of 40% of the committed price then yields an effective cost of \(0.40/0.97\approx41\%\)—a saving that few other optimisations in this book can match. The saving is real only if the pipeline is engineered for it, and three properties matter.</p>
+<p><strong>Idempotent, keyed output.</strong> Every row has a stable identifier, and results are written keyed by it, so that a row processed twice—because a worker was preempted after generating but before acknowledging—overwrites the same record rather than appending a duplicate. This is the idempotency of §11.7, applied to storage. <strong>Small commit units.</strong> Results are flushed in chunks of seconds to minutes of work, not at the end of a file of a million rows. <strong>Fast restart.</strong> Because restart time is the whole waste, the cold-start techniques of Chapter 5—weights cached on local disk or in a nearby object store, streamed loading, pre-pulled images—determine the economics; a 20-minute cold start with hourly preemptions would waste a quarter of the spend. Preemption notices (two minutes on AWS, thirty seconds on some other clouds) are used to stop admitting rows and flush what is finished. SpotServe (2024) and similar systems extended these ideas even to latency-sensitive serving, migrating state between instances within the notice period<span class="cite"><a href="#r-spotserve">[2]</a></span>; for batch work the simpler row-level scheme suffices.</p>
+
+<div class="box bridge">
+<div class="box-title">For the mathematician — why inference checkpoints are free and training's are not</div>
+<p>A training run is a long chain: step \(k+1\) depends on the parameters after step \(k\), so the computation's dependency graph is a path, and losing the state at any point loses everything since the last saved vertex. Batch inference has a dependency graph with no edges between rows: it is an <em>embarrassingly parallel</em> map over a set. Its state is therefore a subset of a set—the completed rows—which grows monotonically and can be recorded incrementally at negligible cost. The Young–Daly trade-off between checkpoint cost and lost work (§7.5) disappears because the checkpoint cost per unit of work is essentially zero and the unit of loss is one row. RL rollouts sit in between: rows within a step are independent, but steps form a chain.</p>
+</div>
+
+<details class="drill">
+<summary>Drill 19.2 — Is spot worth it with a slow cold start?</summary>
+<p>A batch job runs on spot H100s at $1.00 per GPU-hour; committed capacity costs $2.50. Preemptions arrive on average every 90 minutes. Compare the effective cost per productive GPU-hour when a restart takes (a) 3 minutes and (b) 25 minutes. At what restart time does spot stop being cheaper?</p>
+<p><em>Solution.</em> Productive fraction \(=\text{MTBF}/(\text{MTBF}+t_{\text{restart}})\). (a) \(90/93=0.968\): $1.03 per productive hour. (b) \(90/115=0.783\): $1.28. Both beat $2.50. Spot stops paying when \(1.00\times(90+t_{\text{restart}})/90=2.50\), that is \(t_{\text{restart}}=135\) minutes—far beyond any reasonable cold start. The practical risks are different: spot capacity may be unavailable when the deadline nears, so deadline-bound jobs keep a committed or on-demand fallback and switch to it when the remaining work no longer fits in the remaining time at the observed spot rate.</p>
+</details>
+
+<h2 id="s19-6">19.6 The pipeline around the model</h2>
+<p>An offline job is more than a model call: rows are read from storage, parsed, perhaps rendered or cropped, tokenised, run through the model, parsed again, validated and written. Figure 19.5 shows the stages. The system's throughput is the minimum of the stages' throughputs, and in practice the GPU is often not the bottleneck: a pipeline that renders PDF pages or decodes images on a few CPU cores can leave expensive accelerators starved.</p>
+
+<figure class="diagram" id="fig-19-5">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Stages of an offline inference pipeline">
+<defs><marker id="a195" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="50" width="100" height="70" rx="8" class="bx"/><text x="60" y="76" text-anchor="middle" class="t-xs t-b">read</text><text x="60" y="92" text-anchor="middle" class="t-xs">object store,</text><text x="60" y="106" text-anchor="middle" class="t-xs">row ids</text>
+<rect x="130" y="50" width="110" height="70" rx="8" class="bx4"/><text x="185" y="76" text-anchor="middle" class="t-xs t-b">preprocess (CPU)</text><text x="185" y="92" text-anchor="middle" class="t-xs">parse, render,</text><text x="185" y="106" text-anchor="middle" class="t-xs">tokenise</text>
+<rect x="260" y="50" width="80" height="70" rx="8" class="bx"/><text x="300" y="76" text-anchor="middle" class="t-xs t-b">queue</text><text x="300" y="92" text-anchor="middle" class="t-xs">bounded,</text><text x="300" y="106" text-anchor="middle" class="t-xs">by length</text>
+<rect x="360" y="50" width="120" height="70" rx="8" class="bx2"/><text x="420" y="76" text-anchor="middle" class="t-xs t-b">model (GPU)</text><text x="420" y="92" text-anchor="middle" class="t-xs">max batch, shared</text><text x="420" y="106" text-anchor="middle" class="t-xs">prefix, spot</text>
+<rect x="500" y="50" width="100" height="70" rx="8" class="bx4"/><text x="550" y="76" text-anchor="middle" class="t-xs t-b">postprocess</text><text x="550" y="92" text-anchor="middle" class="t-xs">parse, validate,</text><text x="550" y="106" text-anchor="middle" class="t-xs">retry bad rows</text>
+<rect x="620" y="50" width="90" height="70" rx="8" class="bx3"/><text x="665" y="76" text-anchor="middle" class="t-xs t-b">write</text><text x="665" y="92" text-anchor="middle" class="t-xs">keyed by row id,</text><text x="665" y="106" text-anchor="middle" class="t-xs">small commits</text>
+<line x1="110" y1="85" x2="128" y2="85" class="ln" marker-end="url(#a195)"/><line x1="240" y1="85" x2="258" y2="85" class="ln" marker-end="url(#a195)"/><line x1="340" y1="85" x2="358" y2="85" class="ln" marker-end="url(#a195)"/><line x1="480" y1="85" x2="498" y2="85" class="ln" marker-end="url(#a195)"/><line x1="600" y1="85" x2="618" y2="85" class="ln" marker-end="url(#a195)"/>
+<path d="M300,120 C300,160 185,160 185,124" class="ln ln-acc" fill="none" stroke-dasharray="4 3" marker-end="url(#a195)"/>
+<text x="242" y="176" text-anchor="middle" class="t-xs t-acc">backpressure: full queue slows producers</text>
+<path d="M550,50 C550,15 420,15 420,46" class="ln ln-s2" fill="none" stroke-dasharray="4 3" marker-end="url(#a195)"/>
+<text x="485" y="14" text-anchor="middle" class="t-xs t-s2">failed rows requeued (bounded retries)</text>
+<text x="360" y="212" text-anchor="middle" class="t-xs">Throughput = the slowest stage. CPU and GPU stages scale independently; queues between them are bounded.</text>
+</svg>
+<figcaption><b>Figure 19.5 — An offline inference pipeline.</b> CPU stages feed the GPU stage through a bounded queue that applies backpressure; outputs are validated, failed rows retried a bounded number of times, and results committed in small keyed chunks.</figcaption>
+</figure>
+
+<p>Figure 19.5 embodies four design rules. <strong>Scale stages independently.</strong> CPU preprocessing and GPU inference have different unit costs and different bottlenecks, so they run in separate worker pools whose sizes are chosen to match rates; data-processing frameworks built for this heterogeneous, streaming style of batch execution—Ray Data is the best-known open example<span class="cite"><a href="#r-raydata">[3]</a></span>—replaced the older pattern of one process per GPU doing everything. <strong>Bound the queues.</strong> An unbounded queue between a fast reader and a slower model fills memory until the job crashes; a bounded queue makes the producer wait, which is backpressure, the same principle as the admission control of Chapter 11. <strong>Order by length.</strong> Grouping rows of similar length keeps the KV memory of §19.2 well packed and prefill padding low; with a deep queue and continuous batching, a finished sequence's slot is refilled at once, so the straggler problem that plagues step-synchronous work (§19.7) does not arise. <strong>Validate and retry rows, not jobs.</strong> A row whose output fails to parse, or trips a guard (Chapter 18), is retried a bounded number of times and then written to a dead-letter set for inspection; one bad row in two hundred million must never fail the job.</p>
+<p>The sizing exercise is a chain of rate calculations. In the ticket job of §19.2, 50 GPUs prefill about 1.5 million tokens per second, some 6 MB of text: storage and tokenisation are trivial. Replace tickets with scanned pages that take 100 ms of CPU each to render and yield 1,000 tokens, and each GPU consumes 31 pages per second, needing about three cores of rendering per GPU, 150 cores for the fleet—still cheap, but only if someone provisions them. The habit of computing every stage's rate, and monitoring GPU utilisation as the signal that an upstream stage has fallen behind, is what separates a job that costs $1,000 from one that costs $5,000.</p>
+
+<h2 id="s19-7">19.7 Rollout fleets: inference that feeds a trainer</h2>
+<p>The largest single class of offline inference is the generation of rollouts for reinforcement learning. Vol. I §25.7 and §26.7 analysed one step in detail: for an 8B policy on 64 H100s, 512 prompts with \(n_s=16\) samples each and a mean of 4,000 generated tokens come to \(3.3\times10^7\) tokens per step; generation takes about 200 seconds and training about 105, so two thirds of the step is inference, and more than half of the generation time is spent waiting for the longest rollouts. A training run of ten thousand such steps generates \(3.3\times10^{11}\) tokens—more than many products serve in a month. Here we take the infrastructure view: what kind of fleet produces those tokens? Figure 19.6 shows its parts.</p>
+
+<figure class="diagram" id="fig-19-6">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Infrastructure of an RL rollout fleet">
+<defs><marker id="a196" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="85" width="110" height="70" rx="8" class="bx"/><text x="70" y="110" text-anchor="middle" class="t-xs t-b">task queue</text><text x="70" y="126" text-anchor="middle" class="t-xs">prompts, envs,</text><text x="70" y="140" text-anchor="middle" class="t-xs">curriculum</text>
+<rect x="160" y="70" width="150" height="100" rx="10" class="bx2"/><text x="235" y="94" text-anchor="middle" class="t-xs t-b">rollout engines (GPU)</text><text x="235" y="110" text-anchor="middle" class="t-xs">production engine, max batch,</text><text x="235" y="124" text-anchor="middle" class="t-xs">n_s samples share a prompt;</text><text x="235" y="138" text-anchor="middle" class="t-xs">elastic, may be spot</text><text x="235" y="154" text-anchor="middle" class="t-xs">policy version tagged</text>
+<rect x="345" y="20" width="150" height="70" rx="10" class="bx4"/><text x="420" y="44" text-anchor="middle" class="t-xs t-b">environments (CPU)</text><text x="420" y="60" text-anchor="middle" class="t-xs">sandboxes, tools,</text><text x="420" y="74" text-anchor="middle" class="t-xs">unit tests, simulators</text>
+<rect x="345" y="150" width="150" height="70" rx="10" class="bx3"/><text x="420" y="174" text-anchor="middle" class="t-xs t-b">trajectory store</text><text x="420" y="190" text-anchor="middle" class="t-xs">tokens, log-probs,</text><text x="420" y="204" text-anchor="middle" class="t-xs">rewards, versions</text>
+<rect x="540" y="85" width="165" height="70" rx="10" class="bx5"/><text x="622" y="110" text-anchor="middle" class="t-xs t-b">trainer (GPU)</text><text x="622" y="126" text-anchor="middle" class="t-xs">policy update;</text><text x="622" y="140" text-anchor="middle" class="t-xs">committed capacity</text>
+<line x1="125" y1="120" x2="158" y2="120" class="ln" marker-end="url(#a196)"/>
+<path d="M310,95 C325,80 330,65 343,58" class="ln ln-acc" fill="none" marker-end="url(#a196)"/>
+<path d="M345,72 C330,85 322,95 312,108" class="ln ln-acc" fill="none" marker-end="url(#a196)"/>
+<text x="200" y="52" class="t-xs t-acc">actions / results</text>
+<path d="M310,145 C325,160 330,170 343,178" class="ln" fill="none" marker-end="url(#a196)"/>
+<path d="M495,185 C530,180 560,170 590,157" class="ln" fill="none" marker-end="url(#a196)"/>
+<path d="M622,155 C622,290 235,290 235,173" class="ln ln-s3" fill="none" stroke-dasharray="5 3" marker-end="url(#a196)"/>
+<text x="600" y="252" text-anchor="middle" class="t-xs t-s3">new weights each update</text>
+<text x="600" y="266" text-anchor="middle" class="t-xs t-s3">(broadcast, §5.5)</text>
+<text x="360" y="292" text-anchor="middle" class="t-xs">Three fleets with different scaling: rollout GPUs (elastic), environment CPUs (bursty), trainer GPUs (fixed).</text>
+</svg>
+<figcaption><b>Figure 19.6 — A rollout fleet.</b> Inference engines generate trajectories, interacting with CPU-side environments; a store decouples them from the trainer; updated weights are broadcast back to the engines.</figcaption>
+</figure>
+
+<p>Figure 19.6 distinguishes three fleets with different needs. The <strong>rollout engines</strong> are an inference fleet like any other and should be production engines (Vol. I §26.7), run at the throughput-optimal point of §19.2; with \(n_s\) samples per prompt, the shared prompt's KV is computed once. They are the elastic part: generation is row-parallel within a step, so rollout replicas can be added from spare or spot capacity and removed without harm, and a preempted replica loses only its in-flight rollouts. The <strong>trainer</strong> is the opposite: a tightly coupled job whose loss stalls the whole run, so it stays on committed capacity with checkpoints (§7.5). The <strong>environments</strong> are the part newcomers forget. For agentic tasks each rollout drives a sandbox (§17.3)—a code interpreter, a browser, a set of unit tests—so eight thousand concurrent rollouts need eight thousand sandboxes, whose start time and execution time enter the step directly; a verifier that takes thirty seconds per rollout on too few cores turns a GPU bottleneck into a CPU one.</p>
+<div class="box example">
+<div class="box-title">Worked example — the environment fleet for a coding-agent RL step</div>
+<p><strong>Setting.</strong> The step of Vol. I §25.7—8,192 concurrent rollouts on 64 H100s, about 200 s of generation—now trains a coding agent. Each rollout makes 10 tool calls (running tests, executing snippets), each using 5 s of one CPU core, in a sandbox holding 0.5 GiB of memory.</p>
+<p><strong>CPU work.</strong> \(8{,}192\times10\times5\approx4.1\times10^5\) core-seconds per step. For the tools not to lengthen the 200-second generation phase, they must be spread over at least \(4.1\times10^5/200\approx2{,}050\) cores: about eleven 192-core servers, with \(8{,}192\times0.5\approx4\) TiB of sandbox memory among them.</p>
+<p><strong>If under-provisioned.</strong> With 256 cores the tool work alone takes \(4.1\times10^5/256\approx1{,}600\) s. The step grows from 300 s to nearly half an hour, and 64 H100s costing $160 per hour wait on $10 per hour of CPUs—with their KV caches held or reloaded throughout (§17.4).</p>
+<p><strong>Weight synchronisation.</strong> The updated 8B policy is 16 GB; relayed between nodes at 50 GB/s (a 400 Gb/s link), each hop takes about 0.3 s, and a tree reaches 64 engines in six hops, about 2 s—under 1% of the step. Reloading each engine from object storage at 2 GB/s would take 8 s for this model and over a minute for a 141 GB 70B policy, every step.</p>
+<p><strong>Lesson.</strong> In agentic RL the cheap fleet can stall the expensive one. Environment capacity is sized from tool seconds per rollout, exactly as the GPU fleet is sized from tokens.</p>
+</div>
+
+<p>Two couplings between the fleets create the distinctive problems. The first is <strong>weight synchronisation</strong>. After each update the engines must load the new policy—16 GB for the 8B model, hundreds of gigabytes for a large one. Reloading from object storage every few minutes would dominate the step, so weights move directly from trainer to engines over the cluster network, by the tree or chain broadcast of §5.5, or are updated in place when trainer and engine share GPUs; and every prefix cache in every engine is invalidated at each update, because KV computed by old weights is wrong for new ones. The second is <strong>staleness</strong>. A step-synchronous loop wastes most of its generation capacity on stragglers; an asynchronous loop—engines generating continuously, the trainer consuming from the trajectory store, as in the actor–learner architectures of earlier deep RL<span class="cite"><a href="#r-impala">[4]</a></span>—keeps every GPU busy, at the price that trajectories were generated by a policy \(n_{\text{stale}}\) updates old and must be corrected by importance ratios or discarded beyond a staleness limit (Vol. I §25.7). The trajectory store therefore records the policy version and the sampling log-probabilities with every rollout: without them the data cannot be used correctly.</p>
+<p>The capacity-planning consequence closes the loop with §19.3. A lab's rollout demand is flexible in exactly the way batch demand is: it can be throttled, paused and resumed within minutes. Labs that both serve products and train models therefore treat rollout generation as the largest tenant of the trough—running it on the serving fleet at night, yielding to interactive traffic by day—so that a single pool of GPUs earns revenue at its peak and produces training data in its valley.</p>
+
+<h2 id="s19-8">19.8 Operating offline work: evaluations, synthetic data and reproducibility</h2>
+<p>Offline jobs lack the alarms of online service—no user complains when an evaluation is quietly wrong—so their operational discipline must be designed in. <strong>Reproducibility</strong> comes first. An evaluation score or a synthetic dataset is only meaningful if it can be regenerated, so each job records the model's weight hash, the engine and its version, quantisation, sampling parameters and seeds, the prompt template and the dataset version. Even then, bit-identical outputs are not guaranteed across batch sizes, hardware and engine versions, because floating-point reductions are reordered (Vol. I §23.8); evaluations therefore report variation across seeds, and comparisons between checkpoints are made under identical configurations on the same fleet.</p>
+<p><strong>Result caching</strong> exploits the same determinism where it holds: keyed by the hash of model, prompt and parameters, a cache lets a re-run of an evaluation suite, or a pipeline restarted after a bug in a later stage, skip rows already computed. At temperature zero the saving is often large, because evaluation suites change slowly while checkpoints change daily—though each new checkpoint necessarily recomputes everything. <strong>Cost attribution</strong> matters because offline work is invisible: a tag on every job for team, project and purpose, and a weekly report of GPU-hours by tag, is the only way to learn that a forgotten nightly job consumes a tenth of the trough. <strong>Quality gates</strong> replace user feedback: sampled outputs are checked by validators, by a stronger judge model or by people before a synthetic dataset is used for training, because errors in generated data are amplified, not averaged out, by the model trained on them.</p>
+<p>Finally, offline work has its own safety and governance. Batch APIs receive the same abuse attempts as interactive ones, with the difference that guards (Chapter 18) can run asynchronously over a whole file before any output is released, at batch prices. Data residency (§12.6) applies to batch files and their outputs, which constrains which regions' troughs a job may use. And evaluation sets must be protected from leaking into training data—a governance problem that no amount of infrastructure solves, but that good lineage records, the offline analogue of audit logs, make detectable.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>We now have every component of cloud AI infrastructure: buildings and power, accelerators and networks, storage, orchestration and scheduling, serving platforms, capacity and economics, the front door, regions, reliability and security, and the workloads beyond chat—multimodal, retrieval, agents, guardrails and batch. An interview does not ask for the components one at a time. It asks for a system: "design a global LLM API", "design a serverless GPU platform", "design the scheduler for a ten-thousand-GPU cluster". The skill it tests is assembling what you know, under time pressure, with numbers, and defending the trade-offs. Chapter 20 turns the book into that skill: an estimation toolkit, a method for the design interview, and worked case studies with the rubrics by which they are judged.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Inference divides by deadline into interactive, asynchronous, batch and best-effort work; flexibility in time is a resource spent on larger batches, off-peak hours and cheaper machines.</li>
+<li>Decode throughput is \(B\beta_{\text{eff}}/(W_{\text{bytes}}+B\,n_{\text{ctx}}s_{kv})\), rising until KV memory fills: Llama 3 8B on an H100 reaches ≈ 32k tokens/s at 500-token contexts (B ≈ 945) but ≈ 8k at 2,000 tokens. Context length, shared prefixes and prefill dominate batch cost.</li>
+<li>200 million 800-token classifications cost ≈ 1,040 GPU-hours with a cached instruction: ≈ 44 H100s for a day, ≈ $2,600 committed or ≈ $1,050 on spot.</li>
+<li>Batch APIs (2024) charge about half because troughs are paid-for capacity: with online load averaging 55% and filling to 90%, a fleet absorbs 64% more work for free; batch is also the first load to shed.</li>
+<li>Share GPUs by replica switching (slow) or in-engine harvesting (strict online priority, token-boundary preemption, capped batch occupancy and KV headroom); schedule batch jobs earliest-deadline-first and admit against conservative forecasts of spare capacity.</li>
+<li>Batch inference suits spot capacity because rows are independent: checkpoints are completed-row sets, waste ≈ \(t_{\text{restart}}/(\text{MTBF}+t_{\text{restart}})\) (≈ 3%), given idempotent keyed outputs, small commits and fast cold starts.</li>
+<li>Pipelines are limited by their slowest stage: scale CPU and GPU pools independently, bound queues for backpressure, order by length, and retry rows rather than jobs.</li>
+<li>RL rollout fleets combine elastic inference engines, bursty CPU environments and a fixed trainer; weight broadcast, cache invalidation, stragglers and staleness are the system problems; rollouts are the natural largest tenant of the trough.</li>
+<li>Offline operations need recorded configurations and seeds, result caches, cost attribution, quality gates, asynchronous guards and data lineage.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci19-mcq-01" data-topic="§19.1 Classes">
+<p class="q">What mainly distinguishes batch from interactive inference?</p>
+<ol class="opts"><li>The model used</li><li data-correct>The deadline: hours instead of seconds, so the metric becomes cost per token</li><li>The tokeniser</li><li>The GPU type</li></ol>
+<div class="explain">Flexibility in time is what the operator exploits.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-02" data-topic="§19.1 Classes">
+<p class="q">Why can batch systems tolerate higher transient error rates per attempt?</p>
+<ol class="opts"><li>Errors do not matter offline</li><li data-correct>A failed row is simply retried later, provided completed rows are tracked</li><li>Batch models are more accurate</li><li>They use ECC memory</li></ol>
+<div class="explain">No user is waiting within a patience limit.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-03" data-topic="§19.2 Throughput">
+<p class="q">In the bandwidth model, decode throughput saturates as \(B\to\infty\) at:</p>
+<ol class="opts"><li>\(\beta_{\text{eff}}/W_{\text{bytes}}\)</li><li data-correct>\(\beta_{\text{eff}}/(n_{\text{ctx}}s_{kv})\)</li><li>\(\pi/N\)</li><li>Infinity</li></ol>
+<div class="explain">KV reads dominate; memory capacity usually stops growth first.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-04" data-topic="§19.2 Throughput">
+<p class="q">For Llama 3 8B on an H100, what ends the 2,000-token-context curve at \(B\approx236\)?</p>
+<ol class="opts"><li>Compute</li><li data-correct>KV caches fill the 80 GB of HBM</li><li>Network</li><li>Tokenisation</li></ol>
+<div class="explain">236 × 2,000 × 128 KiB ≈ 62 GB plus 16 GB of weights.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-05" data-topic="§19.2 Throughput">
+<p class="q">Why can a batch job run at far larger \(B\) than an interactive service?</p>
+<ol class="opts"><li>It uses different GPUs</li><li data-correct>No latency target limits step time and a deep queue refills every slot instantly</li><li>It disables attention</li><li>It uses smaller vocabularies</li></ol>
+<div class="explain">Interactive services also keep headroom for bursts.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-06" data-topic="§19.2 Throughput">
+<p class="q">In the 200-million-ticket example, what dominates GPU time?</p>
+<ol class="opts"><li data-correct>Prefill of input tokens</li><li>Decode of output tokens</li><li>Tokenisation</li><li>Writing results</li></ol>
+<div class="explain">160B input tokens against 10B output.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-07" data-topic="§19.2 Throughput">
+<p class="q">Caching the shared 300-token instruction reduced the job from about 1,580 to about:</p>
+<ol class="opts"><li>1,500 GPU-hours</li><li data-correct>1,040 GPU-hours</li><li>500 GPU-hours</li><li>100 GPU-hours</li></ol>
+<div class="explain">Only the 500-token ticket is prefilled per row.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-08" data-topic="§19.2 Throughput">
+<p class="q">Which optimisations become available without a latency constraint? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Maximum batch sizes</li><li data-correct>Ordering rows so shared prefixes are adjacent</li><li data-correct>No streaming or per-token detokenisation</li><li>Unlimited KV memory</li></ol>
+<div class="explain">Memory remains the hard limit.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-09" data-topic="§19.3 Pricing">
+<p class="q">Why is the marginal cost of batch work in the trough near zero?</p>
+<ol class="opts"><li>Night electricity is free</li><li data-correct>The GPUs are already paid for to cover the online peak; only incremental power is added</li><li>Batch tokens are smaller</li><li>Providers subsidise it</li></ol>
+<div class="explain">Idle committed capacity earns nothing otherwise.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-10" data-topic="§19.3 Pricing">
+<p class="q">Online load averages 55% of capacity and batch fills to 90%. How much more work does the fleet do?</p>
+<ol class="opts"><li>35%</li><li data-correct>64%</li><li>90%</li><li>10%</li></ol>
+<div class="explain">0.35/0.55.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-11" data-topic="§19.3 Pricing">
+<p class="q">Why does a 24-hour completion window make the batch promise safe?</p>
+<ol class="opts"><li>Jobs take 24 hours</li><li data-correct>Any 24-hour window contains a full diurnal trough</li><li>Regulations require it</li><li>Caches expire daily</li></ol>
+<div class="explain">Whatever the submission hour.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-12" data-topic="§19.3 Pricing">
+<p class="q">How does a batch tier help reliability of the online tier?</p>
+<ol class="opts"><li>It replicates data</li><li data-correct>Batch work can be paused within seconds, releasing GPUs during spikes or capacity loss</li><li>It lowers TPOT</li><li>It caches prompts</li></ol>
+<div class="explain">The first rung of load shedding.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-13" data-topic="§19.4 Sharing">
+<p class="q">In-engine harvesting gives online sequences:</p>
+<ol class="opts"><li>Equal shares with batch</li><li data-correct>Strict priority; batch fills leftover slots and is preempted at token boundaries</li><li>Separate GPUs</li><li>Lower precision</li></ol>
+<div class="explain">Preempted batch sequences keep their progress.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-14" data-topic="§19.4 Sharing">
+<p class="q">Why must batch occupancy in a shared replica be capped even though batch is preemptible?</p>
+<ol class="opts"><li>Billing</li><li data-correct>Running batch sequences lengthen every decode step, raising online TPOT</li><li>Batch uses a different model</li><li>Preemption is impossible</li></ol>
+<div class="explain">The \(B\,n_{\text{ctx}}s_{kv}\) term.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-15" data-topic="§19.4 Sharing">
+<p class="q">Earliest-deadline-first scheduling is optimal in the sense that:</p>
+<ol class="opts"><li>It minimises cost</li><li data-correct>If any schedule meets all deadlines on the capacity, EDF does</li><li>It maximises throughput</li><li>It minimises mean response time</li></ol>
+<div class="explain">For preemptible work on a single resource.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-16" data-topic="§19.4 Sharing">
+<p class="q">Why admit batch jobs against a conservative quantile of forecast spare capacity?</p>
+<ol class="opts"><li>To raise prices</li><li data-correct>Tomorrow's online demand is uncertain; over-admission breaks deadline promises</li><li>GPUs degrade</li><li>EDF requires it</li></ol>
+<div class="explain">Fallbacks: purchased capacity or another region's trough.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-17" data-topic="§19.4 Sharing">
+<p class="q">Why does replica-level switching between online and batch pools waste short-term slack?</p>
+<ol class="opts"><li>It is unsafe</li><li data-correct>A replica takes minutes to change hands, so only slow diurnal swings can be followed</li><li>It requires spot</li><li>It doubles memory</li></ol>
+<div class="explain">Cold starts if the model differs.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-18" data-topic="§19.5 Spot">
+<p class="q">Why is batch inference better suited to spot capacity than training?</p>
+<ol class="opts"><li>It needs fewer GPUs</li><li data-correct>Rows are independent, so a preemption loses only in-flight rows and the checkpoint is the set of completed rows</li><li>Spot GPUs are faster</li><li>Training cannot checkpoint</li></ol>
+<div class="explain">Training state is one chain.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-19" data-topic="§19.5 Spot">
+<p class="q">Preemptions every 2 hours with a 4-minute restart waste about:</p>
+<ol class="opts"><li>0.3%</li><li data-correct>3%</li><li>13%</li><li>30%</li></ol>
+<div class="explain">4/124.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-20" data-topic="§19.5 Spot">
+<p class="q">Why must batch outputs be written keyed by row identifier?</p>
+<ol class="opts"><li>For compression</li><li data-correct>A row processed twice after a preemption overwrites rather than duplicates</li><li>For encryption</li><li>For sorting</li></ol>
+<div class="explain">Idempotency applied to storage.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-21" data-topic="§19.5 Spot">
+<p class="q">On spot capacity, which quantity most determines waste?</p>
+<ol class="opts"><li>Batch size</li><li data-correct>Restart (cold-start) time relative to time between preemptions</li><li>Model size alone</li><li>Output length</li></ol>
+<div class="explain">Hence Chapter 5's techniques.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-22" data-topic="§19.5 Spot">
+<p class="q">What should a deadline-bound spot job keep?</p>
+<ol class="opts"><li>Larger batches</li><li data-correct>A committed or on-demand fallback to switch to when remaining work no longer fits</li><li>More regions' data</li><li>A second model</li></ol>
+<div class="explain">Spot may be unavailable near the deadline.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-23" data-topic="§19.6 Pipelines">
+<p class="q">A pipeline's throughput equals:</p>
+<ol class="opts"><li>The sum of stage throughputs</li><li>The GPU stage's throughput</li><li data-correct>The minimum of its stages' throughputs</li><li>The mean of stage throughputs</li></ol>
+<div class="explain">CPU stages often starve GPUs.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-24" data-topic="§19.6 Pipelines">
+<p class="q">What does a bounded queue between stages provide?</p>
+<ol class="opts"><li>Encryption</li><li data-correct>Backpressure: producers slow when consumers fall behind, so memory does not fill</li><li>Higher throughput</li><li>Ordering</li></ol>
+<div class="explain">The same principle as admission control.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-25" data-topic="§19.6 Pipelines">
+<p class="q">Pages take 100 ms of CPU to render and yield 1,000 tokens; a GPU prefills 31,000 tokens/s. Cores of rendering needed per GPU:</p>
+<ol class="opts"><li>0.3</li><li data-correct>About 3</li><li>31</li><li>310</li></ol>
+<div class="explain">31 pages/s × 0.1 s.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-26" data-topic="§19.6 Pipelines">
+<p class="q">What should happen to a row whose output repeatedly fails validation?</p>
+<ol class="opts"><li>Fail the job</li><li>Retry forever</li><li data-correct>After bounded retries, write it to a dead-letter set for inspection</li><li>Drop it silently</li></ol>
+<div class="explain">One bad row must not fail 200 million.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-27" data-topic="§19.7 Rollouts">
+<p class="q">In the 8B RLVR step of Vol. I §25.7, roughly what share of the step is generation?</p>
+<ol class="opts"><li>10%</li><li>One third</li><li data-correct>Two thirds</li><li>99%</li></ol>
+<div class="explain">About 200 s of 300 s.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-28" data-topic="§19.7 Rollouts">
+<p class="q">Which parts of an RL system suit elastic or spot capacity?</p>
+<ol class="opts"><li>The trainer</li><li data-correct>The rollout engines</li><li>Neither</li><li>Only the trajectory store</li></ol>
+<div class="explain">Rollouts within a step are independent rows; the trainer is a coupled job.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-29" data-topic="§19.7 Rollouts">
+<p class="q">Why are prefix caches invalidated at each policy update?</p>
+<ol class="opts"><li>To save memory</li><li data-correct>KV computed with the old weights is wrong for the new weights</li><li>Prompts change</li><li>For security</li></ol>
+<div class="explain">Every update changes every layer's keys and values.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-30" data-topic="§19.7 Rollouts">
+<p class="q">Why must the trajectory store record policy version and sampling log-probabilities?</p>
+<ol class="opts"><li>For billing</li><li data-correct>Asynchronous training must correct or discard stale rollouts using importance ratios</li><li>For compression</li><li>To speed decoding</li></ol>
+<div class="explain">Staleness \(n_{\text{stale}}\) is bounded.</div>
+</div>
+
+<div class="mcq" data-id="ci19-mcq-31" data-topic="§19.8 Operations">
+<p class="q">Which belong in an offline job's record for reproducibility? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Weight hash and engine version</li><li data-correct>Sampling parameters and seeds</li><li data-correct>Prompt template and dataset version</li><li>The operator's laptop model</li></ol>
+<div class="explain">Bit-identical outputs still vary with batch size and hardware.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci19-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Why is the batch API half price?</summary>
+<div class="answer">
+<p>Online fleets are sized for the peak and average ~50–60% utilisation; trough GPU-hours are already paid for, so batch work there has near-zero marginal cost. Batch also runs more efficiently: maximum batch sizes, shared prefixes, no streaming, ~90% utilisation. The 24-hour window guarantees a full trough. Batch is also interruptible, acting as a reserve the provider can reclaim in seconds. Once batch demand exceeds the trough it needs its own GPUs, and the full cost at high utilisation is about half the interactive price.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-02">
+<summary><span class="lvl warm">Warm-up</span> How does the optimisation objective change for offline inference?</summary>
+<div class="answer">
+<p>From meeting TTFT/TPOT percentiles at minimum cost to minimising cost per token subject to a deadline. Consequences: run at the largest batch memory allows; choose when and where to run (troughs, cheap regions, spot); drop streaming; reorder rows for prefix sharing and length packing; tolerate and retry failures per row; trade model size and quantisation against validated quality.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-03">
+<summary><span class="lvl core">Core</span> Derive decode throughput versus batch size and say what limits it.</summary>
+<div class="answer">
+<p>Step time = (W_bytes + B·n_ctx·s_kv)/β_eff: weights read once, every sequence's KV once. Throughput = B·β_eff/(W_bytes + B·n_ctx·s_kv); rises with B, saturating at β_eff/(n_ctx·s_kv). Limits: KV memory (B·n_ctx·s_kv ≤ HBM − weights), then compute π at very large B. Llama 3 8B/H100: 500-token contexts → B ≈ 945, ~32k tok/s; 2,000 tokens → B ≈ 236, ~8k tok/s. Context length is the lever.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-04">
+<summary><span class="lvl core">Core</span> Estimate the cost of classifying 200 million documents with an 8B model by tomorrow.</summary>
+<div class="answer">
+<p>Per row 800 input (300 shared instruction + 500 doc), 50 output. Prefill ~31k tok/s per H100 (2N FLOPs/token at ~500 TFLOP/s); decode ~19k tok/s at B = 512. Naive: 160B/31k + 10B/19k ≈ 5.7M GPU-s ≈ 1,580 GPU-h. With instruction cached: 100B/31k + … ≈ 1,040 GPU-h. 24 h → ~44 GPUs (+margin). Cost ≈ $2,600 committed at $2.50/h, ≈ $1,050 spot. Check CPU stages, storage and validation are not bottlenecks.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-05">
+<summary><span class="lvl core">Core</span> How do you run batch jobs on production GPUs without hurting production?</summary>
+<div class="answer">
+<p>Share engines with strict priority for online sequences; batch fills leftover slots and KV; preempt batch at token boundaries on online arrival (evict or offload KV, requeue with progress). Cap batch occupancy so online TPOT stays within target; bound batch prefill chunks; keep KV headroom so new online requests never wait. At fleet level, autoscaler shifts replicas between pools for the diurnal swing. Monitor online tail latency with and without batch; kill switch to pause batch. ConServe-style harvesting.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-06">
+<summary><span class="lvl core">Core</span> Why is batch inference a good fit for spot instances?</summary>
+<div class="answer">
+<p>Work is independent rows; the checkpoint is the set of completed row IDs, nearly free to maintain. A preemption loses only in-flight rows plus restart time: waste ≈ t_restart/(MTBF + t_restart), e.g. 4 min / 124 min ≈ 3%, against 60%+ discounts. Requirements: idempotent outputs keyed by row ID, small commit units, fast cold starts (cached weights/images), use of preemption notices, and a committed fallback for deadlines. Training by contrast is a chain needing Young–Daly checkpoints.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-07">
+<summary><span class="lvl deep">Deep-dive</span> Design admission control for a batch API with a 24-hour SLA.</summary>
+<div class="answer">
+<p>Estimate each job's work (tokens → GPU-hours by model, using measured rates). Forecast spare capacity per hour per region (capacity × ceiling − online forecast) with uncertainty; use a conservative quantile. Order admitted jobs by deadline (EDF); a new job is feasible if for every deadline the cumulative work due does not exceed cumulative spare capacity. If not, quote a later completion, route to another region's trough (residency permitting), or reserve paid capacity. Per-customer quotas to prevent one job taking the trough; continuous re-planning as actual online load deviates; alarms when projected completion approaches the SLA.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> In RL for reasoning models, where does the time go and how do systems fix it?</summary>
+<div class="answer">
+<p>Generation dominates (about two thirds in the 8B example), and over half of generation is waiting for long-tail rollouts while GPUs decode at small batch. Fixes: asynchronous actor–learner with a trajectory store (bounded staleness, importance correction), over-sampling with early termination, partial rollouts, length curricula, production engines at maximum batch with shared-prompt KV for n_s samples; fast weight sync by broadcast or in-place update; enough CPU for environments/verifiers. Then training speed-ups matter.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> What are the infrastructure parts of a rollout fleet and how does each scale?</summary>
+<div class="answer">
+<p>Rollout engines: elastic GPU inference, row-parallel, spot-friendly, policy-version tagged. Environments: CPU sandboxes/tools/tests, one per concurrent rollout, bursty, need fast start (snapshots) and isolation. Trajectory store: tokens, log-probs, rewards, versions; decouples generation from training. Trainer: fixed, committed GPUs with checkpoints. Weight distribution: tree/chain broadcast each update; cache invalidation. Control: curriculum/task queue, staleness limits. Capacity: rollouts as the largest flexible tenant, run in the serving trough.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-10">
+<summary><span class="lvl design">Design</span> Design an offline pipeline to OCR and summarise one billion scanned pages.</summary>
+<div class="answer">
+<p>Stages: list/read from object storage → CPU render/deskew → vision-language model for OCR (image tokens, Chapter 15) → summariser (smaller text model) → validation → keyed write. Compute each stage's rate; separate autoscaled pools; bounded queues. Model stage: maximum batch, shared instruction prefix, length bucketing, spot GPUs with row checkpoints and fast restart, committed fallback. Cascade: cheap OCR model first, escalate low-confidence pages. Idempotent outputs keyed by page ID, small commits, dead-letter set. Quality sampling by a judge model and humans. Cost tags; residency of data; throughput and GPU-utilisation dashboards; estimate total GPU-hours and deadline before starting.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-11">
+<summary><span class="lvl design">Design</span> Design an evaluation service that scores every new checkpoint on forty benchmarks.</summary>
+<div class="answer">
+<p>Job spec pins weight hash, engine/version, quantisation, sampling params, seeds, templates, dataset versions. Scheduler runs benchmarks as batch jobs with priorities (release-blocking first), on trough or spot capacity with deadlines. Engines at maximum batch; result cache keyed by (weights, prompt, params) for reruns and partial failures. Judges/verifiers as separate stages (sandboxed code execution for coding benchmarks). Report means with seed variance and confidence intervals; compare under identical configs. Lineage to keep eval data out of training; dashboards of regressions; cost attribution per team.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-12">
+<summary><span class="lvl core">Core</span> Your batch job's GPUs show 40% utilisation. What do you check?</summary>
+<div class="answer">
+<p>Upstream starvation: CPU preprocessing, tokenisation, storage reads, network—look at queue depth before the model stage. Batch size below memory limit (engine config, too few concurrent requests from the client). Long-context rows crowding KV. Output/validation stage backpressure. Row ordering causing padding. Stragglers if the job is step-synchronous. Small files and per-request overheads (HTTP per row instead of in-process batching). Fix the slowest stage; scale CPU pools; raise client concurrency.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-13">
+<summary><span class="lvl core">Core</span> How much batch work can a fleet absorb for free?</summary>
+<div class="answer">
+<p>Integrate (ceiling − online load) over the day. With online peak at 80% and mean 55% of capacity and a 90% ceiling: spare averages 35% of the fleet → 0.35/0.55 = 64% more work. For 4,000 GPUs ≈ 33,600 GPU-h/day. Subtract headroom for forecast error and interference caps; account for model mix (spare GPUs must host the batch job's model, or pay switching time).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-14">
+<summary><span class="lvl warm">Warm-up</span> What makes batch output writes safe under retries and preemption?</summary>
+<div class="answer">
+<p>Stable row IDs; outputs keyed by ID so reprocessing overwrites; small atomic commits (write temp object then rename, or transactional append with offsets); a manifest of completed chunks as the checkpoint; bounded retries with dead-letter storage; deterministic chunking so workers do not overlap. Exactly-once effect from at-least-once processing plus idempotent writes.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> Why are outputs not bit-reproducible across batch runs, and how do you handle it?</summary>
+<div class="answer">
+<p>Floating-point addition is not associative; batch size, kernel choice, hardware, parallelism (TP degree) and engine version change reduction order, and tiny logit differences flip near-ties and then diverge. Sampling adds seeds and RNG streams tied to batch position. Handle by pinning configuration, using per-row seeds independent of batch composition, reporting variance across seeds, comparing checkpoints under identical setups, caching results by full configuration hash, and treating small score differences as noise unless significant.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci19-qa-16">
+<summary><span class="lvl design">Design</span> A lab serves a product and trains with RL on the same 10,000 GPUs. How do you share them?</summary>
+<div class="answer">
+<p>Three classes: online serving (priority, sized for peak with headroom), trainer (fixed committed slice), rollouts and batch (flexible). Rollout engines harvest serving capacity: in-engine if the policy and served model match, otherwise replica switching with fast weight load from local cache. Scheduler with quotas and preemption (§7.7); rollouts throttle by day and expand at night; the trainer consumes asynchronously from a trajectory store so varying rollout rates only change staleness, bounded by policy. Environment sandboxes on a CPU fleet. Weight broadcast per update. Kill switch returns everything to serving in an incident. Track GPU-hours by class to judge the split.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-conserve">Y. Qiao et al. ConServe: Harvesting GPUs for Low-Latency and High-Throughput Large Language Model Serving. 2024. <a href="https://arxiv.org/abs/2410.01228">arXiv:2410.01228</a>.</li>
+<li id="r-spotserve">X. Miao et al. SpotServe: Serving Generative Large Language Models on Preemptible Instances. <em>ASPLOS</em>, 2024. <a href="https://arxiv.org/abs/2311.15566">arXiv:2311.15566</a>.</li>
+<li id="r-raydata">F. Luan et al. The Streaming Batch Model for Efficient and Fault-Tolerant Heterogeneous Execution. 2025. <a href="https://arxiv.org/abs/2501.12407">arXiv:2501.12407</a>.</li>
+<li id="r-impala">L. Espeholt et al. IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures. <em>ICML</em>, 2018. <a href="https://arxiv.org/abs/1802.01561">arXiv:1802.01561</a>.</li>
+<li>OpenAI. Batch API documentation, 2024; Anthropic. Message Batches API documentation, 2024.</li>
+<li>A. Agrawal et al. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2403.02310">arXiv:2403.02310</a>.</li>
+<li>DeepSeek-AI. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a>.</li>
+<li>Q. Yu et al. DAPO: An Open-Source LLM Reinforcement Learning System at Scale. 2025. <a href="https://arxiv.org/abs/2503.14476">arXiv:2503.14476</a>.</li>
+<li>C. L. Liu and J. W. Layland. Scheduling Algorithms for Multiprogramming in a Hard-Real-Time Environment. <em>Journal of the ACM</em>, 1973.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

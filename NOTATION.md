@@ -356,3 +356,10 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(n_{\text{chk}}\) | tokens between successive checks of a streamed output |
 | \(c_1\), \(c_2\), \(f_{\text{esc}}\) | per-item cost of cascade stages 1 and 2; fraction escalated to stage 2 |
 | \(t_{\text{rev}}\) | mean human review time per item |
+
+## Batch and offline inference (Vol. II Ch. 19)
+| Symbol | Meaning |
+|---|---|
+| \(n_{\text{ctx}}\) | mean context length (tokens) of the sequences in a decode batch |
+| \(w_j\) | remaining work of batch job \(j\), in GPU-hours |
+| \(t_{\text{restart}}\) | time to resume after a preemption (new instance, weights, caches) |
