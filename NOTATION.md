@@ -363,3 +363,10 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(n_{\text{ctx}}\) | mean context length (tokens) of the sequences in a decode batch |
 | \(w_j\) | remaining work of batch job \(j\), in GPU-hours |
 | \(t_{\text{restart}}\) | time to resume after a preemption (new instance, weights, caches) |
+
+## Design interview (Vol. II Ch. 20)
+| Symbol | Meaning |
+|---|---|
+| \(\lambda_{\text{peak}}\), \(u_{\text{peak}}\) | peak request rate; utilisation allowed at peak |
+| \(r_{\text{gpu}}\) | output tokens per second one GPU produces at its operating point |
+| \(\tau_{\text{warm}}\) | keep-warm timeout of a serverless replica (distinct from the sampling temperature \(\tau\)) |

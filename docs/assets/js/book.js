@@ -64,7 +64,7 @@
     { id: 'ci17', n: 17, part: 'V', title: 'Agents and Compound AI Systems', sub: 'Tool calls, MCP, code sandboxes, session state, program-aware scheduling', file: 'cloud/ci17.html', ready: true },
     { id: 'ci18', n: 18, part: 'V', title: 'Guardrails and Moderation Infrastructure', sub: 'Safety classifiers, streaming moderation, guard-model placement, audit', file: 'cloud/ci18.html', ready: true },
     { id: 'ci19', n: 19, part: 'V', title: 'Batch, Offline and Rollout Inference', sub: 'Batch APIs, throughput-optimal pipelines, spot-tolerant jobs, RL rollouts', file: 'cloud/ci19.html', ready: true },
-    { id: 'ci20', n: 20, part: 'VI', title: 'The Cloud Infrastructure Design Interview', sub: 'Worked case studies, estimation drills and rubrics', file: 'cloud/ci20.html', ready: false }
+    { id: 'ci20', n: 20, part: 'VI', title: 'The Cloud Infrastructure Design Interview', sub: 'Worked case studies, estimation drills and rubrics', file: 'cloud/ci20.html', ready: true }
   ];
   const CLOUD_PARTS = { I: 'The Physical Cloud', II: 'Orchestration', III: 'Elasticity and Economics', IV: 'The Global Request Path', V: 'Beyond Chat: Workloads Volume I Left Open', VI: 'The Interview' };
   const BOOKS = {

@@ -344,6 +344,12 @@
 <tr><td>\(w_j\)</td><td>remaining work of batch job \(j\), in GPU-hours</td></tr>
 <tr><td>\(t_{\text{restart}}\)</td><td>time to resume after a preemption (new instance, weights, caches)</td></tr>
 </tbody></table></div>
+<h2>Design interview (Vol. II Ch. 20)</h2>
+<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>\(\lambda_{\text{peak}}\), \(u_{\text{peak}}\)</td><td>peak request rate; utilisation allowed at peak</td></tr>
+<tr><td>\(r_{\text{gpu}}\)</td><td>output tokens per second one GPU produces at its operating point</td></tr>
+<tr><td>\(\tau_{\text{warm}}\)</td><td>keep-warm timeout of a serverless replica (distinct from the sampling temperature \(\tau\))</td></tr>
+</tbody></table></div>
 </div>
 </body>
 </html>

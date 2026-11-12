@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 20 · The Cloud Infrastructure Design Interview — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 20 of Cloud AI Infrastructure: how to answer infrastructure design questions for AI serving. A method for the 45-minute interview, an estimation toolkit of the volume's key numbers and formulas, and worked case studies: a global LLM API, a serverless GPU platform, a scheduler for a ten-thousand-GPU cluster, a billion-vector retrieval service and an agent sandbox fleet, with the rubrics by which answers are graded.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci20" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part VI · Synthesis — Chapter 20</div>
+<h1 id="top">The Cloud Infrastructure Design Interview</h1>
+<p class="lede">An infrastructure interview does not ask for chapters. It asks for a system—"design a global LLM API", "design a serverless GPU platform", "design the scheduler for our cluster"—and gives you forty-five minutes, a whiteboard and an interviewer who will push on whichever part you understand least. This final chapter turns the volume into that performance: a method for structuring the answer, a toolkit of numbers and formulas to estimate with, five worked cases, and the criteria by which answers are judged.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Volume I ended with the model-serving design interview: given a model and a latency target, choose the engine configuration, the batch size, the parallelism and the cache policy (Vol. I Chapter 30). The questions of this volume sit one level up. The model and the engine are taken as components, and the candidate is asked to design what surrounds them: fleets across regions, capacity and its cost, schedulers, platforms that other teams build on, and the behaviour of the whole when something fails. These are the questions asked for infrastructure, platform and site-reliability roles at AI laboratories, at cloud providers and at any company that runs models at scale, and at senior levels they are usually the deciding rounds.</p>
+<p>The difficulty is rarely knowledge of any one topic. It is assembly under time pressure: deciding what to ask, estimating before designing, drawing a system whose parts connect, going deep where it matters, and saying what would break. Candidates who know every chapter of this book still fail by designing without numbers, by describing components instead of making decisions, or by never mentioning failure. A method prevents all three, and practice on realistic cases makes it automatic.</p>
+<p>We describe what the interview assesses and a method that fits it (§20.1), then collect the estimation toolkit (§20.2). Three full cases follow: a global LLM API (§20.3), a serverless GPU platform (§20.4) and a scheduler for a ten-thousand-GPU cluster (§20.5); then two shorter ones, a billion-vector retrieval service and an agent sandbox fleet (§20.6). We end with how answers are graded and the mistakes that sink them (§20.7).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Structure a 45-minute infrastructure design answer: requirements, estimates, architecture, deep dives, failures, trade-offs.</li>
+<li>Convert a demand statement into GPUs, megawatts, dollars and replicas from memory, using a small set of constants and formulas.</li>
+<li>Design a multi-region LLM API with capacity, routing, reliability and cost reasoning.</li>
+<li>Design a serverless GPU platform, quantifying pooling gains, cold starts and keep-warm policies.</li>
+<li>Design a cluster scheduler for mixed inference, training and batch workloads.</li>
+<li>Recognise what distinguishes senior and staff-level answers, and avoid the common failure modes.</li>
+</ol>
+<p class="small muted">Uses: every earlier chapter of this volume, and the engine-level design method of Vol. I Chapter 30.</p>
+</div>
+
+<h2 id="s20-1">20.1 What the interview assesses, and a method that fits</h2>
+<p>An interviewer in a design round is trying to predict how you would behave as the owner of a real system, and looks for five things. <strong>Scoping</strong>: do you find out what is being asked—scale, latency targets, tenancy, regions, budget—before designing, and do you choose sensible assumptions when the interviewer declines to answer? <strong>Quantitative reasoning</strong>: can you estimate the size of the system and let the numbers drive the design? <strong>Architecture</strong>: do the components connect into something that would work, with clear responsibilities and interfaces? <strong>Depth</strong>: when pushed on one part, do you know how it really works and what its failure modes are? <strong>Judgement</strong>: do you see the trade-offs, state what you would choose and why, and know what you would measure to find out whether you were right? Knowledge of buzzwords is not on the list, and naming a product is never an answer to a design question.</p>
+<p>A method makes room for all five in the time available. Figure 20.1 shows one allocation of a 45-minute round. The proportions matter more than the minutes: a third of the time on scoping and estimation feels extravagant to candidates and is exactly what interviewers reward, because the estimates determine which parts of the design are hard.</p>
+
+<figure class="diagram" id="fig-20-1">
+<svg class="dg" viewBox="0 0 720 230" role="img" aria-label="Time allocation for a 45-minute design interview">
+<rect x="15" y="40" width="92" height="70" rx="6" class="bx4"/><text x="61" y="62" text-anchor="middle" class="t-xs t-b">1 Scope</text><text x="61" y="78" text-anchor="middle" class="t-xs">users, SLOs,</text><text x="61" y="92" text-anchor="middle" class="t-xs">constraints</text>
+<rect x="107" y="40" width="107" height="70" rx="6" class="bx2"/><text x="160" y="62" text-anchor="middle" class="t-xs t-b">2 Estimate</text><text x="160" y="78" text-anchor="middle" class="t-xs">tokens → GPUs →</text><text x="160" y="92" text-anchor="middle" class="t-xs">MW → dollars</text>
+<rect x="214" y="40" width="153" height="70" rx="6" class="bx3"/><text x="290" y="62" text-anchor="middle" class="t-xs t-b">3 Architecture</text><text x="290" y="78" text-anchor="middle" class="t-xs">data plane, control plane,</text><text x="290" y="92" text-anchor="middle" class="t-xs">request path end to end</text>
+<rect x="367" y="40" width="184" height="70" rx="6" class="bx5"/><text x="459" y="62" text-anchor="middle" class="t-xs t-b">4 Deep dives</text><text x="459" y="78" text-anchor="middle" class="t-xs">two hard parts, chosen by</text><text x="459" y="92" text-anchor="middle" class="t-xs">the numbers or the interviewer</text>
+<rect x="551" y="40" width="92" height="70" rx="6" class="bx2"/><text x="597" y="62" text-anchor="middle" class="t-xs t-b">5 Failures</text><text x="597" y="78" text-anchor="middle" class="t-xs">what breaks,</text><text x="597" y="92" text-anchor="middle" class="t-xs">what then</text>
+<rect x="643" y="40" width="62" height="70" rx="6" class="bx"/><text x="674" y="62" text-anchor="middle" class="t-xs t-b">6 Wrap</text><text x="674" y="78" text-anchor="middle" class="t-xs">trade-offs,</text><text x="674" y="92" text-anchor="middle" class="t-xs">metrics</text>
+<text x="61" y="130" text-anchor="middle" class="t-xs">0–6 min</text><text x="160" y="130" text-anchor="middle" class="t-xs">6–13</text><text x="290" y="130" text-anchor="middle" class="t-xs">13–23</text><text x="459" y="130" text-anchor="middle" class="t-xs">23–35</text><text x="597" y="130" text-anchor="middle" class="t-xs">35–41</text><text x="674" y="130" text-anchor="middle" class="t-xs">41–45</text>
+<rect x="15" y="155" width="690" height="56" rx="8" class="bx"/>
+<text x="360" y="176" text-anchor="middle" class="t-xs t-b">Throughout: say the assumption, write the number, name the trade-off, state the decision.</text>
+<text x="360" y="194" text-anchor="middle" class="t-xs">The estimates of step 2 choose the deep dives of step 4: go deep where the numbers say the system is hard.</text>
+</svg>
+<figcaption><b>Figure 20.1 — Forty-five minutes.</b> About a third of the time goes to scoping and estimation, a quarter to the architecture, a quarter to two deep dives, and the rest to failures and trade-offs.</figcaption>
+</figure>
+
+<p>Figure 20.1's six steps deserve a sentence each. In <em>scope</em>, ask who the users are, what the load is (requests per second at peak, tokens in and out), what the latency and availability targets are, which models, how many regions, and what is out of scope; write the answers down as a requirements list. In <em>estimate</em>, turn that load into GPUs, power and money (§20.2), and notice what dominates. In <em>architecture</em>, draw the request path from client to GPU and back, then the control plane that manages it (§1.7), naming each component's job. In <em>deep dives</em>, pick the two parts the numbers make hardest—or accept the interviewer's choice—and reason about them at the level of mechanisms. In <em>failures</em>, walk through the loss of a node, a zone, a region and a dependency, and say what users experience. In <em>wrap-up</em>, summarise the main trade-offs, what you would build first, and what you would monitor. Speak in decisions: not "we could use a warm pool" but "I would keep a warm pool of ten replicas, because a cold start is 70 seconds and the burst rate needs that many within it".</p>
+
+<h2 id="s20-2">20.2 The estimation toolkit</h2>
+<p>Estimation in an interview is done from memory, so it rests on a small set of constants and a smaller set of formulas. The constants below are those this volume has used throughout; rounding them is fine, but being wrong by a factor of ten is not, and interviewers notice both fluency and sanity checks.</p>
+<p><strong>Hardware.</strong> An H100 has 80 GB of memory, 3.35 TB/s of bandwidth and about \(10^{15}\) FLOP/s of dense BF16 arithmetic; all-in it draws about 1.4 kW of IT power and rents for about $2.50 per hour on a multi-year commitment, so a GPU-year costs about $22,000 and a megawatt of IT power holds about 700 of them (§1.6). Newer generations roughly double memory and throughput per GPU at about 2 kW. Facility power is IT power times a PUE of 1.1–1.5 (Chapter 2). A 400 Gb/s link moves 50 GB/s; a local NVMe drive reads a few GB/s; object storage delivers 1–2 GB/s per stream (Chapters 4 and 5).</p>
+<p><strong>Models.</strong> Llama 3 8B is 16 GB in BF16 with 128 KiB of KV cache per token; Llama 3 70B is 141 GB with 320 KiB per token, and is served across eight H100s. Online, a single H100 produces about 9,000 output tokens per second from the 8B model, and an eight-GPU replica about 6,000 from the 70B model—so the larger model costs roughly twelve times as much per token. Prefill costs \(2N\) FLOPs per token; decode is bandwidth-bound (Vol. I Chapter 6).</p>
+<p><strong>Demand.</strong> Peak-to-mean ratios of 1.5–2 are typical for regional traffic; fleets sized for the peak with headroom average about 55% utilisation (§1.6, §9.3). The basic conversion is</p>
+\[
+n_{\text{gpu}}=\frac{\lambda_{\text{peak}}\;n_{\text{out}}}{r_{\text{gpu}}\;u_{\text{peak}}},
+\]
+<p>where \(\lambda_{\text{peak}}\) is the peak request rate, \(n_{\text{out}}\) the mean output tokens, \(r_{\text{gpu}}\) the output tokens per second one GPU produces at its operating point (with prefill included in the measured rate), and \(u_{\text{peak}}\) the utilisation allowed at peak, typically 0.75. Figure 20.2 plots it for the two dense running models.</p>
+
+<figure class="chart" id="fig-20-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"H100s needed at peak, against peak request rate (400 output tokens per request, 75% peak utilisation)","height":330,
+ "x":{"label":"Peak requests per second (log)","log":true,"min":100,"max":100000,"ticks":[100,1000,10000,100000]},
+ "y":{"label":"H100s (log)","log":true,"min":3,"max":100000,"ticks":[10,100,1000,10000,100000]},
+ "series":[
+  {"name":"Llama 3 70B (750 tokens/s per GPU)","color":"s2","points":[[100,71],[1000,711],[10000,7111,"7.1k"],[100000,71111]]},
+  {"name":"Llama 3 8B (9,000 tokens/s per GPU)","color":"s3","points":[[100,6],[1000,59],[10000,593,"593"],[100000,5926]]}
+ ]}
+</script>
+<figcaption><b>Figure 20.2 — From requests to GPUs.</b> Fleet size is linear in request rate; the model sets the constant. Ten thousand requests per second need about 600 H100s on the 8B model and about 7,100 on the 70B model, a megawatt against ten.</figcaption>
+</figure>
+
+<p>Figure 20.2 is the first thing to reproduce on a whiteboard, because it settles the character of the system: 600 GPUs is one cluster in one hall; 7,000 is several megawatts and a procurement programme. From GPUs the rest follows by multiplication—power at 1.4 kW each, cost at $22,000 a year each, replicas at one or eight GPUs each—and from the cost and the daily token volume, the cost per million tokens (§10.3). Atlas, the volume's running example, is the mixed case: 10,000 requests per second at peak, split 60/35/5 between an 8B tier, a 70B tier and a DeepSeek-V3 tier, on about 4,000 H100s drawing 5.6 MW and costing about $88 million a year.</p>
+<p><strong>Formulas worth carrying.</strong> Little's law, \(\text{concurrency}=\lambda\times\text{time in system}\), sizes anything with a rate and a duration: sandboxes, reviewers, connections, KV memory. Availability: 99.9% allows 43.8 minutes of downtime a month, 99.99% allows 4.4; components in series multiply availabilities, and \(k\) independent replicas in parallel fail together with probability \(p^k\) (§13.2). Regional redundancy: to survive the loss of one of \(r\) regions at peak, provision \(r/(r-1)\) times the peak (§12.4). Cold starts: time \(\approx\) bytes over bandwidth plus initialisation (§5.1). Pooling: the sum of \(n\) independent demands has a standard deviation that grows as \(\sqrt n\), so headroom per unit shrinks as \(1/\sqrt n\) (§2.4). Compounding: a chain of \(n\) steps each succeeding with probability \(p\) succeeds with \(p^n\) (§17.7). Precision at low prevalence (§18.3). With these and the constants above, every case in this chapter can be sized in two minutes.</p>
+
+<details class="drill">
+<summary>Drill 20.1 — Two-minute sizing</summary>
+<p>A product expects 3,000 requests per second at peak on a 70B-class model, with 500 output tokens per request and a peak-to-mean ratio of 1.8. Estimate the GPUs, IT power, annual hardware cost, and cost per million output tokens.</p>
+<p><em>Solution.</em> \(n_{\text{gpu}}=3000\times500/(750\times0.75)\approx2{,}670\) H100s, about 330 eight-GPU replicas. Power: \(2{,}670\times1.4\approx3.7\) MW of IT load. Cost: \(2{,}670\times\$22{,}000\approx\$59\) million a year. Mean rate: \(3000/1.8\approx1{,}670\) requests per second, \(8.3\times10^5\) output tokens per second, \(2.6\times10^{13}\) per year; \(\$59\times10^6/2.6\times10^{7}\) million tokens \(\approx\$2.25\) per million output tokens of hardware cost, before electricity, staff and margin. Sanity check: mean utilisation is \(0.75/1.8\approx42\%\), on the low side, so a batch tier or a second time zone would improve the economics.</p>
+</details>
+
+<h2 id="s20-3">20.3 Case study: a global LLM API</h2>
+<p><em>"Design a public LLM API serving three model tiers to customers on three continents."</em> This is the Atlas problem, and the whole volume is its answer; the interview skill is compressing it.</p>
+<p><strong>Scope.</strong> Ask, or assume and state: 10,000 requests per second at global peak; three tiers (small, large, reasoning); streaming responses; TTFT under 500 ms at the 95th percentile for the small and large tiers; 99.9% availability; enterprise customers with data-residency requirements in Europe; token-priced, with rate limits per customer. Out of scope: training, the engine's internals.</p>
+<p><strong>Estimate.</strong> By §20.2, about 4,000 H100s: roughly 600 for the 8B tier, 2,500 for the 70B tier and 900 for the reasoning tier; 5.6 MW of IT load; $88 million a year. The peak in each region is offset by time zone, so three regions each carry about 40% of the global peak at their own peak. To survive the loss of one region the survivors must absorb its traffic: with three regions, provision \(3/2\) of what each would otherwise need, unless the business accepts shedding the batch tier and degrading the reasoning tier in a regional outage—a choice worth saying aloud, because it is the difference between 4,000 and 6,000 GPUs.</p>
+
+<figure class="diagram" id="fig-20-3">
+<svg class="dg" viewBox="0 0 720 300" role="img" aria-label="Architecture of a global LLM API">
+<defs><marker id="a203" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="20" width="110" height="46" rx="8" class="bx"/><text x="70" y="40" text-anchor="middle" class="t-xs t-b">clients</text><text x="70" y="55" text-anchor="middle" class="t-xs">SDKs, SSE streams</text>
+<rect x="160" y="20" width="150" height="46" rx="8" class="bx4"/><text x="235" y="40" text-anchor="middle" class="t-xs t-b">global routing</text><text x="235" y="55" text-anchor="middle" class="t-xs">DNS / anycast, residency</text>
+<line x1="125" y1="43" x2="158" y2="43" class="ln" marker-end="url(#a203)"/>
+<rect x="15" y="95" width="690" height="130" rx="10" class="bx"/>
+<text x="690" y="114" text-anchor="end" class="t-xs t-b">one region (× 3), spread over 3 zones</text>
+<rect x="30" y="125" width="120" height="85" rx="8" class="bx4"/><text x="90" y="146" text-anchor="middle" class="t-xs t-b">API gateway</text><text x="90" y="162" text-anchor="middle" class="t-xs">auth, rate limits,</text><text x="90" y="176" text-anchor="middle" class="t-xs">metering, streams,</text><text x="90" y="190" text-anchor="middle" class="t-xs">guards in parallel</text>
+<rect x="170" y="125" width="130" height="85" rx="8" class="bx3"/><text x="235" y="146" text-anchor="middle" class="t-xs t-b">inference router</text><text x="235" y="162" text-anchor="middle" class="t-xs">per-model pools,</text><text x="235" y="176" text-anchor="middle" class="t-xs">cache- and load-aware,</text><text x="235" y="190" text-anchor="middle" class="t-xs">admission, shedding</text>
+<rect x="320" y="125" width="110" height="38" rx="6" class="bx2"/><text x="375" y="148" text-anchor="middle" class="t-xs">8B replicas (1 GPU)</text>
+<rect x="320" y="168" width="110" height="42" rx="6" class="bx2"/><text x="375" y="186" text-anchor="middle" class="t-xs">70B replicas (TP8)</text><text x="375" y="200" text-anchor="middle" class="t-xs">reasoning tier</text>
+<rect x="450" y="125" width="115" height="85" rx="8" class="bx5"/><text x="507" y="146" text-anchor="middle" class="t-xs t-b">cluster</text><text x="507" y="162" text-anchor="middle" class="t-xs">Kubernetes, GPU</text><text x="507" y="176" text-anchor="middle" class="t-xs">scheduler, autoscaler,</text><text x="507" y="190" text-anchor="middle" class="t-xs">warm pool</text>
+<rect x="585" y="125" width="105" height="85" rx="8" class="bx"/><text x="637" y="146" text-anchor="middle" class="t-xs t-b">storage</text><text x="637" y="162" text-anchor="middle" class="t-xs">weights cache,</text><text x="637" y="176" text-anchor="middle" class="t-xs">images, logs,</text><text x="637" y="190" text-anchor="middle" class="t-xs">batch files</text>
+<line x1="235" y1="66" x2="100" y2="123" class="ln" marker-end="url(#a203)"/>
+<line x1="150" y1="167" x2="168" y2="167" class="ln" marker-end="url(#a203)"/>
+<line x1="300" y1="150" x2="318" y2="146" class="ln" marker-end="url(#a203)"/><line x1="300" y1="185" x2="318" y2="188" class="ln" marker-end="url(#a203)"/>
+<line x1="450" y1="167" x2="432" y2="167" class="ln ln-acc" marker-end="url(#a203)"/>
+<line x1="585" y1="167" x2="567" y2="167" class="ln ln-acc" marker-end="url(#a203)"/>
+<rect x="15" y="245" width="690" height="42" rx="8" class="bx"/>
+<text x="360" y="263" text-anchor="middle" class="t-xs t-b">global control plane</text>
+<text x="360" y="279" text-anchor="middle" class="t-xs">capacity planning and placement, config and model rollout (canary by region), quotas, billing, SLO dashboards</text>
+</svg>
+<figcaption><b>Figure 20.3 — A global LLM API.</b> Requests are routed to a region by latency and residency, pass a gateway and an inference router, and land on per-model replica pools managed by a cluster scheduler and autoscaler; a global control plane handles capacity, rollout, quotas and billing.</figcaption>
+</figure>
+
+<p><strong>Architecture.</strong> Figure 20.3 is the picture to draw, in this order. The <em>request path</em>: global routing sends each client to the nearest region allowed by its residency policy (Chapter 12); the gateway authenticates, applies token-aware rate limits, starts metering, runs the input guard in parallel with prefill and holds the stream until its verdict (Chapters 11 and 18); the inference router picks a replica by prefix-cache affinity and load, and applies admission control (Chapter 8); the engine streams tokens back through the gateway. The <em>regional control plane</em>: Kubernetes with a GPU-aware scheduler places replicas across zones; an autoscaler follows the diurnal curve with a warm pool for bursts; weights are cached on local disks and distributed peer to peer (Chapters 5–7 and 9). The <em>global control plane</em>: capacity planning and placement of models across regions, staged rollout of models and configuration, quotas and billing, and the SLO dashboards.</p>
+<p><strong>Deep dives.</strong> The numbers suggest two. First, <em>capacity and cost</em>: commit to roughly the trough-to-mean level, cover the diurnal swing with shorter commitments and autoscaling, sell the trough as a batch tier at half price (§19.3), and place the reasoning tier in the regions with cheapest power, since its users tolerate latency. Second, <em>overload behaviour</em>: when demand exceeds capacity the system must degrade in a planned order—pause batch, queue then shed the lowest-priority tenants with a retry-after header, protect goodput with admission control rather than letting every request miss its deadline (§11.6)—and retries must be budgeted so that a brief overload does not become a retry storm.</p>
+<p><strong>Failures.</strong> Node loss: the router's health checks eject the replica within seconds, in-flight streams fail and clients retry with idempotency keys; a few replicas of headroom absorb it. Zone loss: a third of a region's capacity, covered by spreading replicas across zones and by overflow to other regions for traffic without residency constraints. Region loss: global routing withdraws it; the others absorb what their headroom allows and shed the rest by tier. Control-plane loss: the data plane must keep serving with its last configuration—static stability (§13.6). A bad rollout is the most likely outage of all, hence canaries by region and automatic rollback.</p>
+
+<h2 id="s20-4">20.4 Case study: a serverless GPU platform</h2>
+<p><em>"Design a platform where customers deploy their own models and pay only while requests are running."</em> The product promise—scale to zero, pay per second—is economically possible only because of statistical pooling, and technically hard only because of cold starts. A good answer makes both quantitative.</p>
+<p><strong>Scope.</strong> Customers upload a container or name a model; the platform gives them an endpoint; replicas start on demand and stop when idle; billing is per second of GPU time. Assume 10,000 deployed endpoints, most of them rarely used, models from 2 GB to 150 GB, a target first-response time under 10 s for small models on a cold start, and strong isolation between customers.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — why scale-to-zero can be sold at all</div>
+<p><strong>One customer.</strong> An endpoint is busy 6% of the time. A dedicated H100 at $2.50 per hour costs $60 a day; on a serverless platform charging $5.00 per active GPU-hour it costs \(0.06\times24\times5.00=\$7.20\). The customer saves a factor of eight despite paying double the hourly rate. The break-even utilisation is \(2.50/5.00=50\%\): above it, dedicated capacity is cheaper.</p>
+<p><strong>The platform.</strong> Suppose 1,000 such endpoints, each independently active with probability 0.06. The number active at once has mean 60 and standard deviation \(\sqrt{1000\times0.06\times0.94}\approx7.5\). Provisioning for the mean plus three standard deviations needs about 83 GPUs—not 1,000. Revenue is \(60\times\$5.00=\$300\) per hour against a cost of \(83\times\$2.50\approx\$208\): a margin of about 30%, from GPUs that are 72% utilised.</p>
+<p><strong>The catch.</strong> Demands are not independent—customers share a working day—so the peak is higher than the binomial says; and each activation must load a model onto a GPU that just held another customer's. The margin is spent on the peak-hour headroom and on making that switch fast.</p>
+</div>
+
+<figure class="diagram" id="fig-20-4">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Architecture of a serverless GPU platform">
+<defs><marker id="a204" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="100" width="100" height="60" rx="8" class="bx"/><text x="65" y="125" text-anchor="middle" class="t-xs t-b">request</text><text x="65" y="141" text-anchor="middle" class="t-xs">to endpoint E</text>
+<rect x="145" y="85" width="140" height="90" rx="10" class="bx4"/><text x="215" y="108" text-anchor="middle" class="t-xs t-b">front door / activator</text><text x="215" y="124" text-anchor="middle" class="t-xs">routes to a live replica,</text><text x="215" y="138" text-anchor="middle" class="t-xs">or buffers the request</text><text x="215" y="152" text-anchor="middle" class="t-xs">and asks for one</text>
+<rect x="320" y="20" width="160" height="70" rx="10" class="bx3"/><text x="400" y="43" text-anchor="middle" class="t-xs t-b">autoscaler + placer</text><text x="400" y="59" text-anchor="middle" class="t-xs">picks a node that already</text><text x="400" y="73" text-anchor="middle" class="t-xs">caches E's weights</text>
+<rect x="320" y="110" width="160" height="60" rx="10" class="bx2"/><text x="400" y="133" text-anchor="middle" class="t-xs t-b">replica (isolated)</text><text x="400" y="149" text-anchor="middle" class="t-xs">microVM / container + GPU</text>
+<rect x="320" y="190" width="160" height="60" rx="10" class="bx5"/><text x="400" y="213" text-anchor="middle" class="t-xs t-b">node cache</text><text x="400" y="229" text-anchor="middle" class="t-xs">images, weights, snapshots</text>
+<rect x="520" y="20" width="185" height="70" rx="10" class="bx"/><text x="612" y="43" text-anchor="middle" class="t-xs t-b">warm pool</text><text x="612" y="59" text-anchor="middle" class="t-xs">booted nodes, runtime ready,</text><text x="612" y="73" text-anchor="middle" class="t-xs">no model loaded</text>
+<rect x="520" y="110" width="185" height="60" rx="10" class="bx"/><text x="612" y="133" text-anchor="middle" class="t-xs t-b">metering</text><text x="612" y="149" text-anchor="middle" class="t-xs">GPU-seconds per endpoint</text>
+<rect x="520" y="190" width="185" height="60" rx="10" class="bx"/><text x="612" y="213" text-anchor="middle" class="t-xs t-b">object store / registry</text><text x="612" y="229" text-anchor="middle" class="t-xs">cold source of weights</text>
+<line x1="115" y1="130" x2="143" y2="130" class="ln" marker-end="url(#a204)"/>
+<line x1="285" y1="140" x2="318" y2="140" class="ln" marker-end="url(#a204)"/>
+<path d="M285,105 C300,85 305,70 318,60" class="ln ln-acc" fill="none" marker-end="url(#a204)"/>
+<line x1="400" y1="90" x2="400" y2="108" class="ln ln-acc" marker-end="url(#a204)"/>
+<line x1="400" y1="190" x2="400" y2="172" class="ln ln-s3" marker-end="url(#a204)"/>
+<line x1="520" y1="55" x2="482" y2="55" class="ln" marker-end="url(#a204)"/>
+<line x1="480" y1="140" x2="518" y2="140" class="ln" stroke-dasharray="4 3"/>
+<line x1="520" y1="220" x2="482" y2="220" class="ln ln-s3" marker-end="url(#a204)"/>
+<text x="150" y="212" class="t-xs">Idle replicas are stopped after a</text><text x="150" y="226" class="t-xs">keep-warm timeout; their weights</text><text x="150" y="240" class="t-xs">stay in the node cache.</text>
+</svg>
+<figcaption><b>Figure 20.4 — A serverless GPU platform.</b> A request for an endpoint with no live replica is buffered while the placer starts one on a node that already caches the weights; a warm pool hides node boot; idle replicas stop after a timeout but leave their weights cached.</figcaption>
+</figure>
+
+<p><strong>Architecture.</strong> Figure 20.4 shows the parts. The front door knows, for every endpoint, which replicas are live. If one is, the request is routed to it; if none is, an <em>activator</em> holds the request and asks the autoscaler for a replica. The placer chooses a node—preferring one whose local disk already holds that model's weights and image—and starts the replica inside an isolation boundary, a microVM or a hardened container with a dedicated GPU (§14.2, §17.3). When the replica reports ready, the buffered request is released. A replica idle for longer than a keep-warm timeout is stopped; its weights stay in the node's cache until evicted.</p>
+<p><strong>Deep dive: the cold start.</strong> By §5.1, the cold start is a sum: acquire a node (minutes if one must be booted, hence a warm pool of booted nodes), pull the image (seconds if cached, minutes if not), load weights (bytes over bandwidth: 16 GB at a few GB/s from local NVMe is under 10 s; 141 GB from object storage at 2 GB/s is over a minute), and initialise the engine. The platform's engineering is a campaign against each term: lazy-loading image formats, streaming weights straight into GPU memory, peer-to-peer transfer from nodes that hold them, placement by cache affinity, and snapshots of an initialised process restored in seconds. What remains is managed by policy, the keep-warm timeout. If an endpoint's requests arrive as a Poisson process of rate \(\lambda\), a request finds the replica gone exactly when the gap since the previous request exceeded the timeout \(\tau_{\text{warm}}\), which happens with probability \(e^{-\lambda\tau_{\text{warm}}}\). Figure 20.5 plots it.</p>
+
+<figure class="chart" id="fig-20-5">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Fraction of requests that hit a cold start, against keep-warm timeout (Poisson arrivals)","height":320,
+ "x":{"label":"Keep-warm timeout (minutes)","min":0,"max":30,"ticks":[0,5,10,15,20,25,30]},
+ "y":{"label":"Probability a request is a cold start","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"1 request per 20 min","color":"s2","points":[[0,1],[5,0.779],[10,0.607],[15,0.472],[20,0.368],[30,0.223]]},
+  {"name":"1 request per 5 min","color":"s1","points":[[0,1],[2,0.670],[5,0.368],[10,0.135],[15,0.050],[20,0.018],[30,0.002]]},
+  {"name":"1 request per minute","color":"s3","points":[[0,1],[1,0.368],[2,0.135],[3,0.050],[5,0.007],[10,0],[30,0]]}
+ ]}
+</script>
+<figcaption><b>Figure 20.5 — Keep-warm timeouts help busy endpoints and cannot save quiet ones.</b> The cold-start probability is \(e^{-\lambda\tau_{\text{warm}}}\): a five-minute timeout makes cold starts rare at one request per minute, but an endpoint used every twenty minutes still starts cold four times in five.</figcaption>
+</figure>
+
+<p>Figure 20.5 explains serverless pricing and product design. For endpoints with steady traffic a short timeout suffices, and the idle time it adds is small. For rarely used endpoints no affordable timeout helps, so the product must either make the cold start itself fast, or let the customer pay for a minimum of one always-on replica, or set expectations with an asynchronous API. The timeout is a cost to someone: idle-but-warm seconds are either billed to the customer or absorbed by the platform, and platforms differ mainly in who pays. An adaptive policy sets each endpoint's timeout from its own arrival history, long where gaps are short and regular, zero where they are not.</p>
+<p><strong>Second deep dive: multi-tenancy.</strong> Customers run arbitrary containers, so the isolation of Chapter 14 is not optional: a virtual machine or microVM boundary around each replica, GPUs assigned whole (or as MIG slices) and scrubbed between tenants, no shared host paths, network policy that denies traffic between tenants, and per-tenant quotas so that one customer's burst cannot exhaust the warm pool. <strong>Failures</strong>: a node dies—replicas restart elsewhere, cold; the registry is unreachable—cached models still start, new ones cannot, so the cache is also a reliability feature; a regional capacity shortage—queue activations with honest latency estimates and reject beyond a bound, rather than time out silently.</p>
+
+<details class="drill">
+<summary>Drill 20.2 — Choosing a keep-warm timeout</summary>
+<p>An endpoint receives Poisson requests at one per 4 minutes; each takes 20 s of GPU time; a cold start takes 40 s. The platform bills active time only, at $5.00 per GPU-hour, and its own cost is $2.50 per GPU-hour whenever a GPU is held. With a timeout of 8 minutes, what fraction of requests start cold, and roughly what fraction of held GPU time is billable? Is the endpoint profitable for the platform?</p>
+<p><em>Solution.</em> \(\lambda\tau_{\text{warm}}=8/4=2\), so cold starts are \(e^{-2}\approx13.5\%\) of requests. Per request the GPU is held for 20 s of work plus the idle wait until the next request or the timeout, whose mean is \((1-e^{-\lambda\tau_{\text{warm}}})/\lambda=0.865\times240\approx208\) s, plus 40 s of loading on the 13.5% that start cold (5 s on average): about 233 s held, of which 20 s is billable, under 9%. Revenue per request is \(20/3600\times5.00\approx\$0.028\); cost is \(233/3600\times2.50\approx\$0.16\). The endpoint loses money at this timeout. A timeout near zero with a fast cold start, or billing for warm idle time, is required—which is why platforms charge for "provisioned" warmth.</p>
+</details>
+
+<h2 id="s20-5">20.5 Case study: a scheduler for a ten-thousand-GPU cluster</h2>
+<p><em>"Design the scheduler for a cluster of 10,000 GPUs shared by inference services, training jobs and batch work."</em> This case tests whether a candidate understands that scheduling GPUs is a packing problem with topology, priorities and time, not a queue.</p>
+<p><strong>Scope.</strong> 10,000 GPUs are 1,250 eight-GPU nodes in perhaps 40 racks behind a fat-tree network (Chapter 4). Workloads: inference replicas needing 1–8 GPUs on one node, some needing 16–64 across adjacent nodes, with scale-up decisions needed in seconds; training jobs needing 64–2,048 GPUs all at once (gangs) with fast interconnect, running for days; batch and rollout jobs that are flexible and preemptible. Several teams share the cluster under quotas. Targets: more than 90% of GPUs allocated, inference scale-ups placed in under a second, no team starved.</p>
+
+<figure class="diagram" id="fig-20-6">
+<svg class="dg" viewBox="0 0 720 270" role="img" aria-label="Architecture of a GPU cluster scheduler">
+<defs><marker id="a206" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="25" width="130" height="50" rx="8" class="bx2"/><text x="80" y="46" text-anchor="middle" class="t-xs t-b">inference</text><text x="80" y="62" text-anchor="middle" class="t-xs">high priority, seconds</text>
+<rect x="15" y="85" width="130" height="50" rx="8" class="bx5"/><text x="80" y="106" text-anchor="middle" class="t-xs t-b">training gangs</text><text x="80" y="122" text-anchor="middle" class="t-xs">all-or-nothing, days</text>
+<rect x="15" y="145" width="130" height="50" rx="8" class="bx3"/><text x="80" y="166" text-anchor="middle" class="t-xs t-b">batch / rollouts</text><text x="80" y="182" text-anchor="middle" class="t-xs">preemptible filler</text>
+<rect x="180" y="25" width="150" height="170" rx="10" class="bx4"/>
+<text x="255" y="48" text-anchor="middle" class="t-xs t-b">queues and quotas</text>
+<text x="255" y="70" text-anchor="middle" class="t-xs">per-team guaranteed</text>
+<text x="255" y="84" text-anchor="middle" class="t-xs">share + borrowing;</text>
+<text x="255" y="98" text-anchor="middle" class="t-xs">priority classes;</text>
+<text x="255" y="112" text-anchor="middle" class="t-xs">admission: does the</text>
+<text x="255" y="126" text-anchor="middle" class="t-xs">whole gang fit?</text>
+<text x="255" y="150" text-anchor="middle" class="t-xs">reservations and</text>
+<text x="255" y="164" text-anchor="middle" class="t-xs">backfill for large</text>
+<text x="255" y="178" text-anchor="middle" class="t-xs">gangs</text>
+<rect x="365" y="25" width="150" height="170" rx="10" class="bx3"/>
+<text x="440" y="48" text-anchor="middle" class="t-xs t-b">placement</text>
+<text x="440" y="70" text-anchor="middle" class="t-xs">filter: GPU type, free</text>
+<text x="440" y="84" text-anchor="middle" class="t-xs">count, health, zone</text>
+<text x="440" y="106" text-anchor="middle" class="t-xs">score: topology (same</text>
+<text x="440" y="120" text-anchor="middle" class="t-xs">node → rack → pod),</text>
+<text x="440" y="134" text-anchor="middle" class="t-xs">best fit to limit</text>
+<text x="440" y="148" text-anchor="middle" class="t-xs">fragmentation, cached</text>
+<text x="440" y="162" text-anchor="middle" class="t-xs">weights, spread across</text>
+<text x="440" y="176" text-anchor="middle" class="t-xs">failure domains</text>
+<rect x="550" y="25" width="155" height="76" rx="10" class="bx"/>
+<text x="627" y="48" text-anchor="middle" class="t-xs t-b">preemption / defrag</text>
+<text x="627" y="66" text-anchor="middle" class="t-xs">evict lowest priority,</text>
+<text x="627" y="80" text-anchor="middle" class="t-xs">fewest victims; migrate</text>
+<text x="627" y="94" text-anchor="middle" class="t-xs">to open whole nodes</text>
+<rect x="550" y="119" width="155" height="76" rx="10" class="bx"/>
+<text x="627" y="142" text-anchor="middle" class="t-xs t-b">cluster state</text>
+<text x="627" y="160" text-anchor="middle" class="t-xs">nodes, GPUs, health,</text>
+<text x="627" y="174" text-anchor="middle" class="t-xs">topology labels;</text>
+<text x="627" y="188" text-anchor="middle" class="t-xs">replicated store</text>
+<line x1="145" y1="50" x2="178" y2="70" class="ln" marker-end="url(#a206)"/><line x1="145" y1="110" x2="178" y2="110" class="ln" marker-end="url(#a206)"/><line x1="145" y1="170" x2="178" y2="150" class="ln" marker-end="url(#a206)"/>
+<line x1="330" y1="110" x2="363" y2="110" class="ln" marker-end="url(#a206)"/>
+<line x1="515" y1="70" x2="548" y2="64" class="ln ln-acc" marker-end="url(#a206)"/>
+<line x1="550" y1="157" x2="517" y2="150" class="ln" marker-end="url(#a206)"/>
+<rect x="15" y="215" width="690" height="42" rx="8" class="bx"/>
+<text x="360" y="233" text-anchor="middle" class="t-xs t-b">nodes: 1,250 × 8 GPUs, in racks and pods of a fat tree</text>
+<text x="360" y="249" text-anchor="middle" class="t-xs">agents report health and free devices; bind decisions flow down; failures flow up and requeue workloads</text>
+</svg>
+<figcaption><b>Figure 20.6 — A GPU cluster scheduler.</b> Workload classes enter through queues with quotas and priorities; placement filters and scores nodes by topology, fragmentation and failure domains; preemption and defragmentation make room; a replicated store holds cluster state.</figcaption>
+</figure>
+
+<p><strong>Architecture.</strong> Figure 20.6 separates four decisions that beginners merge. <em>Admission</em>: is this workload entitled to run now—does its team have quota, guaranteed or borrowed, and for a gang, can all of it fit? <em>Placement</em>: on which GPUs? Nodes are filtered by hard constraints and scored by soft ones: keep a replica's GPUs on one node, a gang's nodes under one switch, prefer the node that leaves the least unusable remainder, prefer nodes that already cache the weights, and spread a service's replicas across racks and zones. <em>Preemption</em>: when a high-priority workload does not fit, which lower-priority ones are evicted, choosing the fewest and cheapest victims. <em>Defragmentation</em>: over time, small allocations leave every node partly used, so that 2,000 GPUs may be free with no node entirely free; the scheduler must migrate or preempt to consolidate (Chapter 7).</p>
+<div class="box example">
+<div class="box-title">Worked example — the price of fragmentation</div>
+<p><strong>State.</strong> The cluster is 80% allocated: 2,000 of 10,000 GPUs are free, but spread evenly, about 1.6 free GPUs on each of 1,250 nodes. No node is entirely free.</p>
+<p><strong>Request.</strong> A training job asks for 512 GPUs as 64 whole nodes under one group of switches. Although four times that many GPUs are free, the job cannot start: the largest placeable gang is zero nodes.</p>
+<p><strong>Defragment.</strong> Choose 64 adjacent nodes and move their workloads elsewhere. They hold \(64\times(8-1.6)\approx410\) GPUs of work; the other 1,186 nodes have about 1,900 free GPUs, so it fits. If the displaced work is inference replicas that each take two minutes to restart elsewhere (started before the old ones are drained), the cost is about \(410\times2/60\approx14\) GPU-hours, some $35.</p>
+<p><strong>Do nothing.</strong> The gang waits. Each hour of delay idles nothing visibly—the free GPUs were idle anyway—but 2,000 free GPUs that can host no large job are worth \(2{,}000\times\$2.50=\$5{,}000\) per hour of stranded capacity.</p>
+<p><strong>Lesson.</strong> Report "largest gang placeable now", not "GPUs free". Best-fit placement keeps the number from decaying, and cheap, routine migration of small workloads restores it.</p>
+</div>
+
+<p><strong>Deep dive: large gangs versus utilisation.</strong> A 2,048-GPU training job needs 256 whole nodes at once. Waiting for them to become free by chance never succeeds in a busy cluster, and holding nodes idle while they accumulate wastes capacity. The standard answer is a <em>reservation with backfill</em>: the scheduler computes the earliest time the gang can start, given running jobs' expected ends and what it may preempt, reserves those nodes for that time, and meanwhile fills them with batch and rollout work that is guaranteed to be preemptible by then. The preemptible classes are thus what makes large gangs compatible with 90% utilisation—an example of flexible work as the lubricant of a cluster, as in Chapter 19.</p>
+<p><strong>Deep dive: inference inside a batch scheduler.</strong> Inference scale-ups must be placed in under a second, while optimising gang placement can take many seconds. Give inference its own fast path: a priority class above everything preemptible, a small pool of free or instantly preemptible GPUs kept as headroom, placement that only filters and picks the best of a sample of nodes, and optimistic concurrency against the shared state so that the fast path and the slow path do not block each other. Scale-downs are as important: an inference replica being removed should drain its streams first (§13.5).</p>
+<p><strong>Failures.</strong> A node fails—its workloads are requeued; inference replicas elsewhere absorb the load and the autoscaler replaces them; a gang job restarts from its checkpoint (§7.5), which is why node health prediction and draining ahead of failure pay. A switch fails—a rack disappears, so replicas of one service must never share a rack. The scheduler itself fails—running workloads must be unaffected, with a standby taking over from the replicated store. And the slow failures: quota that no longer matches the organisation, and fragmentation that creeps up until a dashboard of "largest gang placeable now" makes it visible.</p>
+
+<h2 id="s20-6">20.6 Two shorter cases</h2>
+<p><strong>A retrieval service over a billion documents.</strong> <em>Scope</em>: one billion chunks, 1,024-dimensional embeddings, 2,000 queries per second, recall above 0.95 at ten results, 50 ms at the 99th percentile, with continuous ingestion. <em>Estimate</em>: raw vectors are \(10^9\times1024\times4\approx4\) TB—far beyond one machine's memory, which decides the design. Product quantisation to 64 bytes per vector makes the codes 64 GB; a graph index over the full vectors would need terabytes of RAM. <em>Design</em>: shard the corpus across nodes; on each, an inverted-file index with product-quantised codes in memory and full vectors on SSD for re-ranking, or a disk-based graph index; fan out each query to all shards (or route to a subset by a coarse quantiser) and merge. Embedding the queries is cheap; embedding the corpus is a batch job of the kind in Chapter 19—a billion chunks of 300 tokens on a 0.3B encoder is a few hundred GPU-hours. <em>Deep dives</em>: the recall–latency trade through the number of lists probed and the re-ranking depth (Chapter 16); freshness, by writing new vectors to a small mutable index merged periodically; filtering by tenant and permissions, which must happen inside the search, not after it. <em>Failures</em>: replicate every shard; a missing shard silently lowers recall, so report partial results explicitly.</p>
+<p><strong>A sandbox fleet for coding agents.</strong> <em>Scope</em>: 50,000 concurrent agent sessions, each with a private sandbox for running model-written code; sessions last about 12 minutes; start time under a second; no escape, no cross-tenant access, no uncontrolled network egress. <em>Estimate</em>: by Little's law, 50,000 live sandboxes; at 2 vCPUs and 4 GiB each, 100,000 vCPUs and 200 TiB if reserved, but sandboxes are busy about a fifth of the time, so overcommit CPU fourfold—about 130 large servers—and snapshot idle sandboxes to disk (§17.3). Creation rate is about 70 per second. <em>Design</em>: microVMs restored from snapshots of prepared images; a placement service packing them onto hosts; per-sandbox network policy with an allow-listed proxy for package mirrors; a file service for each session's workspace; an API the agent orchestrator calls to execute commands; durable session records so that a lost host loses at most the current step (§17.7). <em>Deep dives</em>: the isolation boundary and why containers alone are insufficient; the idle policy that trades memory against resume latency—and against the KV cache the model holds while the tool runs (§17.4). <em>Failures</em>: host loss—restore from the last snapshot; a noisy neighbour—cgroup limits and eviction; abuse such as mining or scanning—egress policy and anomaly detection.</p>
+<p>The two cases look unrelated, and the method is identical: one estimate decides the architecture (4 TB does not fit in memory; 50,000 sandboxes are a CPU fleet), the design is a request path plus a control plane, and the deep dives are the places where the numbers are tight.</p>
+
+<h2 id="s20-7">20.7 How answers are graded, and how they fail</h2>
+<p>Interviewers grade against the five qualities of §20.1, and the difference between levels is consistent across companies. A <strong>mid-level</strong> answer produces a reasonable architecture when led and knows the components. A <strong>senior</strong> answer drives itself: it scopes without prompting, estimates, makes decisions with reasons, and handles the failure discussion competently. A <strong>staff-level</strong> answer adds three things: it identifies which requirement is really the hard one and reshapes the problem around it ("the expensive question here is whether we must survive a region loss without shedding load"); it reasons about cost and organisation as fluently as about technology—what to build first, what to buy, what the system will cost per unit of what it serves; and it knows the second-order effects—what the design does to the on-call engineer, to the capacity plan, to the next model twice as large.</p>
+<p>The failure modes are equally consistent, and all are avoidable. <strong>No numbers</strong>: a design that would be the same for a hundred requests per second and a hundred thousand is not a design. <strong>Sizing for the mean</strong>: forgetting the peak-to-mean ratio, headroom and redundancy, and so underestimating by a factor of two to three. <strong>A component tour</strong>: listing a gateway, a queue, a cache and a database without saying what each decides and why it is there. <strong>Ignoring the control plane</strong>: drawing only the request path, with nothing about how replicas come to exist, how models are rolled out, or how configuration changes. <strong>No failure story</strong>: never saying what happens when a node, a zone or a dependency disappears. <strong>Forgetting cold starts</strong>: assuming capacity appears the instant an autoscaler asks. <strong>Treating GPUs as CPUs</strong>: forgetting that they are scarce, that replicas take minutes to start and gigabytes to load, that memory rather than compute often limits them, and that a single model can need eight of them at once. <strong>Silence about cost</strong>, in a field where the hardware bill dominates. And <strong>refusing to choose</strong>: presenting three options and stopping. State the choice, the reason and what would change your mind.</p>
+<p>Preparation follows from this. Practise the estimates until the constants of §20.2 are reflexes. Practise aloud, with a timer, on the cases of this chapter and on variations—halve the latency target, add a region, replace the model with one ten times larger—because variations are what interviewers use to find the edge of understanding. For each chapter of this volume, be able to give the two-minute version: the bottleneck, the idea, the formula, one number. The questions at the end of every chapter are that practice, and the progress page shows which ones to revisit.</p>
+
+<h2 id="ahead" class="unnumbered">Looking back, and ahead</h2>
+<p>This volume began with a single GPU that could serve a hundred people and asked what it takes to serve a planet. The answer filled twenty chapters, but its shape is simple. Physical limits come first: power, cooling, memory bandwidth, the speed of a network link. Above them sit the systems that allocate scarce accelerators to work—schedulers, platforms, autoscalers—and the economics that decide what is worth building. Around them are the properties that make a service trustworthy: reliability, security, guardrails. And on top is an ever-widening set of workloads, from chat to agents to the rollouts that train the next model. At every level the method was the same one Volume I used for a single forward pass: find the bottleneck, write its formula, put numbers in, and let the numbers choose the design.</p>
+<p>The field will not stand still. Accelerators will change, racks will draw more power than today's whole rows, models will grow and their workloads will take new forms; some numbers in this book will be out of date within a year. The reasoning will not be. An engineer who can derive the cost of a token from the price of a kilowatt-hour, who knows why a cold start takes as long as it does, and who asks of every design what happens when a part of it fails, will be able to read whatever comes next—and to help build it.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Design interviews assess scoping, quantitative reasoning, architecture, depth and judgement. Use six steps—scope, estimate, architecture, two deep dives, failures, wrap-up—and speak in decisions with reasons.</li>
+<li>Carry the constants: H100 = 80 GB, 3.35 TB/s, ≈ 1.4 kW all-in, ≈ $22k a year; 8B ≈ 9,000 tokens/s per GPU, 70B ≈ 6,000 per eight-GPU replica; peak-to-mean ≈ 1.8; mean utilisation ≈ 55%. Fleet size is \(\lambda_{\text{peak}}n_{\text{out}}/(r_{\text{gpu}}u_{\text{peak}})\).</li>
+<li>Carry the formulas: Little's law, availability arithmetic, \(r/(r-1)\) regional redundancy, bytes-over-bandwidth cold starts, \(\sqrt n\) pooling, \(p^n\) compounding, precision at low prevalence.</li>
+<li>Global LLM API: route by latency and residency; gateway (auth, limits, metering, guards) → router (cache- and load-aware, admission) → per-model pools; regional and global control planes; deep dives on capacity/cost and overload; failures by node, zone, region, rollout.</li>
+<li>Serverless GPU platform: pooling makes scale-to-zero profitable (1,000 endpoints at 6% need ≈ 83 GPUs); cold starts are the engineering problem; cold-start probability \(e^{-\lambda\tau_{\text{warm}}}\) shows timeouts help busy endpoints only; isolation between tenants is mandatory.</li>
+<li>Cluster scheduler: separate admission, placement, preemption and defragmentation; topology- and fragmentation-aware scoring; reservations with backfill for large gangs; a fast path for inference; requeue on failure.</li>
+<li>Retrieval and sandbox fleets follow the same method: one estimate (4 TB of vectors; 50,000 sandboxes) decides the architecture.</li>
+<li>Answers fail through missing numbers, sizing for the mean, component tours, no control plane, no failure story, forgotten cold starts, treating GPUs as CPUs, silence on cost, and refusing to choose.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci20-mcq-01" data-topic="§20.1 Method">
+<p class="q">Which is the best first move in an infrastructure design interview?</p>
+<ol class="opts"><li>Draw the architecture</li><li data-correct>Clarify scale, latency and availability targets, tenancy and regions</li><li>Name the technologies you would use</li><li>Discuss failure modes</li></ol>
+<div class="explain">Scope before design; state assumptions when answers are withheld.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-02" data-topic="§20.1 Method">
+<p class="q">Why spend several minutes on estimation before designing?</p>
+<ol class="opts"><li>To impress with arithmetic</li><li data-correct>The numbers determine which parts of the system are hard and what the deep dives should be</li><li>Interviewers require exact answers</li><li>To fill time</li></ol>
+<div class="explain">600 GPUs and 7,000 GPUs are different systems.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-03" data-topic="§20.1 Method">
+<p class="q">Which statement is phrased as a decision?</p>
+<ol class="opts"><li>"We could use a warm pool."</li><li>"Warm pools are common."</li><li data-correct>"I would keep ten warm replicas, because a cold start is 70 s and bursts need that many within it."</li><li>"There are several options."</li></ol>
+<div class="explain">Choice, reason and number.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-04" data-topic="§20.1 Method">
+<p class="q">Which qualities do interviewers assess? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Scoping</li><li data-correct>Quantitative reasoning</li><li data-correct>Depth on mechanisms</li><li>Number of product names mentioned</li></ol>
+<div class="explain">Plus architecture and judgement.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-05" data-topic="§20.2 Toolkit">
+<p class="q">Roughly how many H100s does one megawatt of IT power hold?</p>
+<ol class="opts"><li>70</li><li data-correct>700</li><li>7,000</li><li>70,000</li></ol>
+<div class="explain">About 1.4 kW each, all-in.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-06" data-topic="§20.2 Toolkit">
+<p class="q">A committed H100 at $2.50 per hour costs about how much per year?</p>
+<ol class="opts"><li>$2,200</li><li data-correct>$22,000</li><li>$220,000</li><li>$900</li></ol>
+<div class="explain">2.50 × 8,760.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-07" data-topic="§20.2 Toolkit">
+<p class="q">1,000 peak requests per second, 400 output tokens, Llama 3 70B at 750 tokens/s per GPU, 75% peak utilisation. GPUs needed:</p>
+<ol class="opts"><li>71</li><li data-correct>About 710</li><li>7,100</li><li>53</li></ol>
+<div class="explain">\(1000\times400/(750\times0.75)\).</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-08" data-topic="§20.2 Toolkit">
+<p class="q">99.9% availability allows about how much downtime per month?</p>
+<ol class="opts"><li>4.4 minutes</li><li data-correct>44 minutes</li><li>7 hours</li><li>26 seconds</li></ol>
+<div class="explain">0.1% of about 43,800 minutes.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-09" data-topic="§20.2 Toolkit">
+<p class="q">To survive the loss of one of four regions at peak with no shedding, provision what multiple of peak demand?</p>
+<ol class="opts"><li>1.25</li><li data-correct>1.33</li><li>1.5</li><li>2</li></ol>
+<div class="explain">\(r/(r-1)=4/3\).</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-10" data-topic="§20.2 Toolkit">
+<p class="q">Per output token, the 70B model costs roughly how many times the 8B model on H100s?</p>
+<ol class="opts"><li>2</li><li>4</li><li data-correct>12</li><li>100</li></ol>
+<div class="explain">9,000 against 750 tokens/s per GPU.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-11" data-topic="§20.2 Toolkit">
+<p class="q">Which formula sizes "how many sandboxes, reviewers or connections are live at once"?</p>
+<ol class="opts"><li>Amdahl's law</li><li data-correct>Little's law</li><li>Bayes' theorem</li><li>The Young–Daly formula</li></ol>
+<div class="explain">Concurrency = rate × time in system.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-12" data-topic="§20.3 Global API">
+<p class="q">On the request path of a global LLM API, which component applies token-aware rate limits and metering?</p>
+<ol class="opts"><li>Global DNS</li><li data-correct>The API gateway</li><li>The inference engine</li><li>The cluster scheduler</li></ol>
+<div class="explain">The router then picks a replica.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-13" data-topic="§20.3 Global API">
+<p class="q">The inference router should choose replicas by:</p>
+<ol class="opts"><li>Round robin only</li><li data-correct>Prefix-cache affinity and load, with admission control</li><li>Alphabetical order</li><li>GPU serial number</li></ol>
+<div class="explain">Chapter 8.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-14" data-topic="§20.3 Global API">
+<p class="q">In planned overload degradation, what goes first?</p>
+<ol class="opts"><li>The highest-paying tenants</li><li data-correct>Batch work is paused</li><li>All requests are slowed equally</li><li>The gateway is restarted</li></ol>
+<div class="explain">Then queue and shed by priority with retry-after.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-15" data-topic="§20.3 Global API">
+<p class="q">"Static stability" means that when the control plane fails:</p>
+<ol class="opts"><li>All traffic stops safely</li><li data-correct>The data plane keeps serving with its last known configuration</li><li>Replicas restart</li><li>Rate limits are removed</li></ol>
+<div class="explain">§13.6.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-16" data-topic="§20.3 Global API">
+<p class="q">Which is typically the most likely cause of a large outage?</p>
+<ol class="opts"><li>Simultaneous GPU failures</li><li data-correct>A bad rollout of software, a model or configuration</li><li>Cosmic rays</li><li>Region loss</li></ol>
+<div class="explain">Hence canaries and automatic rollback.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-17" data-topic="§20.4 Serverless">
+<p class="q">1,000 independent endpoints each active 6% of the time need about how many GPUs at mean + 3σ?</p>
+<ol class="opts"><li>60</li><li data-correct>83</li><li>250</li><li>1,000</li></ol>
+<div class="explain">\(60+3\times7.5\).</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-18" data-topic="§20.4 Serverless">
+<p class="q">With serverless at $5.00 per active GPU-hour and dedicated at $2.50, dedicated becomes cheaper above what utilisation?</p>
+<ol class="opts"><li>10%</li><li>25%</li><li data-correct>50%</li><li>90%</li></ol>
+<div class="explain">2.50/5.00.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-19" data-topic="§20.4 Serverless">
+<p class="q">For Poisson arrivals at rate \(\lambda\) and keep-warm timeout \(\tau_{\text{warm}}\), the cold-start probability per request is:</p>
+<ol class="opts"><li>\(\lambda\tau_{\text{warm}}\)</li><li data-correct>\(e^{-\lambda\tau_{\text{warm}}}\)</li><li>\(1-e^{-\lambda\tau_{\text{warm}}}\)</li><li>\(1/(\lambda\tau_{\text{warm}})\)</li></ol>
+<div class="explain">The gap exceeded the timeout.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-20" data-topic="§20.4 Serverless">
+<p class="q">One request per 5 minutes with a 10-minute timeout: cold-start fraction is about:</p>
+<ol class="opts"><li>50%</li><li data-correct>13.5%</li><li>2%</li><li>0.1%</li></ol>
+<div class="explain">\(e^{-2}\).</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-21" data-topic="§20.4 Serverless">
+<p class="q">Why should the placer prefer nodes that already cache an endpoint's weights?</p>
+<ol class="opts"><li>For billing</li><li data-correct>Loading from local disk takes seconds; fetching from object storage can take a minute or more</li><li>For isolation</li><li>To save power</li></ol>
+<div class="explain">The cache is also a reliability feature when the registry is down.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-22" data-topic="§20.4 Serverless">
+<p class="q">Which isolation measures does a multi-tenant GPU platform need? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>VM or microVM boundary per replica</li><li data-correct>GPU memory scrubbed between tenants</li><li data-correct>Network policy denying cross-tenant traffic</li><li>Shared host paths for speed</li></ol>
+<div class="explain">Chapter 14.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-23" data-topic="§20.5 Scheduler">
+<p class="q">Which four decisions does a GPU scheduler separate?</p>
+<ol class="opts"><li>Read, write, update, delete</li><li data-correct>Admission, placement, preemption, defragmentation</li><li>Prefill, decode, sample, stream</li><li>Plan, build, test, ship</li></ol>
+<div class="explain">Figure 20.6.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-24" data-topic="§20.5 Scheduler">
+<p class="q">How does a busy cluster start a 2,048-GPU gang without idling nodes for hours?</p>
+<ol class="opts"><li>It cannot</li><li data-correct>Reserve nodes for a future start time and backfill them with preemptible work until then</li><li>Split the gang into single GPUs</li><li>Run it on CPUs</li></ol>
+<div class="explain">Flexible work makes gangs compatible with high utilisation.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-25" data-topic="§20.5 Scheduler">
+<p class="q">2,000 GPUs are free but no node is entirely free. This is:</p>
+<ol class="opts"><li>Oversubscription</li><li data-correct>Fragmentation</li><li>Starvation</li><li>Thrashing</li></ol>
+<div class="explain">Fixed by best-fit scoring and defragmentation.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-26" data-topic="§20.5 Scheduler">
+<p class="q">Why give inference a fast scheduling path?</p>
+<ol class="opts"><li>Inference uses fewer GPUs</li><li data-correct>Scale-ups must be placed in under a second, while gang optimisation can take much longer</li><li>Inference is low priority</li><li>For fairness</li></ol>
+<div class="explain">Headroom pool plus sampled placement.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-27" data-topic="§20.5 Scheduler">
+<p class="q">Why spread a service's replicas across racks?</p>
+<ol class="opts"><li>For cache affinity</li><li data-correct>A switch failure removes a whole rack; replicas in one rack would fail together</li><li>To reduce power</li><li>To simplify quotas</li></ol>
+<div class="explain">Failure-domain spreading.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-28" data-topic="§20.6 Shorter cases">
+<p class="q">One billion 1,024-dimensional float32 vectors occupy about:</p>
+<ol class="opts"><li>4 GB</li><li>40 GB</li><li>400 GB</li><li data-correct>4 TB</li></ol>
+<div class="explain">Which rules out an in-memory flat or graph index on one machine.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-29" data-topic="§20.6 Shorter cases">
+<p class="q">50,000 sandboxes at 2 vCPUs each, busy a fifth of the time, with fourfold CPU overcommit need about:</p>
+<ol class="opts"><li>2,500 vCPUs</li><li data-correct>25,000 vCPUs</li><li>100,000 vCPUs</li><li>400,000 vCPUs</li></ol>
+<div class="explain">100,000 / 4.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-30" data-topic="§20.7 Grading">
+<p class="q">Which mistakes commonly sink design answers? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Sizing for mean rather than peak load</li><li data-correct>Drawing only the request path with no control plane</li><li data-correct>Assuming capacity appears instantly (no cold start)</li><li>Stating a choice and the reason for it</li></ol>
+<div class="explain">Refusing to choose is the mistake.</div>
+</div>
+
+<div class="mcq" data-id="ci20-mcq-31" data-topic="§20.7 Grading">
+<p class="q">What most distinguishes a staff-level answer?</p>
+<ol class="opts"><li>More components</li><li data-correct>Identifying the truly hard requirement and reasoning about cost, sequencing and second-order effects</li><li>Faster drawing</li><li>Using newer technologies</li></ol>
+<div class="explain">It reshapes the problem around what matters.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci20-qa-01">
+<summary><span class="lvl warm">Warm-up</span> How do you structure a 45-minute infrastructure design answer?</summary>
+<div class="answer">
+<p>Scope (≈6 min): users, load, tokens, SLOs, tenancy, regions, out-of-scope; write requirements. Estimate (≈7): requests → tokens → GPUs → MW → dollars; note what dominates. Architecture (≈10): request path end to end, then control plane; each component's job. Deep dives (≈12): two hard parts chosen by the numbers or the interviewer. Failures (≈6): node, zone, region, dependency, bad rollout—what users see. Wrap (≈4): trade-offs, what to build first, what to monitor. Speak in decisions with reasons.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Which numbers do you keep in your head for estimation?</summary>
+<div class="answer">
+<p>H100: 80 GB, 3.35 TB/s, ~10¹⁵ FLOP/s, ~1.4 kW all-in, ~$2.50/h ≈ $22k/yr, ~700 per MW. Llama 3 8B: 16 GB, 128 KiB KV/token, ~9k tok/s per GPU online. 70B: 141 GB, 320 KiB/token, TP8, ~6k tok/s per replica. PUE 1.1–1.5. Peak/mean ~1.8, mean utilisation ~55%, peak ~75%. 400 Gb/s = 50 GB/s; NVMe a few GB/s; object store 1–2 GB/s. 99.9% = 44 min/month. Formulas: Little's law, r/(r−1), bytes/bandwidth, √n pooling, pⁿ.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-03">
+<summary><span class="lvl core">Core</span> You are given 5,000 peak requests per second on a 70B model with 400 output tokens. Size the system.</summary>
+<div class="answer">
+<p>GPUs = 5000 × 400 / (750 × 0.75) ≈ 3,560 H100s ≈ 445 TP8 replicas. Power ≈ 5 MW IT, ≈ 6.5 MW facility at PUE 1.3. Cost ≈ $78M/yr. Mean rate at 1.8 peak-to-mean ≈ 2,800 req/s → 1.1M tok/s → ~3.5×10¹³ output tokens/yr → ≈ $2.2 per million output tokens of hardware. Add redundancy: across 3 regions with one-region tolerance × 1.5 unless shedding is accepted. Check KV memory for the context lengths, and input-token prefill load if prompts are long and cache hit rates low.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-04">
+<summary><span class="lvl design">Design</span> Design a global LLM API.</summary>
+<div class="answer">
+<p>Requirements: tiers, 10k req/s peak, streaming, TTFT p95 &lt; 500 ms, 99.9%, residency. Estimate ≈ 4,000 H100s, 5.6 MW, $88M/yr. Path: global routing (latency + residency) → regional gateway (auth, token rate limits, metering, SSE, guards in parallel) → inference router (prefix-affinity + load, admission) → per-model replica pools. Regional control: Kubernetes + GPU scheduler, autoscaler + warm pool, weight caches. Global control: capacity placement, staged rollout, quotas, billing, SLOs. Deep dives: capacity/commit mix + batch tier in trough; overload ladder and retry budgets. Failures: node (eject, retry), zone (spread), region (reroute, shed by tier), control plane (static stability), bad rollout (canary, rollback).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-05">
+<summary><span class="lvl design">Design</span> Design a serverless GPU inference platform.</summary>
+<div class="answer">
+<p>Requirements: custom containers/models, scale to zero, per-second billing, cold start target, isolation. Economics: pooling—n endpoints at low duty cycle need mean + kσ GPUs. Path: front door → live replica, else activator buffers and requests scale-up → placer picks node by cache affinity → replica in microVM with dedicated GPU → ready → release. Warm pool of booted nodes. Cold start = node + image + weights (bytes/bandwidth) + init; attack with lazy images, streaming loads, P2P, snapshots. Keep-warm policy: P(cold) = e^(−λτ); adaptive per endpoint; provisioned concurrency as a paid option. Isolation, quotas, metering. Failures: node loss, registry outage (cache), capacity shortage (queue with estimates, reject beyond bound).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-06">
+<summary><span class="lvl design">Design</span> Design a scheduler for a 10,000-GPU cluster shared by inference, training and batch.</summary>
+<div class="answer">
+<p>Classes and priorities: inference &gt; training &gt; batch/rollouts (preemptible). Queues with per-team guaranteed quota and borrowing; gang admission (all-or-nothing). Placement: filter (GPU type, health, zone), score (same node → rack → pod, best-fit to limit fragmentation, cached weights, spread across failure domains). Preemption: lowest priority, fewest victims, graceful. Reservations + backfill for large gangs. Defragmentation by migration/preemption of flexible work. Inference fast path with headroom pool and sub-second placement; optimistic concurrency on replicated state. Failure handling: requeue, checkpoint restart, drain on predicted failure. Metrics: allocation %, largest placeable gang, queue wait by class, preemption rate.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-07">
+<summary><span class="lvl core">Core</span> How do you choose a keep-warm timeout for a serverless endpoint?</summary>
+<div class="answer">
+<p>For Poisson arrivals, P(cold) = e^(−λτ); expected idle held per request = (1 − e^(−λτ))/λ. Choose τ to minimise idle cost + cold-start penalty × P(cold), per endpoint from its inter-arrival history (real traffic is burstier than Poisson, which favours short timeouts after bursts end and predictive pre-warming for periodic patterns). Busy endpoints: short τ suffices. Rare endpoints: no τ is affordable—rely on fast cold starts, provisioned minimum replicas, or async APIs. Decide who pays for warm idle time.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-08">
+<summary><span class="lvl core">Core</span> How much extra capacity does regional redundancy cost, and how can you reduce it?</summary>
+<div class="answer">
+<p>To lose one of r regions at peak without shedding: r/(r−1) × peak (2× for two regions, 1.5× for three, 1.33× for four). Reduce by: more regions; exploiting time-zone offsets (a failed region's peak coincides with others' off-peak); shedding flexible work first (batch, rollouts, free tiers); degrading (smaller model, shorter outputs); accepting residency-bound traffic cannot move; buying burst capacity on demand. State the business choice explicitly.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Walk through what happens when a zone fails in your LLM API design.</summary>
+<div class="answer">
+<p>Detection: health checks and load-balancer probes fail within seconds; router ejects replicas. In-flight streams break; clients retry with idempotency keys under a retry budget. Capacity: region loses ~1/3; remaining zones run hotter—headroom plus autoscaler scale-up (limited by free GPUs in surviving zones); overflow non-residency traffic to other regions; pause batch; shed by tier if needed. State: weight caches in other zones, replicated control-plane store keeps quorum (three zones). Recovery: zone returns cold; warm caches, ramp gradually to avoid thundering herd. Afterwards: review whether zone spread and headroom matched the assumption.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> How do large training gangs coexist with high utilisation and fast inference scale-up?</summary>
+<div class="answer">
+<p>Reservations with backfill: compute the gang's earliest start, reserve nodes, fill them with preemptible batch/rollout work until then. Defragmentation keeps whole nodes available. Inference gets top priority, a headroom pool and a fast path; it can preempt batch instantly and, if necessary, training via checkpoint. Topology-aware placement gives gangs contiguous pods; inference spreads across racks. Flexible work is the buffer that makes both possible; without it you choose between idle reservations and starved gangs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-11">
+<summary><span class="lvl design">Design</span> Design a retrieval service over one billion documents.</summary>
+<div class="answer">
+<p>Estimate: 10⁹ × 1024 × 4 B ≈ 4 TB raw; PQ at 64 B/vector = 64 GB codes. Design: sharded IVF-PQ with in-memory codes and SSD re-ranking, or DiskANN-style graph on SSD; fan-out and merge; replicas per shard. Ingestion: batch embedding (GPU-hours estimate), streaming updates into a mutable delta index merged periodically. Query path: embed (small GPU/CPU), search, re-rank (optionally cross-encoder on top-k), filter by tenant/ACL inside the index. Tune n_probe/re-rank depth for recall ≥ 0.95 within 50 ms p99. Failures: shard replicas, partial-result signalling, index rebuilds. Cost: memory vs SSD vs recall.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-12">
+<summary><span class="lvl design">Design</span> Design a sandbox fleet for 50,000 concurrent coding-agent sessions.</summary>
+<div class="answer">
+<p>Little's law: 50k live sandboxes; 2 vCPU/4 GiB each; busy ~20% → 4× CPU overcommit ≈ 25k vCPUs ≈ 130 servers; snapshot idle sandboxes. ~70 creations/s. MicroVMs from snapshots (sub-second), per-session workspace storage, exec API, network deny-by-default with allow-listed proxy, no credentials, resource limits, lifecycle and garbage collection. Placement by memory packing; durable session state so host loss costs one step. Observability and abuse detection. Coordinate with the LLM tier on KV policy during tool runs.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-13">
+<summary><span class="lvl core">Core</span> What are the most common mistakes in these interviews?</summary>
+<div class="answer">
+<p>No numbers; sizing for the mean (ignoring peak-to-mean, headroom, redundancy); listing components without decisions; no control plane; no failure story; ignoring cold starts; treating GPUs like CPUs (scarce, slow to start, memory-bound, multi-GPU replicas); ignoring cost; not choosing among options; over-engineering before scoping; ignoring multi-tenancy and security; forgetting observability and rollout.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-14">
+<summary><span class="lvl deep">Deep-dive</span> The interviewer says: "your model is replaced by one ten times larger." What changes?</summary>
+<div class="answer">
+<p>Weights 10× (cold starts 10× longer; storage and distribution matter more); replicas span many more GPUs or multiple nodes (network becomes part of the replica; topology-aware placement, larger failure blast radius per replica); per-token cost up roughly 10× (fleet, power, budget; pricing and routing to smaller models for easy requests); KV per token larger (fewer concurrent sequences); fewer, larger replicas reduce routing flexibility and make each failure costlier (more headroom); autoscaling granularity coarser; rollout slower. Revisit capacity plan, redundancy and the tiering strategy.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-15">
+<summary><span class="lvl core">Core</span> What would you monitor on day one of operating an LLM serving fleet?</summary>
+<div class="answer">
+<p>User-facing SLOs: TTFT and TPOT percentiles, error and refusal rates, goodput, by tier and region. Capacity: GPU allocation and utilisation, queue depth, KV memory, headroom vs forecast, warm-pool size, cold-start times. Efficiency: tokens per GPU-second, cache hit rate, cost per million tokens. Health: GPU errors (Xid, ECC), node failures, network errors. Control plane: rollout status, config versions, scheduler latency. Business: tokens by customer, rate-limit rejections. Alerts on SLO burn rates rather than raw thresholds.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci20-qa-16">
+<summary><span class="lvl warm">Warm-up</span> Give the two-minute summary of how to turn demand into a fleet and a budget.</summary>
+<div class="answer">
+<p>Peak requests/s × output tokens ÷ (tokens/s per GPU × peak utilisation) = GPUs (per model tier; check prefill and KV memory). × 1.4 kW = IT power; × PUE = facility power. × $22k = annual hardware cost; add ~5% electricity, plus staff and network. Mean rate = peak ÷ peak-to-mean; annual tokens = mean rate × tokens × seconds per year; cost ÷ tokens = cost per million. Add redundancy factor r/(r−1), then recover utilisation with batch in the trough. Sanity-check against Atlas: 10k req/s mixed ≈ 4,000 H100s ≈ 5.6 MW ≈ $88M/yr.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li>L. A. Barroso, U. Hölzle and P. Ranganathan. <em>The Datacenter as a Computer: Designing Warehouse-Scale Machines</em>, 3rd ed. Morgan &amp; Claypool, 2018.</li>
+<li>B. Beyer et al. (eds). <em>Site Reliability Engineering: How Google Runs Production Systems</em>. O'Reilly, 2016.</li>
+<li>M. Kleppmann. <em>Designing Data-Intensive Applications</em>. O'Reilly, 2017.</li>
+<li>Y. Fu et al. ServerlessLLM: Low-Latency Serverless Inference for Large Language Models. <em>OSDI</em>, 2024. <a href="https://arxiv.org/abs/2401.14351">arXiv:2401.14351</a>.</li>
+<li>M. Shahrad et al. Serverless in the Wild: Characterizing and Optimizing the Serverless Workload at a Large Cloud Provider. <em>USENIX ATC</em>, 2020. <a href="https://arxiv.org/abs/2003.03423">arXiv:2003.03423</a>.</li>
+<li>A. Verma et al. Large-scale Cluster Management at Google with Borg. <em>EuroSys</em>, 2015.</li>
+<li>Q. Weng et al. MLaaS in the Wild: Workload Analysis and Scheduling in Large-Scale Heterogeneous GPU Clusters. <em>NSDI</em>, 2022.</li>
+<li>A. Agache et al. Firecracker: Lightweight Virtualization for Serverless Applications. <em>NSDI</em>, 2020.</li>
+<li>S. Jayaram Subramanya et al. DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node. <em>NeurIPS</em>, 2019.</li>
+<li>Volume I, Chapter 30: The Inference System Design Interview.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>
