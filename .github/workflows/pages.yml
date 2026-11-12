@@ -2,7 +2,7 @@ name: Deploy book to GitHub Pages
 
 on:
   push:
-    branches: [main, claude/funny-hopper-lcw8ww, claude/laughing-bohr-pdra58]
+    branches: [main, claude/funny-hopper-lcw8ww]
     paths: ["docs/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
