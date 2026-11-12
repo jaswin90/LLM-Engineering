@@ -320,6 +320,6 @@ A. Numerical precision for mathematicians · B. Back-of-the-envelope cheat-sheet
 | 15 | Serving Multimodal Models | ✅ v1 |
 | 16 | Embeddings, Retrieval and Vector Search at Scale | ✅ v1 |
 | 17 | Agents and Compound AI Systems | ✅ v1 |
-| 18 | Guardrails and Moderation Infrastructure | ⏳ |
+| 18 | Guardrails and Moderation Infrastructure | ✅ v1 |
 | 19 | Batch, Offline and Rollout Inference | ⏳ |
 | 20 | The Cloud Infrastructure Design Interview | ⏳ |

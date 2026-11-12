@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 18 · Guardrails and Moderation Infrastructure — Cloud AI Infrastructure</title>
+<meta name="description" content="Chapter 18 of Cloud AI Infrastructure: where safety classifiers sit in a serving pipeline; guard models such as Llama Guard, ShieldGemma and constitutional classifiers; base rates, precision and threshold setting; the compute and latency cost of guards; moderating streaming output; cascades of classifiers; human review queues; and the operations of policy, evaluation and audit.">
+<script>try{var t=localStorage.getItem('llmeng-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/css/book.css">
+<script defer src="../assets/vendor/katex/katex.min.js"></script>
+<script defer src="../assets/vendor/katex/auto-render.min.js"></script>
+<script defer src="../assets/js/charts.js"></script>
+<script defer src="../assets/js/book.js"></script>
+<script type="module" src="../assets/js/auth.js"></script>
+</head>
+<body data-book="cloud" data-chapter="ci18" data-root="../">
+<div class="layout">
+<aside class="sidebar" aria-label="Chapter contents"></aside>
+<main>
+<article>
+<div class="chapter-kicker">Volume II · Part V · Beyond Chat — Chapter 18</div>
+<h1 id="top">Guardrails and Moderation Infrastructure</h1>
+<p class="lede">Every large LLM service runs a second set of models beside its main ones: classifiers that inspect prompts, retrieved documents, tool calls and generated text, and decide what to allow, block or send for review. These guards are part of the serving path, so they add latency and cost, must keep up with streaming output, and must be tuned for a problem in which the thing they look for is rare. This chapter treats guardrails as infrastructure: where they sit, what they cost, how their thresholds should be set given base rates, how they moderate a stream, how cascades and human review scale, and how the whole system is operated and audited.</p>
+
+<h2 id="opening" class="unnumbered">Why this chapter</h2>
+<p>Alignment training (Vol. I Chapter 24) makes a model more likely to refuse harmful requests and less likely to produce harmful text, but it does not make those events impossible, and a provider cannot change a model's weights every time its policy changes or a new jailbreak is published. Providers therefore add <em>guardrails</em>: separate, smaller models and rules that check inputs and outputs against a written policy—violence, self-harm, sexual content involving minors, weapons of mass destruction, harassment, personal data, prompt injection—and act on the result. Guardrails can be updated independently of the main model, enforce different policies for different products and jurisdictions, and leave an audit trail that regulators and enterprise customers increasingly require.</p>
+<p>For infrastructure, guardrails raise questions that interviews for trust-and-safety platforms and inference teams ask directly: "where in the pipeline do you put the classifier, and what does it add to TTFT?", "your classifier has 95% recall and a 1% false-positive rate—is it good?", "how do you moderate text you are streaming to the user token by token?", "how many GPUs does moderation for 10,000 requests per second need?", "how many human reviewers?". The answers combine the serving economics of Chapters 8 and 10 with elementary but often neglected probability, and they decide whether a safety system protects users or merely annoys them.</p>
+<p>We locate the guard points in a serving pipeline (§18.1) and describe the guard models available (§18.2), then confront base rates and thresholds (§18.3), compute and latency costs (§18.4), streaming moderation (§18.5) and cascades (§18.6). We close with human review (§18.7) and the operation of the whole system: policy, evaluation, adversaries and audit (§18.8).</p>
+
+<div class="box objectives">
+<div class="box-title">Learning objectives</div>
+<ol>
+<li>Identify the guard points in an LLM pipeline—input, retrieved content, tool calls, output—and what each protects against.</li>
+<li>Describe the main open guard models and how a generative classifier produces a verdict.</li>
+<li>Compute precision from recall, false-positive rate and prevalence, and explain why rare harms make false positives dominate.</li>
+<li>Estimate the compute and latency of a guard model at fleet scale, and hide its latency behind the main model's work.</li>
+<li>Design streaming output moderation and quantify the trade-off between check interval, exposure and cost.</li>
+<li>Design classifier cascades and size a human review queue.</li>
+</ol>
+<p class="small muted">Uses: alignment (Vol. I Chapter 24), prefix caching (Vol. I Chapter 10), streaming and gateways (Chapter 11), economics (Chapter 10), prompt injection and isolation (Chapter 14), agents (Chapter 17).</p>
+</div>
+
+<h2 id="s18-1">18.1 Where guardrails sit</h2>
+<p>A request to an LLM service passes several points at which content can be checked, and each guards against a different failure. Figure 18.1 shows them on the serving path of Chapter 11. The <strong>input guard</strong> inspects the user's prompt (and uploaded images or audio) before the main model sees it, catching requests that violate policy and known jailbreak patterns. The <strong>context guard</strong> inspects content that enters the context from elsewhere—retrieved documents (Chapter 16), web pages, tool results (Chapter 17)—for injected instructions, because a malicious page should not be able to steer the model. The <strong>action guard</strong> inspects tool calls before they execute, enforcing policy on what the agent may do. And the <strong>output guard</strong> inspects the generated text before, or as, it reaches the user.</p>
+
+<figure class="diagram" id="fig-18-1">
+<svg class="dg" viewBox="0 0 720 260" role="img" aria-label="Guard points in an LLM serving pipeline">
+<defs><marker id="a181" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="95" width="80" height="54" rx="8" class="bx"/><text x="50" y="118" text-anchor="middle" class="t-xs t-b">user</text><text x="50" y="134" text-anchor="middle" class="t-xs">prompt, files</text>
+<rect x="120" y="95" width="90" height="54" rx="8" class="bx2"/><text x="165" y="118" text-anchor="middle" class="t-xs t-b">input guard</text><text x="165" y="134" text-anchor="middle" class="t-xs">policy, jailbreak</text>
+<rect x="245" y="85" width="150" height="74" rx="10" class="bx4"/><text x="320" y="110" text-anchor="middle" class="t-xs t-b">main model</text><text x="320" y="126" text-anchor="middle" class="t-xs">prefill + decode</text><text x="320" y="142" text-anchor="middle" class="t-xs">(aligned, but fallible)</text>
+<rect x="430" y="95" width="100" height="54" rx="8" class="bx2"/><text x="480" y="118" text-anchor="middle" class="t-xs t-b">output guard</text><text x="480" y="134" text-anchor="middle" class="t-xs">streamed in chunks</text>
+<rect x="565" y="95" width="145" height="54" rx="8" class="bx"/><text x="637" y="118" text-anchor="middle" class="t-xs t-b">user sees text</text><text x="637" y="134" text-anchor="middle" class="t-xs">or a refusal</text>
+<rect x="220" y="10" width="200" height="50" rx="8" class="bx3"/><text x="320" y="31" text-anchor="middle" class="t-xs t-b">retrieval / web / tool results</text><text x="320" y="47" text-anchor="middle" class="t-xs">→ context guard (injection)</text>
+<rect x="220" y="195" width="200" height="50" rx="8" class="bx5"/><text x="320" y="216" text-anchor="middle" class="t-xs t-b">tool calls</text><text x="320" y="232" text-anchor="middle" class="t-xs">→ action guard (policy, scope)</text>
+<line x1="90" y1="122" x2="118" y2="122" class="ln" marker-end="url(#a181)"/>
+<line x1="210" y1="122" x2="243" y2="122" class="ln" marker-end="url(#a181)"/>
+<line x1="395" y1="122" x2="428" y2="122" class="ln" marker-end="url(#a181)"/>
+<line x1="530" y1="122" x2="563" y2="122" class="ln" marker-end="url(#a181)"/>
+<line x1="320" y1="60" x2="320" y2="83" class="ln ln-s3" marker-end="url(#a181)"/>
+<line x1="320" y1="159" x2="320" y2="193" class="ln ln-acc" marker-end="url(#a181)"/>
+<rect x="460" y="190" width="250" height="56" rx="8" class="bx"/><text x="585" y="211" text-anchor="middle" class="t-xs t-b">decision log (audit)</text><text x="585" y="227" text-anchor="middle" class="t-xs">verdict, category, score, policy version</text>
+</svg>
+<figcaption><b>Figure 18.1 — Guard points.</b> Inputs are checked before the main model, external content as it enters the context, tool calls before they run, and output as it streams. Every verdict is logged with the policy version that produced it.</figcaption>
+</figure>
+
+<p>Figure 18.1 also makes clear that guardrails are a <em>layered</em> defence. No single guard catches everything: an input guard cannot know what the model will say, an output guard sees harmful text only once it has been generated, and neither sees an injection hidden in a retrieved document unless the context is also checked. Each layer is imperfect, but if their errors are not perfectly correlated, a harmful outcome must slip past all of them, and the probability of that falls multiplicatively. The engineering task is to arrange the layers so that the combined miss rate is low while the combined cost—in latency, compute and wrongly refused users—stays acceptable. The rest of the chapter makes each of those quantities precise, starting with the guards themselves.</p>
+
+<h2 id="s18-2">18.2 Guard models</h2>
+<p>The earliest moderation systems were keyword lists and small text classifiers trained on labelled examples of each harm category. Markov and colleagues at OpenAI described in 2022 a production moderation system of this second kind, with an emphasis on taxonomy design, active learning to find rare examples and careful threshold calibration<span class="cite"><a href="#r-moderation">[1]</a></span>. Such classifiers are fast and cheap, but they understand language only as well as their small encoders do, and each change of policy requires new labels and retraining.</p>
+<p>The LLM era brought <strong>generative guard models</strong>: language models fine-tuned to read a conversation and a policy, and to output a verdict. Meta's Llama Guard (December 2023) fine-tuned Llama 2 7B to answer "safe" or "unsafe" followed by the violated categories, given a taxonomy written into its prompt<span class="cite"><a href="#r-llamaguard">[2]</a></span>; later versions built on Llama 3 at 1B and 8B scale, added multimodal inputs, and adopted the MLCommons hazard taxonomy. Google's ShieldGemma (2024) offered 2B, 9B and 27B guards built on Gemma 2<span class="cite"><a href="#r-shieldgemma">[3]</a></span>, and WildGuard (2024) targeted prompt harm, response harm and refusal detection together<span class="cite"><a href="#r-wildguard">[4]</a></span>. Because the policy appears in the prompt, a generative guard can be adapted to a new category by editing text, and its verdict comes with a probability: the softmax mass on the "unsafe" token is a score that can be thresholded.</p>
+<p>A further step came in early 2025, when Anthropic described <strong>constitutional classifiers</strong>: input and output classifiers trained on large volumes of synthetic data generated from a natural-language "constitution" of allowed and disallowed content, aimed specifically at universal jailbreaks for dangerous scientific knowledge<span class="cite"><a href="#r-constitutional">[5]</a></span>. Their output classifier scores the stream token by token, so that generation can be stopped as soon as harmful content begins—an architecture we return to in §18.5. In thousands of hours of red-teaming, no universal jailbreak was found against the protected system, at the cost of a small increase in refusals and a noticeable compute overhead that the authors reported and worked to reduce.</p>
+<p>Alongside these sit specialised detectors: classifiers for prompt injection and jailbreak attempts (small encoders such as Meta's Prompt Guard), detectors of personal data (names, card numbers, addresses) that can redact rather than block, image classifiers for sexual and violent content and for known abuse material matched by perceptual hashes, and classifiers for code that looks like malware. Infrastructure has to host all of them, which raises the questions of the next three sections: how to set their thresholds, what they cost, and how fast they are.</p>
+
+<h2 id="s18-3">18.3 Base rates, precision and thresholds</h2>
+<p>A guard model is a binary classifier with a score. Choosing a threshold on that score fixes two error rates: the <em>recall</em> (true-positive rate) \(\text{TPR}\), the fraction of harmful items it catches, and the <em>false-positive rate</em> \(\text{FPR}\), the fraction of benign items it wrongly flags. These are the numbers model cards report. But what the operator experiences is the <em>precision</em>—the fraction of flagged items that are actually harmful—and precision depends on a third quantity the classifier does not control: the prevalence \(q_{\text{harm}}\) of harmful items in the traffic. By Bayes' theorem,</p>
+\[
+\text{precision}=\frac{\text{TPR}\;q_{\text{harm}}}{\text{TPR}\;q_{\text{harm}}+\text{FPR}\,(1-q_{\text{harm}})}.
+\]
+<p>When harmful content is rare, the denominator is dominated by the false positives, and precision collapses. Figure 18.2 shows the effect for a classifier with 95% recall.</p>
+
+<figure class="chart" id="fig-18-2">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Precision of a guard with 95% recall, against the prevalence of harmful traffic","height":330,
+ "x":{"label":"Prevalence of harmful requests (log)","log":true,"min":0.0001,"max":0.1,"fmt":"pct","ticks":[0.0001,0.001,0.01,0.1]},
+ "y":{"label":"Precision (fraction of flags that are correct)","min":0,"max":1,"fmt":"pct","ticks":[0,0.2,0.4,0.6,0.8,1]},
+ "series":[
+  {"name":"FPR = 1%","color":"s2","points":[[0.0001,0.009],[0.0003,0.028],[0.001,0.087],[0.003,0.222],[0.01,0.49],[0.03,0.746],[0.1,0.913]]},
+  {"name":"FPR = 0.1%","color":"s3","points":[[0.0001,0.087],[0.0003,0.222],[0.001,0.487],[0.003,0.741],[0.01,0.906],[0.03,0.967],[0.1,0.991]]}
+ ],
+ "vlines":[{"x":0.001,"text":"0.1% prevalence"}]}
+</script>
+<figcaption><b>Figure 18.2 — Rare harms make most flags false.</b> At 0.1% prevalence, a classifier with 95% recall and a 1% false-positive rate is right in fewer than one flag in eleven; cutting the false-positive rate to 0.1% raises precision to about one half. Each tenfold drop in prevalence costs as much precision as a tenfold rise in FPR.</figcaption>
+</figure>
+
+<p>Figure 18.2 is the single most important fact for anyone tuning guardrails, and it is frequently forgotten. A false-positive rate of 1% sounds excellent; at a prevalence of one harmful request in a thousand, it means that ten benign users are refused for every harmful one caught. The two curves are horizontal translates of each other on the log axis, because precision depends on \(\text{FPR}\) and \(q_{\text{harm}}\) only through their ratio when \(q_{\text{harm}}\) is small: the <em>odds</em> of harm among flagged items are \(\text{TPR}\,q_{\text{harm}}/(\text{FPR}(1-q_{\text{harm}}))\). Prevalence also varies enormously by product and by category—a general chatbot sees a very different mix from a children's education app or a security researchers' tool—so a threshold tuned on one traffic mix can be badly wrong on another.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — what a "good" classifier does to Atlas</div>
+<p><strong>Setting.</strong> Atlas serves 10,000 requests per second at peak (§1.6). Suppose 0.1% of requests violate a policy category, and the input guard has \(\text{TPR}=95\%\), \(\text{FPR}=1\%\).</p>
+<p><strong>Flags per second.</strong> Harmful requests: 10 per second, of which 9.5 are caught and 0.5 missed. Benign requests: 9,990 per second, of which 99.9 are wrongly flagged. Total flags: about 109 per second; precision \(9.5/109\approx8.7\%\).</p>
+<p><strong>If flags block.</strong> About 100 legitimate requests per second are refused—roughly 8.6 million a day at that rate. Users learn that the service is unreliable, and enterprise customers file tickets.</p>
+<p><strong>If flags go to human review.</strong> At 30 seconds per review, 109 flags per second need \(109\times30\approx3{,}300\) reviewers working concurrently (Little's law), around the clock—an absurd number.</p>
+<p><strong>What works instead.</strong> Raise the threshold for blocking so that the FPR falls to about 0.01% (accepting lower recall, say 80%); route a middle band of scores to a stronger second-stage classifier (§18.6); act proportionately (a warning, a safe completion, a softened answer rather than a hard refusal) for lower-confidence flags; and keep human review for the small, high-severity residue. The guard's operating point is a business and policy decision made with these numbers in front of it, not a property of the model.</p>
+</div>
+
+<p>Two refinements matter in practice. First, the cost of errors is asymmetric and differs by category: missing a request for help synthesising a nerve agent is catastrophic, while wrongly refusing a question about a war novel is merely annoying, so each category gets its own threshold, set by weighing the expected cost of misses against that of false refusals—a decision-theoretic choice of operating point on each category's ROC curve. Second, the scores must be <strong>calibrated</strong> on traffic that resembles production, with prevalence estimated by sampling and labelling real traffic, because model-card error rates are measured on balanced benchmarks whose prevalence is often 30–50%, a thousand times higher than in production. A guard that scores 0.9 F1 on a balanced benchmark tells you little about its precision at 0.1% prevalence.</p>
+
+<details class="drill">
+<summary>Drill 18.1 — Two guards in series</summary>
+<p>Two independent guards each have \(\text{TPR}=0.9\) and \(\text{FPR}=1\%\). A request is blocked only if <em>both</em> flag it. What are the combined TPR, FPR and precision at 0.1% prevalence? What if a request is blocked when <em>either</em> flags it?</p>
+<p><em>Solution.</em> Both (AND): \(\text{TPR}=0.81\), \(\text{FPR}=10^{-4}\); precision \(=0.81\times0.001/(0.81\times0.001+10^{-4}\times0.999)\approx0.89\). Either (OR): \(\text{TPR}=1-0.1^2=0.99\), \(\text{FPR}\approx1-0.99^2\approx0.0199\); precision \(\approx0.00099/(0.00099+0.0199)\approx0.047\). AND trades a little recall for a hundredfold drop in false positives; OR does the reverse. In practice the guards' errors are correlated—both fail on the same cleverly phrased request—so AND loses more recall and OR gains less than the independent calculation says, and the combination must be measured on real traffic.</p>
+</details>
+
+<h2 id="s18-4">18.4 What guards cost: compute and latency</h2>
+<p>A generative guard reads the whole conversation and emits a handful of tokens, so its cost is almost entirely prefill. Using the FLOP count of Vol. I Chapter 6, a guard with \(N_{\text{guard}}\) parameters reading \(n_{\text{in}}\) tokens costs about \(2N_{\text{guard}}n_{\text{in}}\) FLOPs, and its latency is the prefill time of a small model on a short input, a few tens of milliseconds on an H100. The fleet-scale question is how many accelerators the guards need, which depends on how much traffic each guard sees and how large it is.</p>
+
+<div class="box example">
+<div class="box-title">Worked example — sizing the guard fleet for Atlas</div>
+<p><strong>Single guard.</strong> Run an 8B generative guard on every input of Atlas's 10,000 requests per second, with a mean of 1,000 input tokens: \(10^7\) tokens per second, \(2\times8\times10^{9}\times10^{7}=1.6\times10^{17}\) FLOP/s. At an effective 500 TFLOP/s per H100 (about half of the dense BF16 peak \(\pi\), typical of prefill), that is about 320 H100s—8% of Atlas's 4,000-GPU fleet, for input checking alone. Checking outputs as well roughly doubles it.</p>
+<p><strong>Cascade.</strong> Run a 0.3B encoder classifier on everything, and send the 3% of requests it is least sure about to the 8B guard: \(2\times0.3\times10^9\times10^7=6\times10^{15}\) FLOP/s (about 12 H100s) plus \(0.03\times1.6\times10^{17}\) (about 10 H100s). The cascade costs about 22 GPUs instead of 320, a fifteenfold saving, if the small classifier is good enough at deciding what it can decide alone (§18.6).</p>
+<p><strong>Lesson.</strong> Guard compute scales with traffic times guard size, and a large guard on everything is a significant fraction of the fleet; cascades and small guards are how production systems keep moderation below a few percent of serving cost.</p>
+</div>
+
+<p>Latency is a separate problem. An input guard that runs before the main model adds its full latency to TTFT: a 50 ms guard on a 300 ms TTFT budget consumes a sixth of it. The standard remedy is to run the input guard <em>in parallel</em> with the main model's prefill: the request goes to both at once, the main model starts working, and its first tokens are held at the gateway until the guard's verdict arrives. If the verdict is "safe", which it is for the vast majority of requests, the stream is released with no added delay, because the guard finishes before the main model's prefill does. If it is "unsafe", the main model's work is cancelled and discarded. The cost of this optimism is the main-model compute wasted on blocked requests—small when blocking is rare—and the benefit is that guarding becomes free in latency. The same pattern hides the context guard behind retrieval and the action guard behind the model's generation of the rest of a tool call.</p>
+<p>Two infrastructure choices follow. Guards should run on separate replicas, or separate MIG slices (§3.4), with their own autoscaling, because their load is proportional to request rate rather than to tokens generated, and because a guard outage must not take down the main model. And the failure mode of a guard must be chosen deliberately: <em>fail closed</em> (block or degrade when the guard is unavailable) for high-severity categories and regulated products, <em>fail open</em> (allow, log and review later) where availability matters more. That is a policy decision with an SLO attached, and it belongs in the error budget accounting of Chapter 13.</p>
+
+<h2 id="s18-5">18.5 Moderating a stream</h2>
+<p>Output guards face a problem input guards do not: the output is produced and streamed to the user token by token (§11.2), and harmful content may begin a hundred tokens into an otherwise innocent answer. If the guard checks only the completed response, the user has already read whatever it would have blocked. If it checks after every token, it runs hundreds of times per response. The practical design checks the stream every \(n_{\text{chk}}\) tokens, and buffers the stream so that the user sees text only after it has passed a check. Figure 18.3 shows the arrangement.</p>
+
+<figure class="diagram" id="fig-18-3">
+<svg class="dg" viewBox="0 0 720 240" role="img" aria-label="Streaming output moderation with a hold-back buffer">
+<defs><marker id="a183" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<text x="20" y="22" class="t-sm t-b">Generated tokens, checked in chunks of n_chk</text>
+<rect x="20" y="34" width="100" height="30" rx="4" class="bx3"/><text x="70" y="53" text-anchor="middle" class="t-xs">chunk 1 ✓</text>
+<rect x="120" y="34" width="100" height="30" rx="4" class="bx3"/><text x="170" y="53" text-anchor="middle" class="t-xs">chunk 2 ✓</text>
+<rect x="220" y="34" width="100" height="30" rx="4" class="bx3"/><text x="270" y="53" text-anchor="middle" class="t-xs">chunk 3 ✓</text>
+<rect x="320" y="34" width="100" height="30" rx="4" class="bx4"/><text x="370" y="53" text-anchor="middle" class="t-xs">chunk 4 (held)</text>
+<rect x="420" y="34" width="100" height="30" rx="4" class="bx"/><text x="470" y="53" text-anchor="middle" class="t-xs">generating…</text>
+<rect x="20" y="100" width="300" height="40" rx="8" class="bx3"/><text x="170" y="118" text-anchor="middle" class="t-xs t-b">released to user</text><text x="170" y="132" text-anchor="middle" class="t-xs">only text that has passed a check</text>
+<rect x="320" y="100" width="200" height="40" rx="8" class="bx4"/><text x="420" y="118" text-anchor="middle" class="t-xs t-b">hold-back buffer</text><text x="420" y="132" text-anchor="middle" class="t-xs">≤ n_chk tokens behind the model</text>
+<line x1="170" y1="64" x2="170" y2="98" class="ln ln-s3" marker-end="url(#a183)"/>
+<line x1="370" y1="64" x2="370" y2="98" class="ln" marker-end="url(#a183)"/>
+<rect x="550" y="30" width="160" height="110" rx="8" class="bx2"/>
+<text x="630" y="52" text-anchor="middle" class="t-xs t-b">guard (prefix-cached)</text>
+<text x="630" y="70" text-anchor="middle" class="t-xs">reads prompt + output</text>
+<text x="630" y="84" text-anchor="middle" class="t-xs">so far; only the new</text>
+<text x="630" y="98" text-anchor="middle" class="t-xs">chunk is prefilled</text>
+<text x="630" y="116" text-anchor="middle" class="t-xs">unsafe → stop generation,</text>
+<text x="630" y="130" text-anchor="middle" class="t-xs">drop buffer, send refusal</text>
+<line x1="520" y1="49" x2="548" y2="49" class="ln ln-acc" marker-end="url(#a183)"/>
+<text x="20" y="178" class="t-xs">Trade-offs: smaller n_chk → less text generated past the harmful point and a shorter added delay (n_chk × TPOT before</text>
+<text x="20" y="194" class="t-xs">the first visible token), but more guard calls; with prefix caching in the guard, the total guard work barely changes.</text>
+<text x="20" y="214" class="t-xs">Without a buffer ("stream then retract"), the user may read text before it is withdrawn.</text>
+</svg>
+<figcaption><b>Figure 18.3 — Streaming moderation.</b> The guard checks each chunk of \(n_{\text{chk}}\) tokens in the context of everything before it; the gateway releases a chunk only after it passes, so the user stays at most one chunk behind the model.</figcaption>
+</figure>
+
+<p>Figure 18.3 makes the trade-off concrete. The hold-back buffer delays what the user sees by up to \(n_{\text{chk}}\) tokens, which at a TPOT of 30 ms is about 0.5 s for \(n_{\text{chk}}=16\) and 2 s for \(n_{\text{chk}}=64\), added to the perceived TTFT; after that, the stream flows at the model's rate, one chunk behind. A smaller chunk also stops a harmful generation sooner, wasting less of the main model's decode. The cost side depends entirely on whether the guard uses prefix caching. A guard that re-reads the whole prompt and output at every check does work that grows quadratically with the response—the agent problem of §17.1 again—while a guard that keeps its KV cache from one check to the next prefills only the new chunk each time, so its total work is nearly the same as a single check at the end. Figure 18.4 quantifies the difference.</p>
+
+<figure class="chart" id="fig-18-4">
+<div class="chart-root"></div>
+<script type="application/json" class="chart-spec">
+{"title":"Guard compute for streaming output moderation (1,000-token prompt and response; 8B guard on a 70B model)","height":330,
+ "x":{"label":"Check interval n_chk (tokens, log)","log":true,"min":1,"max":1000,"ticks":[1,4,16,64,256,1000]},
+ "y":{"label":"Guard FLOPs as % of main-model FLOPs (log)","log":true,"min":5,"max":20000,"ticks":[10,100,1000,10000]},
+ "series":[
+  {"name":"Guard re-reads the whole context at each check","color":"s2","points":[[1,8574],[4,2146],[16,533],[64,130],[256,26],[1000,11.4]]},
+  {"name":"Guard keeps its prefix cache between checks","color":"s3","points":[[1,17.1],[4,12.9],[16,11.8],[64,11.5],[256,11.4],[1000,11.4]]}
+ ]}
+</script>
+<figcaption><b>Figure 18.4 — Prefix caching makes fine-grained stream checks affordable.</b> Re-reading the context at every 16-token check costs five times the main model's own compute; with a cached prefix, the same checks cost about 12%, barely more than a single check of the finished response (11.4%, the guard-to-model parameter ratio of 8/70).</figcaption>
+</figure>
+
+<p>Figure 18.4 shows that the right engineering is to treat the output guard as a <em>companion sequence</em> that decodes alongside the main one: it shares the prompt's KV (for itself), appends each chunk as it arrives and emits one verdict token per chunk. Constitutional classifiers push this to its limit by scoring every token with a lightweight head, so that the stream can be cut as soon as the probability of harm rises<span class="cite"><a href="#r-constitutional">[5]</a></span>. Some products instead stream optimistically with no buffer and retract a message when a later check fails ("this response was removed"); this costs nothing in latency but exposes the user to the text it retracts, which is acceptable for mild categories and not for severe ones. Platforms often combine both: no buffer for low-severity categories, a short buffer when an earlier signal—the input guard's score, the conversation's history, the product—suggests elevated risk.</p>
+
+<details class="drill">
+<summary>Drill 18.2 — Choosing a check interval</summary>
+<p>A product has a TPOT of 25 ms and an SLO that the first visible token arrive within 1.0 s of the request, with a main-model TTFT of 400 ms. The output guard keeps its prefix cache, and each check adds a 15 ms delay between generating a chunk and releasing it. What is the largest check interval the SLO allows? If harmful content, once started, is detected on average within the first chunk that contains it, how many tokens of a harmful generation are produced (but not shown) before generation stops?</p>
+<p><em>Solution.</em> The first chunk is visible after \(400+25n_{\text{chk}}+15\) ms; requiring this to be at most 1,000 ms gives \(n_{\text{chk}}\le23.4\), so \(n_{\text{chk}}=23\) (or 16, a convenient power of two, leaving margin). Harmful content that begins at a uniformly random point within a chunk is detected at the end of that chunk, so on average about \(n_{\text{chk}}/2\approx8\)–12 harmful tokens are generated before the guard stops the stream, none of which reaches the user because of the buffer. The main model's wasted decode is negligible.</p>
+</details>
+
+<h2 id="s18-6">18.6 Cascades</h2>
+<p>The worked example of §18.4 showed that running a large guard on everything is expensive, and the analysis of §18.3 showed that a single threshold forces an unpleasant choice between recall and false positives. A <strong>cascade</strong> addresses both. A cheap first stage—a small encoder classifier, a regular-expression and hash matcher, or a 1B guard—scores every item. Items it scores confidently safe pass at once; items it scores confidently harmful are blocked; and only the uncertain middle band, a few percent of traffic, is escalated to an expensive second stage—an 8B or larger guard, possibly with a longer, more detailed policy prompt—and, for the small residue the second stage cannot settle, to human review. Figure 18.5 shows the structure.</p>
+
+<figure class="diagram" id="fig-18-5">
+<svg class="dg" viewBox="0 0 720 250" role="img" aria-label="A moderation cascade">
+<defs><marker id="a185" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="10" y="95" width="105" height="56" rx="8" class="bx"/><text x="62" y="118" text-anchor="middle" class="t-xs t-b">all traffic</text><text x="62" y="134" text-anchor="middle" class="t-xs">10,000 req/s</text>
+<rect x="150" y="85" width="140" height="76" rx="10" class="bx3"/><text x="220" y="108" text-anchor="middle" class="t-xs t-b">stage 1</text><text x="220" y="124" text-anchor="middle" class="t-xs">0.3B classifier + hashes</text><text x="220" y="140" text-anchor="middle" class="t-xs">≈ 1 ms, ≈ 12 GPUs</text>
+<rect x="340" y="85" width="140" height="76" rx="10" class="bx2"/><text x="410" y="108" text-anchor="middle" class="t-xs t-b">stage 2</text><text x="410" y="124" text-anchor="middle" class="t-xs">8B guard, full policy</text><text x="410" y="140" text-anchor="middle" class="t-xs">≈ 40 ms, ≈ 10 GPUs</text>
+<rect x="530" y="85" width="180" height="76" rx="10" class="bx5"/><text x="620" y="108" text-anchor="middle" class="t-xs t-b">human review</text><text x="620" y="124" text-anchor="middle" class="t-xs">high-severity residue</text><text x="620" y="140" text-anchor="middle" class="t-xs">minutes to hours</text>
+<line x1="115" y1="123" x2="148" y2="123" class="ln" marker-end="url(#a185)"/>
+<line x1="290" y1="123" x2="338" y2="123" class="ln ln-acc" marker-end="url(#a185)"/><text x="314" y="114" text-anchor="middle" class="t-xs t-acc">3%</text>
+<line x1="480" y1="123" x2="528" y2="123" class="ln ln-acc" marker-end="url(#a185)"/><text x="504" y="114" text-anchor="middle" class="t-xs t-acc">0.1%</text>
+<line x1="220" y1="85" x2="220" y2="45" class="ln ln-s3" marker-end="url(#a185)"/><text x="220" y="36" text-anchor="middle" class="t-xs t-s3">confident safe: pass (≈ 97%)</text>
+<line x1="220" y1="161" x2="220" y2="198" class="ln ln-s2" marker-end="url(#a185)"/><text x="220" y="214" text-anchor="middle" class="t-xs t-s2">confident harmful: block</text>
+<line x1="410" y1="85" x2="410" y2="45" class="ln ln-s3" marker-end="url(#a185)"/><text x="430" y="36" text-anchor="middle" class="t-xs t-s3">safe: pass</text>
+<line x1="410" y1="161" x2="410" y2="198" class="ln ln-s2" marker-end="url(#a185)"/><text x="410" y="214" text-anchor="middle" class="t-xs t-s2">harmful: block / safe-complete</text>
+<text x="360" y="242" text-anchor="middle" class="t-xs">Each stage sees only what the previous one could not settle; cost ≈ c₁ + f_esc · c₂.</text>
+</svg>
+<figcaption><b>Figure 18.5 — A moderation cascade.</b> A cheap classifier settles most traffic; an expensive guard examines the uncertain few percent; humans see only the high-severity residue. Total cost is dominated by the first stage when escalation is rare.</figcaption>
+</figure>
+
+<p>Figure 18.5's economics are simple. If stage 1 costs \(c_1\) per item and stage 2 costs \(c_2\), and a fraction \(f_{\text{esc}}\) of items is escalated, the expected cost per item is \(c_1+f_{\text{esc}}c_2\). With \(c_2/c_1\approx27\) (an 8B guard against a 0.3B classifier) and \(f_{\text{esc}}=3\%\), the cascade costs about \(1.8c_1\), versus \(27c_1\) for running stage 2 on everything. The art is in choosing the escalation band: too narrow and stage 1's errors pass unchecked; too wide and the cascade loses its saving. The band is tuned on labelled production samples, by measuring how often stage 2 overturns stage 1 at each stage-1 score; scores where it almost never does are settled by stage 1, and scores where it often does are escalated. Because stage 2 sees a population enriched in harmful items—prevalence perhaps 3% instead of 0.1%—its precision is much higher than it would be on raw traffic (Figure 18.2), which is a second, less obvious benefit of cascading.</p>
+<p>The same structure appears in other parts of the serving stack—the model routing of Vol. I §27.6 sends easy queries to small models and hard ones to large models—and the same caveat applies: the cascade is only as good as the first stage's calibration. A first stage that is confidently wrong on a class of inputs (a new jailbreak style, a new language) passes them without escalation, and only sampling of the "confident safe" traffic for review reveals it.</p>
+
+<h2 id="s18-7">18.7 Human review</h2>
+<p>Some decisions should not be left to classifiers: severe categories where a wrong decision has legal consequences, appeals from users who were refused, ambiguous cases near a policy boundary, and the labelled samples that calibrate everything else. A <strong>human review queue</strong> handles them, and it is a queue in exactly the sense of Chapter 11: items arrive at rate \(\lambda\), each takes a reviewer a mean time \(t_{\text{rev}}\), and by Little's law the number of reviewers busy at once is \(\lambda t_{\text{rev}}\). With the Atlas cascade escalating 0.1% of traffic—10 items per second at peak—and 60 seconds per review, about 600 reviewers must be working at peak; reducing the escalated fraction to 0.01% brings it to 60. Every factor of ten in classifier precision at the final stage is a factor of ten in review staff, which is why §18.3's arithmetic is also a staffing calculation.</p>
+<p>Review queues need the operational machinery of any queueing system: priorities (severity, user impact, regulatory deadlines), service-level targets on time to decision, load shedding when queues grow (sampling low-severity items rather than reviewing all of them), and tooling that shows reviewers the context they need while protecting them from unnecessary exposure to disturbing material—blurring images, showing text only on demand, limiting shift exposure. Reviewer decisions are also the most valuable training data the system has: they are labels on exactly the hard cases, and feeding them back into the classifiers (active learning, as in Markov and colleagues' system<span class="cite"><a href="#r-moderation">[1]</a></span>) is how the cascade improves over time.</p>
+
+<h2 id="s18-8">18.8 Operating guardrails: policy, evaluation, adversaries and audit</h2>
+<p>A guardrail system is code, models and policy, and all three change. Policies are revised as laws change, as new harms appear, and as products launch in new markets; each revision must be versioned, and each verdict logged with the policy and model versions that produced it, so that any decision can later be explained. Changes are rolled out like any risky deployment (§13.5): first in <strong>shadow mode</strong>, where the new guard scores production traffic without acting, so its flag rate and disagreements with the old guard can be measured; then to a canary fraction of traffic; then everywhere, with automatic rollback if refusal rates or complaints jump. A sudden rise in the refusal rate is itself an incident, because to users an over-blocking guard is indistinguishable from an outage.</p>
+<figure class="diagram" id="fig-18-6">
+<svg class="dg" viewBox="0 0 720 220" role="img" aria-label="The operating loop of a guardrail system">
+<defs><marker id="a186" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" class="arrowhead"/></marker></defs>
+<rect x="15" y="30" width="125" height="60" rx="8" class="bx4"/><text x="77" y="54" text-anchor="middle" class="t-xs t-b">policy (versioned)</text><text x="77" y="70" text-anchor="middle" class="t-xs">categories, thresholds</text>
+<rect x="180" y="30" width="125" height="60" rx="8" class="bx2"/><text x="242" y="54" text-anchor="middle" class="t-xs t-b">guards in production</text><text x="242" y="70" text-anchor="middle" class="t-xs">verdicts + decision log</text>
+<rect x="345" y="30" width="125" height="60" rx="8" class="bx5"/><text x="407" y="54" text-anchor="middle" class="t-xs t-b">review + sampling</text><text x="407" y="70" text-anchor="middle" class="t-xs">flags, appeals, audits</text>
+<rect x="510" y="30" width="195" height="60" rx="8" class="bx3"/><text x="607" y="54" text-anchor="middle" class="t-xs t-b">labels and measurements</text><text x="607" y="70" text-anchor="middle" class="t-xs">prevalence, precision, recall</text>
+<rect x="345" y="140" width="125" height="60" rx="8" class="bx"/><text x="407" y="164" text-anchor="middle" class="t-xs t-b">retrain / retune</text><text x="407" y="180" text-anchor="middle" class="t-xs">plus red-team sets</text>
+<rect x="180" y="140" width="125" height="60" rx="8" class="bx"/><text x="242" y="164" text-anchor="middle" class="t-xs t-b">shadow → canary</text><text x="242" y="180" text-anchor="middle" class="t-xs">→ rollout / rollback</text>
+<line x1="140" y1="60" x2="178" y2="60" class="ln" marker-end="url(#a186)"/>
+<line x1="305" y1="60" x2="343" y2="60" class="ln" marker-end="url(#a186)"/>
+<line x1="470" y1="60" x2="508" y2="60" class="ln" marker-end="url(#a186)"/>
+<path d="M607,90 C607,150 540,170 472,170" class="ln ln-s3" fill="none" marker-end="url(#a186)"/>
+<line x1="345" y1="170" x2="307" y2="170" class="ln" marker-end="url(#a186)"/>
+<line x1="242" y1="140" x2="242" y2="92" class="ln ln-acc" marker-end="url(#a186)"/>
+<path d="M510,82 C330,125 150,125 90,92" class="ln" fill="none" stroke-dasharray="4 3" marker-end="url(#a186)"/>
+<text x="60" y="128" class="t-xs">measurements revise policy</text>
+</svg>
+<figcaption><b>Figure 18.6 — The operating loop.</b> Production verdicts feed review and sampling; the resulting labels measure prevalence and error rates, drive retraining and threshold changes, and inform policy; every change returns to production through shadow and canary stages.</figcaption>
+</figure>
+
+<p>Figure 18.6 draws the loop that keeps a guardrail system honest: nothing in it is static, and the measurements on the right are what justify every threshold on the left.</p>
+<p>Evaluation needs three kinds of data: <strong>benchmarks</strong> for comparing guard models; <strong>production samples</strong>, labelled by reviewers, for estimating prevalence and calibrating thresholds on the real traffic mix (the lesson of §18.3); and <strong>adversarial sets</strong> from red-teaming, because the people trying to defeat guardrails adapt. Jailbreaks evolve—role-play framings, encodings and ciphers, many-shot prompts that fill a long context with fabricated dialogues, low-resource languages, harmful requests split across turns or across images and text—and a guard that is not retrained against new attacks decays. Multi-turn and multimodal attacks in particular mean that guards must see the conversation, not just the last message, and must classify images and audio as well as text (Chapter 15).</p>
+<p>Audit and privacy pull in opposite directions. Regulators and enterprise customers want evidence that policies were enforced; privacy law and customers' contracts want conversation data kept minimal and short-lived (§12.6, §14.5). The usual resolution logs verdicts, scores, categories and versions for every request, but keeps content only for flagged items and sampled traffic, under access controls and retention limits, with personal data redacted where possible. Moderation is also subject to the residency rules of Chapter 12: a guard model, its logs and its human reviewers may all need to stay in the region where the data originated.</p>
+<p>Finally, guardrails are not a substitute for the structural security of Chapters 14 and 17. A classifier that tries to detect prompt injection in retrieved text reduces risk, but an agent whose tools have least privilege, whose side effects require confirmation and whose sandbox has no network egress is safe even when the classifier misses. Guardrails catch what can be recognised; architecture limits what can go wrong when recognition fails. Production systems need both.</p>
+
+<h2 id="ahead" class="unnumbered">Looking ahead</h2>
+<p>Every workload so far has been <em>online</em>: a user or an agent waits for each answer, so latency matters and capacity must cover the peak. A growing share of tokens is generated with no one waiting—offline evaluation runs, synthetic data for training, document processing pipelines, embedding backfills, and the reinforcement-learning rollouts that train reasoning models, which can consume more inference than a product's users do. Such work can tolerate hours of delay, can run on spare or preemptible capacity, and is judged on cost per token rather than latency. How should batch inference be priced, scheduled and engineered, how do RL rollout systems keep the trainer fed, and how can batch work fill the troughs left by online traffic without disturbing it? Chapter 19 takes up batch, offline and rollout inference.</p>
+
+<h2 id="summary" class="unnumbered">Chapter summary</h2>
+<ul>
+<li>Guardrails check inputs, external context (injection), tool calls and outputs against a versioned policy; they form a layered defence whose miss rates multiply if errors are not perfectly correlated, and every verdict is logged.</li>
+<li>Guard models range from small encoder classifiers to generative guards (Llama Guard, ShieldGemma, WildGuard) whose policy is in the prompt and whose "unsafe" probability is a thresholdable score, and constitutional classifiers that score streams token by token.</li>
+<li>Precision \(=\text{TPR}\,q_{\text{harm}}/(\text{TPR}\,q_{\text{harm}}+\text{FPR}(1-q_{\text{harm}}))\): at 0.1% prevalence, 95% recall and 1% FPR, fewer than one flag in eleven is correct. Set per-category thresholds by cost, calibrate on production prevalence, and act proportionately.</li>
+<li>Guard compute \(\approx 2N_{\text{guard}}n_{\text{in}}\) per check: an 8B guard on all of Atlas's inputs needs ≈ 320 H100s; a cascade needs ≈ 22. Run input guards in parallel with prefill and hold the stream until the verdict; choose fail-open or fail-closed per category.</li>
+<li>Streaming moderation checks every \(n_{\text{chk}}\) tokens behind a hold-back buffer (delay ≈ \(n_{\text{chk}}\) × TPOT); with a prefix-cached guard the total work barely exceeds one final check, without it it grows quadratically.</li>
+<li>Cascades cost \(c_1+f_{\text{esc}}c_2\) per item and raise stage-2 precision by enriching its input; tune the escalation band on labelled samples and audit "confident safe" traffic.</li>
+<li>Human reviewers needed \(=\lambda t_{\text{rev}}\) (Little's law): each tenfold gain in final-stage precision is a tenfold cut in staff; reviewer decisions are the best training labels.</li>
+<li>Operate guards like risky deployments (shadow, canary, rollback), evaluate on benchmarks, production samples and adversarial sets, balance audit with privacy and residency, and rely on structural security for what classifiers miss.</li>
+</ul>
+
+<h2 id="mcq">Multiple-choice questions</h2>
+<p class="muted small">Each question names the section it tests. Click an option to answer; "select all that apply" questions need the <em>Check answer</em> button. Your results are saved automatically.</p>
+<div class="quiz-section">
+
+<div class="mcq" data-id="ci18-mcq-01" data-topic="§18.1 Guard points">
+<p class="q">Which guard point protects against instructions injected into a retrieved web page?</p>
+<ol class="opts"><li>Input guard</li><li data-correct>Context guard</li><li>Output guard</li><li>Rate limiter</li></ol>
+<div class="explain">External content entering the context is checked as it arrives.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-02" data-topic="§18.1 Guard points">
+<p class="q">Why are guardrails deployed as a layered defence?</p>
+<ol class="opts"><li>To spread load</li><li data-correct>Each layer is imperfect; harm must pass all layers, so miss rates multiply if errors are not perfectly correlated</li><li>Regulations require exactly four layers</li><li>Layers improve latency</li></ol>
+<div class="explain">Correlation of errors limits the gain.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-03" data-topic="§18.1 Guard points">
+<p class="q">Why use separate guard models rather than relying only on alignment training?</p>
+<ol class="opts"><li data-correct>They can be updated, tuned per product and audited independently of the main model's weights</li><li>They are always more accurate</li><li>They replace the need for alignment</li><li>They are free</li></ol>
+<div class="explain">Policies change faster than models are retrained.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-04" data-topic="§18.2 Guard models">
+<p class="q">How does a generative guard such as Llama Guard produce a score?</p>
+<ol class="opts"><li>From the length of its output</li><li data-correct>From the probability it assigns to the "unsafe" token given the conversation and policy</li><li>By counting keywords</li><li>By embedding similarity</li></ol>
+<div class="explain">The softmax mass on the verdict token is thresholded.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-05" data-topic="§18.2 Guard models">
+<p class="q">An advantage of generative guards over trained encoder classifiers is that:</p>
+<ol class="opts"><li>They are cheaper</li><li data-correct>A policy change can be made partly by editing the policy text in the prompt</li><li>They need no GPUs</li><li>They never produce false positives</li></ol>
+<div class="explain">Encoder classifiers need new labels and retraining.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-06" data-topic="§18.2 Guard models">
+<p class="q">Constitutional classifiers' output classifier is distinctive because it:</p>
+<ol class="opts"><li>Runs only after generation completes</li><li data-correct>Scores the stream token by token so generation can be stopped as harm begins</li><li>Uses keyword lists</li><li>Requires human review</li></ol>
+<div class="explain">Trained on synthetic data from a natural-language constitution.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-07" data-topic="§18.3 Base rates">
+<p class="q">A guard has 95% recall and 1% FPR. At 0.1% prevalence, its precision is about:</p>
+<ol class="opts"><li>95%</li><li>50%</li><li data-correct>9%</li><li>1%</li></ol>
+<div class="explain">\(0.00095/(0.00095+0.00999)\).</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-08" data-topic="§18.3 Base rates">
+<p class="q">At low prevalence, precision depends on FPR and prevalence mainly through:</p>
+<ol class="opts"><li>Their sum</li><li data-correct>Their ratio</li><li>Their product</li><li>FPR alone</li></ol>
+<div class="explain">Odds of harm among flags ≈ TPR·q/FPR.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-09" data-topic="§18.3 Base rates">
+<p class="q">Why can a guard with 0.9 F1 on a benchmark perform poorly in production?</p>
+<ol class="opts"><li>Benchmarks use other languages</li><li data-correct>Benchmarks are often balanced (high prevalence); at production prevalence the same FPR yields low precision</li><li>F1 is not a metric</li><li>Production uses different GPUs</li></ol>
+<div class="explain">Calibrate on production samples.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-10" data-topic="§18.3 Base rates">
+<p class="q">At Atlas's 10,000 req/s with 0.1% prevalence and 1% FPR, about how many benign requests are wrongly flagged per second?</p>
+<ol class="opts"><li>1</li><li>10</li><li data-correct>100</li><li>1,000</li></ol>
+<div class="explain">9,990 × 0.01.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-11" data-topic="§18.3 Base rates">
+<p class="q">Why do different harm categories get different thresholds?</p>
+<ol class="opts"><li>Classifiers require it</li><li data-correct>The costs of misses and false refusals differ greatly between categories</li><li>For latency</li><li>To simplify audit</li></ol>
+<div class="explain">A decision-theoretic operating point per category.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-12" data-topic="§18.3 Base rates">
+<p class="q">Two independent guards each with TPR 0.9, FPR 1%, combined with AND, give FPR:</p>
+<ol class="opts"><li>2%</li><li>1%</li><li data-correct>0.01%</li><li>0.1%</li></ol>
+<div class="explain">\(0.01^2\); recall falls to 0.81.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-13" data-topic="§18.4 Cost">
+<p class="q">The compute of a generative guard check is approximately:</p>
+<ol class="opts"><li>\(2N_{\text{guard}}\) per output token only</li><li data-correct>\(2N_{\text{guard}}n_{\text{in}}\), dominated by prefill</li><li>Constant per request</li><li>Quadratic in parameters</li></ol>
+<div class="explain">The verdict is a few tokens.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-14" data-topic="§18.4 Cost">
+<p class="q">An 8B guard on all Atlas inputs (10k req/s × 1,000 tokens) needs roughly:</p>
+<ol class="opts"><li>3 H100s</li><li>30 H100s</li><li data-correct>320 H100s</li><li>3,200 H100s</li></ol>
+<div class="explain">\(1.6\times10^{17}\) FLOP/s at 500 TFLOP/s each.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-15" data-topic="§18.4 Cost">
+<p class="q">How can an input guard add no latency for most requests?</p>
+<ol class="opts"><li>By skipping it</li><li data-correct>Run it in parallel with the main model's prefill and hold the first tokens until the verdict</li><li>Run it after generation</li><li>Use a larger guard</li></ol>
+<div class="explain">Blocked requests waste some main-model compute.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-16" data-topic="§18.4 Cost">
+<p class="q">"Fail closed" for a guard means:</p>
+<ol class="opts"><li>The guard blocks everything always</li><li data-correct>When the guard is unavailable, requests are blocked or degraded rather than allowed</li><li>The guard's logs are encrypted</li><li>The guard runs on CPUs</li></ol>
+<div class="explain">Used for high-severity categories and regulated products.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-17" data-topic="§18.4 Cost">
+<p class="q">Why run guards on separate replicas with their own autoscaling?</p>
+<ol class="opts"><li data-correct>Their load scales with request rate, not generated tokens, and their failures must not take down the main model</li><li>They need different drivers</li><li>For billing</li><li>They cannot share GPUs</li></ol>
+<div class="explain">MIG slices are another option.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-18" data-topic="§18.5 Streaming">
+<p class="q">A hold-back buffer of \(n_{\text{chk}}=64\) tokens at TPOT 30 ms adds roughly how much to the first visible token?</p>
+<ol class="opts"><li>30 ms</li><li>0.5 s</li><li data-correct>1.9 s</li><li>6 s</li></ol>
+<div class="explain">64 × 30 ms.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-19" data-topic="§18.5 Streaming">
+<p class="q">Without prefix caching in the guard, checking every \(n_{\text{chk}}\) tokens makes total guard work grow:</p>
+<ol class="opts"><li>Linearly in response length</li><li data-correct>Quadratically in response length (for fixed interval)</li><li>Logarithmically</li><li>Not at all</li></ol>
+<div class="explain">Each check re-reads everything before it.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-20" data-topic="§18.5 Streaming">
+<p class="q">With a prefix-cached 8B guard checking every 16 tokens on a 70B model, guard compute is about what fraction of main-model compute (Figure 18.4)?</p>
+<ol class="opts"><li>530%</li><li>50%</li><li data-correct>12%</li><li>1%</li></ol>
+<div class="explain">Barely above the 11.4% of a single final check.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-21" data-topic="§18.5 Streaming">
+<p class="q">"Stream then retract" moderation:</p>
+<ol class="opts"><li data-correct>Adds no latency but lets the user see text before it is withdrawn</li><li>Never shows harmful text</li><li>Requires no guard</li><li>Doubles TPOT</li></ol>
+<div class="explain">Acceptable for mild categories only.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-22" data-topic="§18.6 Cascades">
+<p class="q">The expected cost per item of a two-stage cascade is:</p>
+<ol class="opts"><li>\(c_1c_2\)</li><li>\(c_1+c_2\)</li><li data-correct>\(c_1+f_{\text{esc}}c_2\)</li><li>\(f_{\text{esc}}c_1+c_2\)</li></ol>
+<div class="explain">Stage 1 sees everything; stage 2 only the escalated fraction.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-23" data-topic="§18.6 Cascades">
+<p class="q">Why does stage 2 of a cascade have higher precision than it would on raw traffic?</p>
+<ol class="opts"><li>It is a bigger model</li><li data-correct>Its input is enriched in harmful items, raising prevalence</li><li>It uses a lower threshold</li><li>It runs on better GPUs</li></ol>
+<div class="explain">Figure 18.2 at higher prevalence.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-24" data-topic="§18.6 Cascades">
+<p class="q">How is a cascade's weakness—confidently wrong first-stage decisions—detected?</p>
+<ol class="opts"><li>It cannot be</li><li data-correct>By sampling "confident safe" traffic for review</li><li>By widening stage 2</li><li>By lowering TPOT</li></ol>
+<div class="explain">New jailbreak styles may pass stage 1 unescalated.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-25" data-topic="§18.7 Review">
+<p class="q">Ten items per second need review at 60 s each. How many reviewers must work concurrently?</p>
+<ol class="opts"><li>10</li><li>60</li><li data-correct>600</li><li>6,000</li></ol>
+<div class="explain">Little's law: \(\lambda t_{\text{rev}}\).</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-26" data-topic="§18.7 Review">
+<p class="q">Why are reviewer decisions especially valuable?</p>
+<ol class="opts"><li>They are cheap</li><li data-correct>They label exactly the hard cases, improving classifiers by active learning</li><li>They replace classifiers</li><li>They reduce latency</li></ol>
+<div class="explain">Feedback is how the cascade improves.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-27" data-topic="§18.8 Operations">
+<p class="q">Shadow mode for a new guard means:</p>
+<ol class="opts"><li>Running it at night</li><li data-correct>Scoring production traffic without acting, to measure flag rates and disagreements</li><li>Hiding it from users</li><li>Running on spot instances</li></ol>
+<div class="explain">Then canary, then full rollout with rollback.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-28" data-topic="§18.8 Operations">
+<p class="q">Why is a sudden rise in the refusal rate treated as an incident?</p>
+<ol class="opts"><li>It increases cost</li><li data-correct>To users, an over-blocking guard is indistinguishable from an outage</li><li>It breaks audit</li><li>It slows the model</li></ol>
+<div class="explain">Refusal rate belongs on the SLO dashboard.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-29" data-topic="§18.8 Operations">
+<p class="q">Which belong in a guardrail decision log? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Verdict and category</li><li data-correct>Score</li><li data-correct>Policy and model versions</li><li>Full content of every request, kept forever</li></ol>
+<div class="explain">Content is kept only for flagged and sampled items, with retention limits.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-30" data-topic="§18.8 Operations">
+<p class="q">Which jailbreak styles motivate guards that see whole conversations and multiple modalities? (Select all that apply.)</p>
+<ol class="opts"><li data-correct>Requests split across turns</li><li data-correct>Many-shot prompts with fabricated dialogues</li><li data-correct>Instructions embedded in images</li><li>Requests with typos only</li></ol>
+<div class="explain">Single-message text guards miss them.</div>
+</div>
+
+<div class="mcq" data-id="ci18-mcq-31" data-topic="§18.8 Operations">
+<p class="q">Why are guardrails not a substitute for least privilege and sandboxing in agents?</p>
+<ol class="opts"><li>Guards are too slow</li><li data-correct>Classifiers miss some attacks; structural limits bound the damage when recognition fails</li><li>Guards cannot read tool calls</li><li>Sandboxes are cheaper</li></ol>
+<div class="explain">Recognition and architecture are complementary.</div>
+</div>
+
+</div>
+
+<h2 id="interview">Interview questions</h2>
+<p class="muted small">Answer aloud before revealing the model answer, then rate yourself. Items marked "review again" appear on your progress page.</p>
+
+<details class="qa" data-id="ci18-qa-01">
+<summary><span class="lvl warm">Warm-up</span> Where would you place safety classifiers in an LLM serving pipeline?</summary>
+<div class="answer">
+<p>Input guard on prompts and uploads (policy violations, jailbreaks) before or in parallel with prefill; context guard on retrieved documents, web pages and tool results (prompt injection); action guard on tool calls before execution (scope, policy, confirmation); output guard on generated text, streamed in chunks behind a hold-back buffer. Log every verdict with category, score and policy/model versions. Layered: each misses some cases; combined miss rate falls if errors are not perfectly correlated. Pair with structural controls (least privilege, sandboxes).</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-02">
+<summary><span class="lvl warm">Warm-up</span> Your classifier has 95% recall and 1% false-positive rate. Is it good?</summary>
+<div class="answer">
+<p>It depends on prevalence. Precision = TPR·q / (TPR·q + FPR(1−q)). At q = 10% precision is 91%; at q = 0.1% it is under 9%: ten benign users flagged for each harmful one. Need the production prevalence (estimated by sampling and labelling), the costs of misses vs false refusals for the category, and what action a flag triggers (block, soft response, escalation, review). Benchmarks are usually balanced, so their F1 overstates production precision.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-03">
+<summary><span class="lvl core">Core</span> How do you avoid adding guard latency to TTFT?</summary>
+<div class="answer">
+<p>Run the input guard concurrently with the main model's prefill; buffer the main model's first tokens at the gateway until the verdict arrives; release if safe (guard is usually faster than main prefill, so no added delay), cancel and discard if unsafe (wasted compute is small when blocking is rare). Use small, fast guards or a cascade; colocate guards near the gateway; autoscale guard replicas on request rate. Similarly hide context checks behind retrieval and action checks behind generation of the tool call.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-04">
+<summary><span class="lvl core">Core</span> How many GPUs does moderation for 10,000 requests per second need?</summary>
+<div class="answer">
+<p>Per check ≈ 2 N_guard n_in FLOPs. 8B guard, 1,000-token inputs: 2·8e9·1e7 = 1.6e17 FLOP/s; at ~500 TFLOP/s effective per H100 ≈ 320 GPUs for inputs, about double with outputs—~8–16% of a 4,000-GPU fleet. Cascade: 0.3B classifier on all (≈12 GPUs) plus 8B on 3% escalated (≈10 GPUs) ≈ 22 GPUs. Output streaming adds little if the guard uses prefix caching. Add headroom and separate failure domains.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-05">
+<summary><span class="lvl core">Core</span> How do you moderate streaming output?</summary>
+<div class="answer">
+<p>Check every n_chk tokens with the guard reading prompt + output so far; a hold-back buffer releases text only after it passes, so users are at most one chunk behind (added first-token delay ≈ n_chk × TPOT + check time). Keep the guard's prefix cache across checks so total work ≈ one final check instead of quadratic. On unsafe: stop generation, drop the buffer, send a refusal. Token-level scoring (constitutional classifiers) for severe categories; stream-then-retract for mild ones. Pick n_chk from the TTFT SLO and severity.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-06">
+<summary><span class="lvl core">Core</span> Design a moderation cascade and explain its economics.</summary>
+<div class="answer">
+<p>Stage 1: cheap classifier plus hash/regex matchers on all traffic; pass confident-safe, block confident-harmful, escalate an uncertain band (~1–5%). Stage 2: large generative guard with detailed policy; settles most escalations. Stage 3: human review for high-severity residue and appeals. Cost per item c₁ + f_esc c₂; with c₂/c₁ ≈ 27 and f_esc = 3%, ≈ 1.8c₁ vs 27c₁. Stage 2 sees enriched prevalence so its precision is higher. Tune the band by measuring stage-2 overturn rate per stage-1 score; sample confident-safe traffic to catch stage-1 blind spots.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-07">
+<summary><span class="lvl core">Core</span> How do you size a human review team for moderation?</summary>
+<div class="answer">
+<p>Little's law: concurrent reviewers = λ·t_rev, then convert to staff with shifts, occupancy (~70–80%), breaks and coverage across time zones and languages. E.g. 10 items/s × 60 s = 600 concurrent at peak. Reduce λ with better final-stage precision (each 10× = 10× fewer reviewers), sampling of low-severity items, and auto-resolution. Add priorities and SLOs by severity, surge plans, wellbeing protections (blurring, exposure limits), and QA of reviewer consistency.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-08">
+<summary><span class="lvl deep">Deep-dive</span> How would you choose thresholds per harm category?</summary>
+<div class="answer">
+<p>For each category, estimate prevalence on production samples, measure the ROC curve on labelled production-like data, assign costs to misses (severity × likelihood of real harm, legal exposure) and to false positives (user harm, churn, support cost), and choose the threshold minimising expected cost: flag where q·TPR·cost_miss gained exceeds (1−q)·FPR·cost_fp. Use different actions at different score bands (allow, soft response, block, review). Re-estimate as traffic shifts; per-product and per-region thresholds; monitor refusal and complaint rates.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-09">
+<summary><span class="lvl deep">Deep-dive</span> Why does prefix caching matter for output guards?</summary>
+<div class="answer">
+<p>A streaming guard checks at k, 2k, 3k… tokens. Re-reading prompt + output each time costs Σ(n_in + jk), quadratic in output length (for 1k tokens checked every 16: ~47× a single final check). Keeping the guard's KV across checks and appending only the new chunk makes total work ≈ n_in + n_out plus a verdict token per check—≈ one final check. Implementation: the guard as a companion sequence with session affinity on guard replicas, its KV kept for the stream's duration; or a lightweight per-token head on the main model's hidden states.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-10">
+<summary><span class="lvl deep">Deep-dive</span> Should a guard fail open or fail closed?</summary>
+<div class="answer">
+<p>Per category and product: fail closed (block or degrade to a safe response) for catastrophic categories (CBRN, CSAM), regulated or children's products, and enterprise customers whose contracts require it; fail open (allow, log, review asynchronously) where harm is mild and availability matters. Make it explicit in the SLO: guard availability becomes part of the product's availability when failing closed, so guards need redundancy across zones, separate capacity, and fallbacks (a smaller backup guard). Alert on guard errors and timeouts separately from main-model errors.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-11">
+<summary><span class="lvl design">Design</span> Design the guardrail system for a consumer chat product with 100 million users.</summary>
+<div class="answer">
+<p>Policy taxonomy with severity tiers; versioned policies per region. Input: cascade (small classifier + hashes → 8B guard on uncertain band) in parallel with prefill; jailbreak detector; image classifier and hash matching for uploads. Output: prefix-cached streaming guard with short buffer for high-risk contexts, stream-then-retract for mild; safe-completion responses rather than hard refusals for borderline. Human review for severe residue and appeals with SLOs. Logging of verdicts with versions; content retention only for flagged and sampled items. Shadow/canary rollouts; dashboards of refusal rates by category and locale; red-team and production-sample evaluation; per-region residency.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-12">
+<summary><span class="lvl design">Design</span> How do you protect an enterprise RAG assistant against prompt injection in documents?</summary>
+<div class="answer">
+<p>Structure: separate trusted instructions from untrusted retrieved content (delimiters, roles), least-privilege tools with user-scoped auth, confirmation for side effects, no egress or allow-listed egress. Detection: context guard (injection classifier) on retrieved chunks at ingestion time (cheaper, done once) and at query time for fresh content; flag documents that contain instructions; output guard for exfiltration patterns (URLs with data, markdown images). Monitoring: anomalous tool-call patterns. Red-team with poisoned documents. Accept that detection is imperfect; design so injection cannot cause high-impact actions.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-13">
+<summary><span class="lvl core">Core</span> How do you roll out a new guard model safely?</summary>
+<div class="answer">
+<p>Offline: evaluate on benchmarks, labelled production samples and adversarial sets; compare flag rates by category and locale with the incumbent. Shadow mode on live traffic: measure flag rate, disagreement, latency, cost; review disagreements. Canary on a small fraction with automatic rollback on refusal-rate or complaint spikes. Full rollout with versioned logging so decisions are attributable. Keep the old model warm for rollback. Communicate policy changes to support teams.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-14">
+<summary><span class="lvl warm">Warm-up</span> Compare encoder classifiers and generative guard models.</summary>
+<div class="answer">
+<p>Encoder classifiers (~100M–1B): very fast (~1 ms), cheap, good for well-defined categories with plenty of labels; policy changes need relabelling and retraining; weaker on nuanced or novel content. Generative guards (1B–27B, e.g. Llama Guard, ShieldGemma): read conversation plus policy text, output verdict and categories; adaptable by editing the policy; better at context and nuance; costlier (prefill of the whole conversation). Production uses both in cascades.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-15">
+<summary><span class="lvl deep">Deep-dive</span> How do you balance moderation audit requirements with privacy?</summary>
+<div class="answer">
+<p>Log metadata for every request (verdict, category, score, policy and model version, timestamps, pseudonymous IDs); keep content only for flagged and sampled items, encrypted, access-controlled, with retention limits and redaction of personal data; keep logs and reviewers in the data's region (residency); honour zero-retention contracts by keeping only metadata; document the practice for regulators; audit access to moderation logs themselves.</p>
+</div>
+</details>
+
+<details class="qa" data-id="ci18-qa-16">
+<summary><span class="lvl core">Core</span> Two independent guards, each TPR 0.9 and FPR 1%: combine with AND or OR?</summary>
+<div class="answer">
+<p>AND: TPR 0.81, FPR 0.01%; precision at 0.1% prevalence ≈ 89%. OR: TPR 0.99, FPR ≈ 2%; precision ≈ 5%. AND suits blocking decisions where false refusals are costly; OR suits high-severity categories or escalation to review where misses are costly. Real guards' errors correlate, so measure the combination on real traffic. A cascade (OR to escalate, stronger model to decide) often gets the best of both.</p>
+</div>
+</details>
+
+<h2 id="references">References</h2>
+<ol class="refs">
+<li id="r-moderation">T. Markov et al. A Holistic Approach to Undesired Content Detection in the Real World. <em>AAAI</em>, 2023. <a href="https://arxiv.org/abs/2208.03274">arXiv:2208.03274</a>.</li>
+<li id="r-llamaguard">H. Inan et al. Llama Guard: LLM-based Input-Output Safeguard for Human-AI Conversations. 2023. <a href="https://arxiv.org/abs/2312.06674">arXiv:2312.06674</a>.</li>
+<li id="r-shieldgemma">W. Zeng et al. ShieldGemma: Generative AI Content Moderation Based on Gemma. 2024. <a href="https://arxiv.org/abs/2407.21772">arXiv:2407.21772</a>.</li>
+<li id="r-wildguard">S. Han et al. WildGuard: Open One-Stop Moderation Tools for Safety Risks, Jailbreaks, and Refusals of LLMs. 2024. <a href="https://arxiv.org/abs/2406.18495">arXiv:2406.18495</a>.</li>
+<li id="r-constitutional">M. Sharma et al. Constitutional Classifiers: Defending against Universal Jailbreaks across Thousands of Hours of Red Teaming. 2025. <a href="https://arxiv.org/abs/2501.18837">arXiv:2501.18837</a>.</li>
+<li>C. Anil et al. Many-shot Jailbreaking. Anthropic, 2024.</li>
+<li>A. Zou et al. Universal and Transferable Adversarial Attacks on Aligned Language Models. 2023. <a href="https://arxiv.org/abs/2307.15043">arXiv:2307.15043</a>.</li>
+<li>K. Greshake et al. Not What You've Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection. 2023. <a href="https://arxiv.org/abs/2302.12173">arXiv:2302.12173</a>.</li>
+<li>MLCommons AI Safety Working Group. Introducing v0.5 of the AI Safety Benchmark. 2024. <a href="https://arxiv.org/abs/2404.12241">arXiv:2404.12241</a>.</li>
+</ol>
+
+</article>
+</main>
+</div>
+</body>
+</html>

@@ -346,3 +346,13 @@ Volume II uses every symbol above with the same meaning and adds the following. 
 | \(n_{\text{step}}\), \(p_{\text{step}}\) | steps in an agent task; probability one step succeeds |
 | \(m_{\text{kv}}\), \(t_{\text{tool}}\) | bytes of one sequence's KV cache; expected tool duration |
 | \(\varpi_{\text{hbm}}\), \(\varpi_{\text{host}}\) | cost of holding one byte in HBM / host memory for one second |
+
+## Guardrails (Vol. II Ch. 18)
+| Symbol | Meaning |
+|---|---|
+| \(\text{TPR}\), \(\text{FPR}\) | recall (true-positive rate) and false-positive rate of a guard at its threshold |
+| \(q_{\text{harm}}\) | prevalence of policy-violating items in traffic |
+| \(N_{\text{guard}}\) | parameters of a guard model |
+| \(n_{\text{chk}}\) | tokens between successive checks of a streamed output |
+| \(c_1\), \(c_2\), \(f_{\text{esc}}\) | per-item cost of cascade stages 1 and 2; fraction escalated to stage 2 |
+| \(t_{\text{rev}}\) | mean human review time per item |
